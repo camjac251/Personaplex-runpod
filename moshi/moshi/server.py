@@ -849,7 +849,7 @@ def main():
         let shouldShowDownload = false;
         let audioQueue = [];
         let jitterBufferReady = false;
-        const JITTER_BUFFER_MS = 60;
+        const JITTER_BUFFER_MS = 120;
         const SAMPLE_RATE = 24000;
         
         // View elements
@@ -1068,16 +1068,19 @@ def main():
                 for (const b of audioQueue) total += b.duration;
                 if (total < JITTER_BUFFER_MS / 1000) return;
                 jitterBufferReady = true;
-                nextPlayTime = audioContext.currentTime + 0.02;
+                nextPlayTime = audioContext.currentTime + JITTER_BUFFER_MS / 1000;
             }
 
             // Drain queued buffers into the Web Audio scheduler
             while (audioQueue.length > 0) {
                 const buf = audioQueue.shift();
                 const now = audioContext.currentTime;
-                if (nextPlayTime < now) {
-                    // Fell behind: tiny skip to resync (was 50ms, now 5ms)
-                    nextPlayTime = now + 0.005;
+                if (nextPlayTime < now - 0.04) {
+                    // Significantly behind (>40ms): real underrun, resync
+                    nextPlayTime = now + 0.01;
+                } else if (nextPlayTime < now) {
+                    // Slightly behind: normal bursty delivery, just catch up
+                    nextPlayTime = now;
                 }
                 const source = audioContext.createBufferSource();
                 source.buffer = buf;
