@@ -132,6 +132,27 @@ class ServerState:
             # Clear CUDA cache after warmup to free any fragmented memory
             torch.cuda.empty_cache()
 
+    def _process_audio_frame(self, chunk_np):
+        """Run GPU inference for one audio frame. Called from thread executor
+        so the asyncio event loop stays responsive during GPU work."""
+        chunk = torch.from_numpy(chunk_np).to(device=self.device)[None, None]
+        codes = self.mimi.encode(chunk)
+        results = []
+        for c in range(codes.shape[-1]):
+            tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+            if tokens is None:
+                continue
+            assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+            main_pcm = self.mimi.decode(tokens[:, 1:9])
+            main_pcm = main_pcm.cpu()
+            pcm_np = main_pcm[0, 0].numpy()
+            text_token = tokens[0, 0, 0].item()
+            text = None
+            if text_token not in (0, 3):
+                _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                text = _text.replace("▁", " ")
+            results.append((pcm_np, text))
+        return results
 
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
@@ -203,6 +224,7 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
+            loop = asyncio.get_event_loop()
             all_pcm_data = None
 
             while True:
@@ -219,31 +241,32 @@ class ServerState:
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
-                    chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
-                    codes = self.mimi.encode(chunk)
-                    for c in range(codes.shape[-1]):
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                        if tokens is None:
-                            continue
-                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
-                        text_token = tokens[0, 0, 0].item()
-                        if text_token not in (0, 3):
-                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                            _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
+
+                    # Offload GPU inference to thread so event loop stays
+                    # responsive for send_loop and recv_loop
+                    results = await loop.run_in_executor(
+                        None, self._process_audio_frame, chunk
+                    )
+
+                    for pcm_data, text in results:
+                        opus_writer.append_pcm(pcm_data)
+                        if text is not None:
+                            msg = b"\x02" + bytes(text, encoding="utf8")
                             await ws.send_bytes(msg)
-                    # Yield control to keep event loop responsive
-                    await asyncio.sleep(0)
+
+                    # Send audio right after inference instead of waiting
+                    # for the send_loop poll cycle
+                    audio_bytes = opus_writer.read_bytes()
+                    if len(audio_bytes) > 0:
+                        await ws.send_bytes(b"\x01" + audio_bytes)
 
         async def send_loop():
+            # Drain loop: catches any opus data buffered between
+            # inference steps (opus encoder has internal buffering)
             while True:
                 if close:
                     return
-                await asyncio.sleep(0.001)  # Fast polling for smooth audio
+                await asyncio.sleep(0.005)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
@@ -823,6 +846,9 @@ def main():
         let micStream = null;
         let micSource = null;
         let shouldShowDownload = false;
+        let audioQueue = [];
+        let jitterBufferReady = false;
+        const JITTER_BUFFER_MS = 60;
         const SAMPLE_RATE = 24000;
         
         // View elements
@@ -1015,7 +1041,7 @@ def main():
                     bufferLength: bufferLength,
                     decoderSampleRate: SAMPLE_RATE,
                     outputBufferSampleRate: audioContext.sampleRate,
-                    resampleQuality: 0
+                    resampleQuality: 5
                 });
                 
                 setTimeout(() => {
@@ -1029,25 +1055,37 @@ def main():
         
         function playDecodedAudio(pcmData) {
             if (!audioContext || !pcmData || pcmData.length === 0) return;
-            
+
             const buffer = audioContext.createBuffer(1, pcmData.length, audioContext.sampleRate);
             buffer.getChannelData(0).set(pcmData);
-            
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(audioContext.destination);
-            if (recordingDestination) {
-                source.connect(recordingDestination);
+            audioQueue.push(buffer);
+
+            // Jitter buffer: accumulate audio before starting playback
+            // so network/processing variance does not cause gaps
+            if (!jitterBufferReady) {
+                let total = 0;
+                for (const b of audioQueue) total += b.duration;
+                if (total < JITTER_BUFFER_MS / 1000) return;
+                jitterBufferReady = true;
+                nextPlayTime = audioContext.currentTime + 0.02;
             }
-            
-            const now = audioContext.currentTime;
-            if (nextPlayTime < now) {
-                nextPlayTime = now + 0.05;
+
+            // Drain queued buffers into the Web Audio scheduler
+            while (audioQueue.length > 0) {
+                const buf = audioQueue.shift();
+                const now = audioContext.currentTime;
+                if (nextPlayTime < now) {
+                    // Fell behind: tiny skip to resync (was 50ms, now 5ms)
+                    nextPlayTime = now + 0.005;
+                }
+                const source = audioContext.createBufferSource();
+                source.buffer = buf;
+                source.connect(audioContext.destination);
+                if (recordingDestination) source.connect(recordingDestination);
+                source.start(nextPlayTime);
+                nextPlayTime += buf.duration;
             }
-            
-            source.start(nextPlayTime);
-            nextPlayTime += buffer.duration;
-            
+
             aiVisualizer.classList.add('active');
             setTimeout(() => aiVisualizer.classList.remove('active'), 100);
         }
@@ -1223,6 +1261,8 @@ def main():
             aiVisualizer.classList.remove('active');
             userVisualizer.classList.remove('active');
             nextPlayTime = 0;
+            audioQueue = [];
+            jitterBufferReady = false;
         }
         
         // Handle page unload
