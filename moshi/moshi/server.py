@@ -132,6 +132,7 @@ class ServerState:
             # Clear CUDA cache after warmup to free any fragmented memory
             torch.cuda.empty_cache()
 
+    @torch.no_grad()
     def _process_audio_frame(self, chunk_np):
         """Run GPU inference for one audio frame. Called from thread executor
         so the asyncio event loop stays responsive during GPU work."""
