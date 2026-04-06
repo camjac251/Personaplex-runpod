@@ -250,27 +250,11 @@ class ServerState:
                     )
 
                     for pcm_data, text in results:
-                        opus_writer.append_pcm(pcm_data)
+                        # Send raw PCM float32 directly (bypass Opus codec)
+                        await ws.send_bytes(b"\x01" + pcm_data.astype(np.float32).tobytes())
                         if text is not None:
                             msg = b"\x02" + bytes(text, encoding="utf8")
                             await ws.send_bytes(msg)
-
-                    # Send audio right after inference instead of waiting
-                    # for the send_loop poll cycle
-                    audio_bytes = opus_writer.read_bytes()
-                    if len(audio_bytes) > 0:
-                        await ws.send_bytes(b"\x01" + audio_bytes)
-
-        async def send_loop():
-            # Drain loop: catches any opus data buffered between
-            # inference steps (opus encoder has internal buffering)
-            while True:
-                if close:
-                    return
-                await asyncio.sleep(0.005)
-                msg = opus_writer.read_bytes()
-                if len(msg) > 0:
-                    await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -282,7 +266,6 @@ class ServerState:
             if seed is not None and seed != -1:
                 seed_all(seed)
 
-            opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
@@ -313,7 +296,6 @@ class ServerState:
                 tasks = [
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(opus_loop()),
-                    asyncio.create_task(send_loop()),
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -839,7 +821,6 @@ def main():
         let socket = null;
         let recorder = null;
         let audioContext = null;
-        let decoderWorker = null;
         let recordingDestination = null;
         let mediaRecorder = null;
         let recordedChunks = [];
@@ -1030,61 +1011,6 @@ registerProcessor('pcm-player', P);`;
             }
         }
         
-        function createWarmupBosPage() {
-            const opusHead = new Uint8Array([
-                0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64,
-                0x01, 0x01, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00,
-                0x00, 0x00, 0x00
-            ]);
-            const pageHeader = new Uint8Array([
-                0x4F, 0x67, 0x67, 0x53, 0x00, 0x02,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x01, 0x13
-            ]);
-            const bosPage = new Uint8Array(pageHeader.length + opusHead.length);
-            bosPage.set(pageHeader, 0);
-            bosPage.set(opusHead, pageHeader.length);
-            return bosPage;
-        }
-        
-        async function initDecoder() {
-            return new Promise((resolve, reject) => {
-                try {
-                    decoderWorker = new Worker('/assets/decoderWorker.min.js');
-                } catch (e) {
-                    console.warn('Could not load local decoder, trying CDN...');
-                    decoderWorker = new Worker('https://cdn.jsdelivr.net/npm/opus-recorder@8.0.5/dist/decoderWorker.min.js');
-                }
-                
-                decoderWorker.onmessage = (e) => {
-                    if (e.data && e.data[0]) {
-                        playDecodedAudio(e.data[0]);
-                    }
-                };
-                
-                decoderWorker.onerror = (err) => {
-                    console.error('Decoder worker error:', err);
-                };
-                
-                const bufferLength = Math.round(960 * audioContext.sampleRate / SAMPLE_RATE);
-                decoderWorker.postMessage({
-                    command: 'init',
-                    bufferLength: bufferLength,
-                    decoderSampleRate: SAMPLE_RATE,
-                    outputBufferSampleRate: audioContext.sampleRate,
-                    resampleQuality: 5
-                });
-                
-                setTimeout(() => {
-                    const bosPage = createWarmupBosPage();
-                    decoderWorker.postMessage({ command: 'decode', pages: bosPage });
-                    console.log('Decoder initialized');
-                    resolve();
-                }, 200);
-            });
-        }
-        
         function playDecodedAudio(pcmData) {
             if (!playerNode || !pcmData || pcmData.length === 0) return;
             playerNode.port.postMessage(pcmData);
@@ -1092,11 +1018,6 @@ registerProcessor('pcm-player', P);`;
             setTimeout(() => aiVisualizer.classList.remove('active'), 100);
         }
         
-        function decodeAudio(opusData) {
-            if (decoderWorker && opusData.length > 0) {
-                decoderWorker.postMessage({ command: 'decode', pages: opusData }, [opusData.buffer]);
-            }
-        }
         
         async function startConversation() {
             try {
@@ -1106,7 +1027,6 @@ registerProcessor('pcm-player', P);`;
                 downloadLink.removeAttribute('href');
                 
                 await initAudio();
-                await initDecoder();
                 
                 // Check microphone permission
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1151,7 +1071,8 @@ registerProcessor('pcm-player', P);`;
                         startMicRecording();
                         startSessionRecording();
                     } else if (msgType === 0x01) {
-                        decodeAudio(payload);
+                        const pcm = new Float32Array(payload.buffer, payload.byteOffset, payload.byteLength / 4);
+                        playDecodedAudio(pcm);
                     } else if (msgType === 0x02) {
                         const text = new TextDecoder().decode(payload);
                         transcript.textContent += text;
@@ -1253,10 +1174,6 @@ registerProcessor('pcm-player', P);`;
             if (socket) {
                 try { socket.close(); } catch(e) {}
                 socket = null;
-            }
-            if (decoderWorker) {
-                try { decoderWorker.terminate(); } catch(e) {}
-                decoderWorker = null;
             }
             connectBtn.disabled = false;
             connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
