@@ -47,6 +47,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
+from .models.lm import MAX_REPETITION_CONTEXT
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -163,10 +164,38 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
-        # self.lm_gen.temp = float(request.query["audio_temperature"])
-        # self.lm_gen.temp_text = float(request.query["text_temperature"])
-        # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
-        # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
+        def _qfloat(name, default):
+            raw = request.query.get(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                clog.log("warning", f"bad float for {name}={raw!r}, using default {default}")
+                return default
+
+        def _qint(name, default):
+            raw = request.query.get(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                clog.log("warning", f"bad int for {name}={raw!r}, using default {default}")
+                return default
+
+        # Parse sampling params here, but apply them inside the session lock below
+        # to avoid races between concurrent connections mutating shared lm_gen state.
+        sampling_params = {
+            "temp": _qfloat("audio_temperature", 0.8),
+            "temp_text": _qfloat("text_temperature", 0.7),
+            "top_k_text": max(1, _qint("text_topk", 25)),
+            "top_k": max(1, _qint("audio_topk", 250)),
+            "repetition_penalty": max(1.0, _qfloat("repetition_penalty", 1.2)),
+            "repetition_penalty_context": max(
+                0, min(_qint("repetition_penalty_context", 64), MAX_REPETITION_CONTEXT)
+            ),
+        }
         
         # Construct full voice prompt path
         requested_voice_prompt_path = None
@@ -265,6 +294,11 @@ class ServerState:
         async with self.lock:
             if seed is not None and seed != -1:
                 seed_all(seed)
+
+            # Apply per-connection sampling params under the lock so concurrent
+            # connections cannot interleave their settings on the shared lm_gen.
+            for k, v in sampling_params.items():
+                setattr(self.lm_gen, k, v)
 
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
@@ -620,6 +654,24 @@ def main():
         .btn-danger { background: #9a3b3b; color: #fff; }
         .btn-danger:hover:not(:disabled) { background: #7f2f2f; transform: translateY(-2px); }
         .btn-container { text-align: center; margin-top: 24px; }
+
+        /* Advanced sliders */
+        .advanced-toggle { display: flex; align-items: center; justify-content: space-between; cursor: pointer;
+                           padding: 4px 0; user-select: none; }
+        .advanced-toggle .arrow { transition: transform 0.2s; font-size: 0.8em; color: #6e5d3b; }
+        .advanced-toggle.open .arrow { transform: rotate(90deg); }
+        .advanced-body { display: none; margin-top: 16px; }
+        .advanced-body.open { display: block; }
+        .slider-row { margin-bottom: 14px; }
+        .slider-row .slider-label { display: flex; justify-content: space-between; font-size: 0.82em;
+                                    color: #3a3329; margin-bottom: 6px; font-weight: 500; }
+        .slider-row .slider-label .slider-value { color: #2f5d50; font-variant-numeric: tabular-nums; font-weight: 600; }
+        .slider-row input[type="range"] { width: 100%; accent-color: #2f5d50; }
+        .slider-row .slider-hint { font-size: 0.72em; color: #8a7a5a; margin-top: 4px; line-height: 1.4; }
+        .slider-actions { display: flex; gap: 8px; margin-top: 8px; }
+        .slider-reset { background: rgba(255,255,255,0.85); color: #5f5136; border: 1px solid rgba(156, 131, 84, 0.4);
+                        border-radius: 6px; padding: 6px 12px; font-size: 0.78em; cursor: pointer; }
+        .slider-reset:hover { background: #2f5d50; color: #f7f1e6; border-color: #2f5d50; }
         
         /* Conversation view */
         .visualizer-container { display: flex; gap: 30px; justify-content: center; margin: 30px 0; }
@@ -735,8 +787,68 @@ def main():
                     </div>
                 </div>
                 
+                <div class="form-section">
+                    <div class="advanced-toggle" id="advancedToggle" onclick="toggleAdvanced()">
+                        <div class="form-section-title" style="margin-bottom: 0;">Sampling &amp; Repetition</div>
+                        <span class="arrow">&#9656;</span>
+                    </div>
+                    <div class="advanced-body" id="advancedBody">
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Text temperature</span>
+                                <span class="slider-value" id="textTempValue">0.70</span>
+                            </div>
+                            <input type="range" id="textTempSlider" min="0.1" max="1.5" step="0.05" value="0.7">
+                            <div class="slider-hint">Higher = more varied word choice. Lower = more focused.</div>
+                        </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Text top-k</span>
+                                <span class="slider-value" id="textTopkValue">25</span>
+                            </div>
+                            <input type="range" id="textTopkSlider" min="1" max="500" step="1" value="25">
+                            <div class="slider-hint">Number of word candidates considered each step.</div>
+                        </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Audio temperature</span>
+                                <span class="slider-value" id="audioTempValue">0.80</span>
+                            </div>
+                            <input type="range" id="audioTempSlider" min="0.1" max="1.5" step="0.05" value="0.8">
+                            <div class="slider-hint">Higher = more expressive prosody. Lower = flatter delivery.</div>
+                        </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Audio top-k</span>
+                                <span class="slider-value" id="audioTopkValue">250</span>
+                            </div>
+                            <input type="range" id="audioTopkSlider" min="1" max="2048" step="1" value="250">
+                            <div class="slider-hint">Number of audio token candidates considered each step.</div>
+                        </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Repetition penalty</span>
+                                <span class="slider-value" id="repPenaltyValue">1.20</span>
+                            </div>
+                            <input type="range" id="repPenaltySlider" min="1.0" max="2.0" step="0.05" value="1.2">
+                            <div class="slider-hint">1.0 = off. 1.1-1.3 = gentle. 1.5+ = aggressive. Stops the model from looping.</div>
+                        </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Repetition context window</span>
+                                <span class="slider-value" id="repContextValue">64</span>
+                            </div>
+                            <input type="range" id="repContextSlider" min="0" max="256" step="8" value="64">
+                            <div class="slider-hint">How many recent text tokens the penalty considers.</div>
+                        </div>
+                        <div class="slider-actions">
+                            <button class="slider-reset" type="button" onclick="resetAdvanced()">Reset to defaults</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="error-msg" id="errorMsg"></div>
-                
+
                 <div class="btn-container">
                     <button class="btn btn-primary" id="connectBtn" onclick="startConversation()">
                         <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -863,6 +975,70 @@ def main():
         }
         textPromptInput.addEventListener('input', updateCharCount);
         updateCharCount();
+
+        // Advanced sampling sliders
+        const ADVANCED_DEFAULTS = {
+            textTemp: 0.7, textTopk: 25,
+            audioTemp: 0.8, audioTopk: 250,
+            repPenalty: 1.2, repContext: 64,
+        };
+        const advancedToggle = document.getElementById('advancedToggle');
+        const advancedBody = document.getElementById('advancedBody');
+        const textTempSlider = document.getElementById('textTempSlider');
+        const textTempValue = document.getElementById('textTempValue');
+        const textTopkSlider = document.getElementById('textTopkSlider');
+        const textTopkValue = document.getElementById('textTopkValue');
+        const audioTempSlider = document.getElementById('audioTempSlider');
+        const audioTempValue = document.getElementById('audioTempValue');
+        const audioTopkSlider = document.getElementById('audioTopkSlider');
+        const audioTopkValue = document.getElementById('audioTopkValue');
+        const repPenaltySlider = document.getElementById('repPenaltySlider');
+        const repPenaltyValue = document.getElementById('repPenaltyValue');
+        const repContextSlider = document.getElementById('repContextSlider');
+        const repContextValue = document.getElementById('repContextValue');
+
+        function bindSlider(slider, label, decimals) {
+            const update = () => {
+                const v = parseFloat(slider.value);
+                label.textContent = decimals > 0 ? v.toFixed(decimals) : String(v | 0);
+                try { localStorage.setItem('pp_' + slider.id, slider.value); } catch (e) {}
+            };
+            slider.addEventListener('input', update);
+            try {
+                const saved = localStorage.getItem('pp_' + slider.id);
+                if (saved !== null) slider.value = saved;
+            } catch (e) {}
+            update();
+        }
+        bindSlider(textTempSlider, textTempValue, 2);
+        bindSlider(textTopkSlider, textTopkValue, 0);
+        bindSlider(audioTempSlider, audioTempValue, 2);
+        bindSlider(audioTopkSlider, audioTopkValue, 0);
+        bindSlider(repPenaltySlider, repPenaltyValue, 2);
+        bindSlider(repContextSlider, repContextValue, 0);
+
+        function toggleAdvanced() {
+            advancedToggle.classList.toggle('open');
+            advancedBody.classList.toggle('open');
+            try { localStorage.setItem('pp_advancedOpen', advancedBody.classList.contains('open') ? '1' : '0'); } catch (e) {}
+        }
+        try {
+            if (localStorage.getItem('pp_advancedOpen') === '1') {
+                advancedToggle.classList.add('open');
+                advancedBody.classList.add('open');
+            }
+        } catch (e) {}
+
+        function resetAdvanced() {
+            textTempSlider.value = ADVANCED_DEFAULTS.textTemp;
+            textTopkSlider.value = ADVANCED_DEFAULTS.textTopk;
+            audioTempSlider.value = ADVANCED_DEFAULTS.audioTemp;
+            audioTopkSlider.value = ADVANCED_DEFAULTS.audioTopk;
+            repPenaltySlider.value = ADVANCED_DEFAULTS.repPenalty;
+            repContextSlider.value = ADVANCED_DEFAULTS.repContext;
+            [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider]
+                .forEach(s => s.dispatchEvent(new Event('input')));
+        }
         
         // Set preset text
         function setPreset(presetName) {
@@ -1042,13 +1218,12 @@ registerProcessor('pcm-player', P);`;
                 const wsUrl = new URL(wsProtocol + '://' + window.location.host + '/api/chat');
                 wsUrl.searchParams.set('text_prompt', textPromptInput.value || '');
                 wsUrl.searchParams.set('voice_prompt', voicePromptSelect.value || '');
-                wsUrl.searchParams.set('text_temperature', '0.7');
-                wsUrl.searchParams.set('text_topk', '100');
-                wsUrl.searchParams.set('audio_temperature', '0.7');
-                wsUrl.searchParams.set('audio_topk', '250');
-                wsUrl.searchParams.set('pad_mult', '0');
-                wsUrl.searchParams.set('repetition_penalty_context', '64');
-                wsUrl.searchParams.set('repetition_penalty', '1.1');
+                wsUrl.searchParams.set('text_temperature', textTempSlider.value);
+                wsUrl.searchParams.set('text_topk', textTopkSlider.value);
+                wsUrl.searchParams.set('audio_temperature', audioTempSlider.value);
+                wsUrl.searchParams.set('audio_topk', audioTopkSlider.value);
+                wsUrl.searchParams.set('repetition_penalty', repPenaltySlider.value);
+                wsUrl.searchParams.set('repetition_penalty_context', repContextSlider.value);
                 
                 socket = new WebSocket(wsUrl.toString());
                 socket.binaryType = 'arraybuffer';

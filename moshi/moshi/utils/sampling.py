@@ -103,6 +103,41 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return next_token
 
 
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    recent_tokens: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    """Penalize logits for tokens that appeared in recent_tokens.
+
+    Returns a NEW tensor; does not mutate the input. The input may be a
+    captured CUDA-graph output buffer that we must not alias.
+
+    Args:
+        logits: shape [..., vocab_size]
+        recent_tokens: shape [B, N] (LongTensor) of recent token IDs.
+            Use -1 for empty/unused slots. The caller is responsible for
+            keeping token 0 out of this buffer (it is the empty-slot sentinel
+            after clamping, which would otherwise produce a duplicate-index
+            scatter with ambiguous semantics).
+        penalty: > 1.0 reduces probability of recent tokens.
+    Returns:
+        New logits tensor with same shape as input.
+    """
+    if penalty == 1.0 or recent_tokens.numel() == 0:
+        return logits
+    # Clone so we never mutate caller-owned (potentially graph-captured) memory.
+    flat_logits = logits.reshape(-1, logits.shape[-1]).clone()
+    valid = recent_tokens >= 0
+    safe_tokens = recent_tokens.clamp(min=0)
+    gathered = flat_logits.gather(-1, safe_tokens)
+    # Standard CTRL-style penalty: divide positive logits, multiply negative
+    penalized = torch.where(gathered > 0, gathered / penalty, gathered * penalty)
+    penalized = torch.where(valid, penalized, gathered)
+    flat_logits.scatter_(-1, safe_tokens, penalized)
+    return flat_logits.reshape(logits.shape)
+
+
 def sample_token(
     logits: torch.Tensor,
     use_sampling: bool = False,

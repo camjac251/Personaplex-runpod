@@ -41,7 +41,7 @@ import sphn
 import torch
 from tqdm.auto import tqdm
 
-from ..utils.sampling import sample_token
+from ..utils.sampling import sample_token, apply_repetition_penalty
 from ..utils.compile import CUDAGraphed
 from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 AUDIO_TOKENS_PER_STREAM = 8
 FRAME_RATE_HZ = 12.5
+MAX_REPETITION_CONTEXT = 256
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
@@ -560,10 +561,14 @@ class _LMGenState:
     graphed_main: CUDAGraphed
     graphed_embeddings: CUDAGraphed
     graphed_depth: CUDAGraphed
+    recent_text_tokens: torch.Tensor  # [B, MAX_REPETITION_CONTEXT], -1 = empty
+    recent_text_offset: int = 0
     offset: int = 0
 
     def reset(self):
         self.offset = 0
+        self.recent_text_offset = 0
+        self.recent_text_tokens.fill_(-1)
         self.provided[:] = False
 
 
@@ -661,6 +666,8 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        repetition_penalty: float = 1.0,
+        repetition_penalty_context: int = 64,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -671,6 +678,8 @@ class LMGen(StreamingModule[_LMGenState]):
         self.temp_text = temp_text
         self.top_k = top_k
         self.top_k_text = top_k_text
+        self.repetition_penalty = repetition_penalty
+        self.repetition_penalty_context = max(0, min(repetition_penalty_context, MAX_REPETITION_CONTEXT))
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
@@ -721,7 +730,14 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
-        return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
+        recent_text_tokens = torch.full(
+            (batch_size, MAX_REPETITION_CONTEXT),
+            -1,
+            device=lm_model.device,
+            dtype=torch.long,
+        )
+
+        return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth, recent_text_tokens)
     
     @torch.no_grad()
     def prepare_step_input(self,
@@ -878,8 +894,16 @@ class LMGen(StreamingModule[_LMGenState]):
         lm_model = self.lm_model
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
+        text_logits_f = text_logits.float()
+        if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
+            ctx = self.repetition_penalty_context
+            text_logits_f = apply_repetition_penalty(
+                text_logits_f,
+                state.recent_text_tokens[:, :ctx],
+                self.repetition_penalty,
+            )
         sampled_text_token = sample_token(
-            text_logits.float(),
+            text_logits_f,
             self.use_sampling,
             self.temp_text,
             self.top_k_text,
@@ -890,6 +914,24 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+
+        # Update repetition penalty ring buffer with the chosen text token.
+        # Skip pad (0) and silence (3) so they do not crowd the context. Also,
+        # filtering 0 here is what makes the duplicate-index scatter in
+        # apply_repetition_penalty unambiguous (the sentinel for empty slots).
+        if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
+            ctx = self.repetition_penalty_context
+            keep_mask = (next_text_token != 0) & (next_text_token != 3)
+            slot = state.recent_text_offset % ctx
+            # Always issue the write (no .any() to avoid a per-step CUDA sync).
+            # When keep_mask is all-False the where() rewrites the existing
+            # values back, which is a no-op but stays on the GPU.
+            state.recent_text_tokens[:, slot] = torch.where(
+                keep_mask,
+                next_text_token,
+                state.recent_text_tokens[:, slot],
+            )
+            state.recent_text_offset = (state.recent_text_offset + 1) % ctx
 
         if self.return_logits:
             sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
