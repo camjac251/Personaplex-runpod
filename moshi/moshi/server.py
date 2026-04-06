@@ -840,16 +840,13 @@ def main():
         let recorder = null;
         let audioContext = null;
         let decoderWorker = null;
-        let nextPlayTime = 0;
         let recordingDestination = null;
         let mediaRecorder = null;
         let recordedChunks = [];
         let micStream = null;
         let micSource = null;
         let shouldShowDownload = false;
-        let audioQueue = [];
-        let jitterBufferReady = false;
-        const JITTER_BUFFER_MS = 120;
+        let playerNode = null;
         const SAMPLE_RATE = 24000;
         
         // View elements
@@ -939,7 +936,38 @@ def main():
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
-            nextPlayTime = audioContext.currentTime;
+            if (!playerNode) {
+                const code = `
+class P extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.chunks = [];
+        this.offset = 0;
+        this.port.onmessage = (e) => {
+            if (e.data === 'flush') { this.chunks = []; this.offset = 0; return; }
+            this.chunks.push(e.data);
+        };
+    }
+    process(inputs, outputs) {
+        const out = outputs[0][0];
+        let w = 0;
+        while (w < out.length && this.chunks.length > 0) {
+            const c = this.chunks[0];
+            const n = Math.min(out.length - w, c.length - this.offset);
+            out.set(c.subarray(this.offset, this.offset + n), w);
+            w += n;
+            this.offset += n;
+            if (this.offset >= c.length) { this.chunks.shift(); this.offset = 0; }
+        }
+        return true;
+    }
+}
+registerProcessor('pcm-player', P);`;
+                const blob = new Blob([code], { type: 'application/javascript' });
+                await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
+                playerNode = new AudioWorkletNode(audioContext, 'pcm-player');
+                playerNode.connect(audioContext.destination);
+            }
         }
 
         async function startSessionRecording() {
@@ -952,6 +980,9 @@ def main():
                 }
                 if (!recordingDestination) {
                     recordingDestination = audioContext.createMediaStreamDestination();
+                }
+                if (playerNode) {
+                    playerNode.connect(recordingDestination);
                 }
                 try {
                     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1055,41 +1086,8 @@ def main():
         }
         
         function playDecodedAudio(pcmData) {
-            if (!audioContext || !pcmData || pcmData.length === 0) return;
-
-            const buffer = audioContext.createBuffer(1, pcmData.length, audioContext.sampleRate);
-            buffer.getChannelData(0).set(pcmData);
-            audioQueue.push(buffer);
-
-            // Jitter buffer: accumulate audio before starting playback
-            // so network/processing variance does not cause gaps
-            if (!jitterBufferReady) {
-                let total = 0;
-                for (const b of audioQueue) total += b.duration;
-                if (total < JITTER_BUFFER_MS / 1000) return;
-                jitterBufferReady = true;
-                nextPlayTime = audioContext.currentTime + JITTER_BUFFER_MS / 1000;
-            }
-
-            // Drain queued buffers into the Web Audio scheduler
-            while (audioQueue.length > 0) {
-                const buf = audioQueue.shift();
-                const now = audioContext.currentTime;
-                if (nextPlayTime < now - 0.04) {
-                    // Significantly behind (>40ms): real underrun, resync
-                    nextPlayTime = now + 0.01;
-                } else if (nextPlayTime < now) {
-                    // Slightly behind: normal bursty delivery, just catch up
-                    nextPlayTime = now;
-                }
-                const source = audioContext.createBufferSource();
-                source.buffer = buf;
-                source.connect(audioContext.destination);
-                if (recordingDestination) source.connect(recordingDestination);
-                source.start(nextPlayTime);
-                nextPlayTime += buf.duration;
-            }
-
+            if (!playerNode || !pcmData || pcmData.length === 0) return;
+            playerNode.port.postMessage(pcmData);
             aiVisualizer.classList.add('active');
             setTimeout(() => aiVisualizer.classList.remove('active'), 100);
         }
@@ -1264,9 +1262,11 @@ def main():
             connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
             aiVisualizer.classList.remove('active');
             userVisualizer.classList.remove('active');
-            nextPlayTime = 0;
-            audioQueue = [];
-            jitterBufferReady = false;
+            if (playerNode) {
+                playerNode.port.postMessage('flush');
+                playerNode.disconnect();
+                playerNode = null;
+            }
         }
         
         // Handle page unload
