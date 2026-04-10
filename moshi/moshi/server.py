@@ -756,8 +756,8 @@ def main():
                         </div>
                     </div>
                     <div class="form-group">
-                        <textarea id="textPrompt" maxlength="1000" placeholder="Enter your text prompt...">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
-                        <div class="char-count"><span id="charCount">0</span>/1000</div>
+                        <textarea id="textPrompt" maxlength="2000" placeholder="Enter your text prompt...">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
+                        <div class="char-count"><span id="charCount">0</span>/2000</div>
                     </div>
                 </div>
                 
