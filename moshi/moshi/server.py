@@ -90,16 +90,14 @@ def wrap_with_system_tags(text: str) -> str:
 @dataclass
 class ServerState:
     mimi: MimiModel
-    other_mimi: MimiModel
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
 
-    def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
+    def __init__(self, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
-        self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
@@ -114,7 +112,6 @@ class ServerState:
         
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
-        self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
     def warmup(self):
@@ -302,7 +299,6 @@ class ServerState:
 
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
-            self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
                 if close or ws.closed:
@@ -537,7 +533,6 @@ def main():
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME, token=hf_token)
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
 
     if args.tokenizer is None:
@@ -552,7 +547,6 @@ def main():
     logger.info("moshi loaded")
     state = ServerState(
         mimi=mimi,
-        other_mimi=other_mimi,
         text_tokenizer=text_tokenizer,
         lm=lm,
         device=args.device,
