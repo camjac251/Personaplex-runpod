@@ -87,6 +87,11 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+UPLOAD_PREFIX = "upload:"
+UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+UPLOAD_ALLOWED_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -96,11 +101,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
+                 uploads_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.uploads_dir = uploads_dir
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -129,6 +136,79 @@ class ServerState:
             torch.cuda.synchronize()
             # Clear CUDA cache after warmup to free any fragmented memory
             torch.cuda.empty_cache()
+
+    def _resolve_upload_path(self, name: str) -> Optional[str]:
+        """Return an absolute path inside uploads_dir, or None if unsafe/missing.
+        Blocks path traversal and ensures the resolved path stays under uploads_dir."""
+        if self.uploads_dir is None or not name:
+            return None
+        if os.sep in name or (os.altsep and os.altsep in name) or name.startswith("."):
+            return None
+        base = os.path.realpath(self.uploads_dir)
+        candidate = os.path.realpath(os.path.join(base, name))
+        try:
+            if os.path.commonpath([base, candidate]) != base:
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    async def handle_voice_upload(self, request):
+        """Accept a multipart upload of an audio file for voice prompting.
+        Returns JSON {filename: "upload:<name>"} on success."""
+        if self.uploads_dir is None:
+            return web.json_response({"error": "uploads disabled on this server"}, status=503)
+        if request.content_length is not None and request.content_length > UPLOAD_MAX_BYTES:
+            return web.json_response({"error": "file too large"}, status=413)
+        try:
+            reader = await request.multipart()
+        except Exception as e:
+            return web.json_response({"error": f"invalid multipart body: {e}"}, status=400)
+
+        field = await reader.next()
+        while field is not None and field.name != "file":
+            field = await reader.next()
+        if field is None:
+            return web.json_response({"error": "missing 'file' field"}, status=400)
+
+        original = field.filename or "upload"
+        ext = Path(original).suffix.lower()
+        if ext not in UPLOAD_ALLOWED_EXT:
+            return web.json_response(
+                {"error": f"unsupported extension {ext or '(none)'}; allowed: {sorted(UPLOAD_ALLOWED_EXT)}"},
+                status=400,
+            )
+
+        safe_name = f"upload_{secrets.token_urlsafe(8)}{ext}"
+        out_path = Path(self.uploads_dir) / safe_name
+        total = 0
+        try:
+            with open(out_path, "wb") as f:
+                while True:
+                    chunk = await field.read_chunk(size=64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > UPLOAD_MAX_BYTES:
+                        f.close()
+                        out_path.unlink(missing_ok=True)
+                        return web.json_response({"error": "file too large"}, status=413)
+                    f.write(chunk)
+        except Exception as e:
+            out_path.unlink(missing_ok=True)
+            return web.json_response({"error": f"failed to save file: {e}"}, status=500)
+
+        # Validate it decodes. sphn.read is CPU-bound; run in executor so we do not
+        # block the event loop on large files.
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, sphn.read, str(out_path))
+        except Exception as e:
+            out_path.unlink(missing_ok=True)
+            return web.json_response({"error": f"could not decode audio: {e}"}, status=400)
+
+        logger.info(f"voice upload saved: {safe_name} ({total} bytes, original={original!r})")
+        return web.json_response({"filename": f"{UPLOAD_PREFIX}{safe_name}", "bytes": total})
 
     @torch.no_grad()
     def _process_audio_frame(self, chunk_np):
@@ -194,23 +274,29 @@ class ServerState:
             ),
         }
         
-        # Construct full voice prompt path
+        # Construct full voice prompt path. Two sources:
+        #   - "upload:<name>" -> uploads_dir/<name> (user-provided wav/mp3/etc.)
+        #   - "<name>"        -> voice_prompt_dir/<name> (preset .pt or audio)
         requested_voice_prompt_path = None
         voice_prompt_path = None
-        if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
-            requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
+        voice_prompt_filename = request.query.get("voice_prompt", "") or ""
+        if voice_prompt_filename.startswith(UPLOAD_PREFIX):
+            upload_name = voice_prompt_filename[len(UPLOAD_PREFIX):]
+            requested_voice_prompt_path = self._resolve_upload_path(upload_name)
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
+                raise FileNotFoundError(
+                    f"Uploaded voice prompt '{upload_name}' not found"
+                )
+            voice_prompt_path = requested_voice_prompt_path
+        elif self.voice_prompt_dir is not None and voice_prompt_filename:
+            requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+            if not os.path.exists(requested_voice_prompt_path):
                 raise FileNotFoundError(
                     f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
                 )
-            else:
-                voice_prompt_path = requested_voice_prompt_path
-                
-        if self.lm_gen.voice_prompt != voice_prompt_path:
+            voice_prompt_path = requested_voice_prompt_path
+
+        if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
@@ -472,6 +558,16 @@ def main():
         )
     )
     parser.add_argument(
+        "--uploads-dir",
+        type=str,
+        help=(
+            "Directory where user-uploaded voice prompt audio files are stored. "
+            "Defaults to '<voice-prompt-dir>/uploads' when voice-prompt-dir is set, "
+            "otherwise disables the upload endpoint. Pass an explicit path to enable "
+            "uploads even without a preset voice directory."
+        )
+    )
+    parser.add_argument(
         "--ssl",
         type=str,
         help=(
@@ -489,6 +585,15 @@ def main():
         assert os.path.exists(args.voice_prompt_dir), \
             f"Directory missing: {args.voice_prompt_dir}"
     logger.info(f"voice_prompt_dir = {args.voice_prompt_dir}")
+
+    # Resolve uploads_dir. Default: <voice_prompt_dir>/uploads if the preset dir
+    # exists; otherwise None (upload endpoint disabled unless user passes
+    # --uploads-dir explicitly).
+    if args.uploads_dir is None and args.voice_prompt_dir is not None:
+        args.uploads_dir = os.path.join(args.voice_prompt_dir, "uploads")
+    if args.uploads_dir is not None:
+        os.makedirs(args.uploads_dir, exist_ok=True)
+    logger.info(f"uploads_dir = {args.uploads_dir}")
 
     static_path: None | str = _get_static_path(args.static, args.hf_repo)
     assert static_path is None or os.path.exists(static_path), \
@@ -551,12 +656,14 @@ def main():
         lm=lm,
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
+        uploads_dir=args.uploads_dir,
         save_voice_prompt_embeddings=False,
     )
     logger.info("warming up the model")
     state.warmup()
-    app = web.Application()
+    app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -700,9 +807,43 @@ def main():
         .footer a { color: #2f5d50; text-decoration: none; }
         .footer a:hover { text-decoration: underline; }
         
-        .error-msg { background: #fff5f5; border: 1px solid #dc3545; color: #dc3545; padding: 15px; 
+        .error-msg { background: #fff5f5; border: 1px solid #dc3545; color: #dc3545; padding: 15px;
                      border-radius: 8px; margin-bottom: 20px; display: none; }
         .mic-icon { width: 24px; height: 24px; }
+
+        /* Voice upload */
+        .upload-row { margin-top: 14px; padding-top: 14px; border-top: 1px dashed rgba(154, 122, 58, 0.35); }
+        .upload-toggle-btn { background: rgba(255,255,255,0.85); color: #5f5136;
+                             border: 1px solid rgba(156, 131, 84, 0.4); border-radius: 8px;
+                             padding: 8px 14px; font-size: 0.85em; cursor: pointer;
+                             font-family: inherit; transition: all 0.2s; }
+        .upload-toggle-btn:hover { background: #2f5d50; color: #f7f1e6; border-color: #2f5d50; }
+        .upload-toggle-btn .arrow { display: inline-block; margin-right: 6px; transition: transform 0.2s; }
+        .upload-toggle-btn.open .arrow { transform: rotate(90deg); }
+        .upload-area { display: none; margin-top: 12px; padding: 14px;
+                       background: rgba(250, 246, 239, 0.7); border-radius: 10px;
+                       border: 1px dashed rgba(156, 131, 84, 0.5); }
+        .upload-area.open { display: block; }
+        .upload-area .hint { font-size: 0.78em; color: #8a7a5a; margin-bottom: 10px; line-height: 1.45; }
+        .upload-area input[type="file"] { font-family: inherit; font-size: 0.88em; color: #3a3329; }
+        .upload-area input[type="file"]::file-selector-button {
+            margin-right: 10px; padding: 6px 12px; border-radius: 6px;
+            border: 1px solid rgba(156, 131, 84, 0.4); background: #fff; color: #5f5136;
+            font-family: inherit; font-size: 0.85em; cursor: pointer;
+        }
+        .upload-area input[type="file"]::file-selector-button:hover {
+            background: #2f5d50; color: #f7f1e6; border-color: #2f5d50;
+        }
+        .upload-status { margin-top: 10px; font-size: 0.85em; min-height: 1.2em; }
+        .upload-status.uploading { color: #6e5d3b; }
+        .upload-status.success { color: #2f5d50; font-weight: 600; }
+        .upload-status.error { color: #9a3b3b; }
+        .upload-clear { display: none; margin-top: 8px; padding: 5px 12px; font-size: 0.78em;
+                        background: rgba(255,255,255,0.85); color: #9a3b3b;
+                        border: 1px solid rgba(154, 59, 59, 0.4); border-radius: 6px; cursor: pointer; }
+        .upload-clear:hover { background: #9a3b3b; color: #fff; border-color: #9a3b3b; }
+        .upload-clear.visible { display: inline-block; }
+        select:disabled { opacity: 0.55; cursor: not-allowed; }
         
         /* Responsive */
         @media (max-width: 600px) {
@@ -778,6 +919,24 @@ def main():
                             <option value="VARM3.pt">VARIETY_M3</option>
                             <option value="VARM4.pt">VARIETY_M4</option>
                         </select>
+                    </div>
+                    <div class="upload-row">
+                        <button type="button" class="upload-toggle-btn" id="uploadToggle" onclick="toggleUploadArea()">
+                            <span class="arrow">&#9656;</span>Clone a voice (upload 10-30s of clean audio)
+                        </button>
+                        <div class="upload-area" id="uploadArea">
+                            <div class="hint">
+                                Mono or stereo, any common format (wav, mp3, flac, ogg, m4a, opus). 10-30s of one
+                                clear speaker works best. Uploaded audio is normalized and fed through Mimi as a
+                                voice prefix - the model continues in that timbre. Not zero-shot perfect, but
+                                recognizable.
+                            </div>
+                            <input type="file" id="voiceUploadInput" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.opus,.aac">
+                            <div class="upload-status" id="uploadStatus"></div>
+                            <button type="button" class="upload-clear" id="uploadClear" onclick="clearUploadedVoice()">
+                                Remove (use preset above instead)
+                            </button>
+                        </div>
                     </div>
                 </div>
                 
@@ -1041,6 +1200,71 @@ def main():
                 updateCharCount();
             }
         }
+
+        // Voice upload (clone)
+        let uploadedVoiceFilename = null;
+        const uploadToggleBtn = document.getElementById('uploadToggle');
+        const uploadArea = document.getElementById('uploadArea');
+        const voiceUploadInput = document.getElementById('voiceUploadInput');
+        const uploadStatus = document.getElementById('uploadStatus');
+        const uploadClearBtn = document.getElementById('uploadClear');
+
+        function toggleUploadArea() {
+            uploadArea.classList.toggle('open');
+            uploadToggleBtn.classList.toggle('open');
+        }
+
+        function setUploadStatus(text, kind) {
+            uploadStatus.textContent = text || '';
+            uploadStatus.className = 'upload-status' + (kind ? ' ' + kind : '');
+        }
+
+        async function uploadVoiceFile(file) {
+            if (!file) return;
+            // 20 MB cap matches server.
+            if (file.size > 20 * 1024 * 1024) {
+                setUploadStatus('File too large (max 20 MB)', 'error');
+                return;
+            }
+            setUploadStatus('Uploading ' + file.name + '...', 'uploading');
+            uploadClearBtn.classList.remove('visible');
+            try {
+                const form = new FormData();
+                form.append('file', file);
+                const res = await fetch('/api/voice-upload', { method: 'POST', body: form });
+                let json = null;
+                try { json = await res.json(); } catch (e) { json = null; }
+                if (!res.ok) {
+                    const msg = (json && json.error) || ('upload failed (' + res.status + ')');
+                    throw new Error(msg);
+                }
+                if (!json || !json.filename) {
+                    throw new Error('server returned no filename');
+                }
+                uploadedVoiceFilename = json.filename;
+                setUploadStatus('Using uploaded voice: ' + file.name, 'success');
+                uploadClearBtn.classList.add('visible');
+                voicePromptSelect.disabled = true;
+            } catch (err) {
+                uploadedVoiceFilename = null;
+                setUploadStatus('Upload failed: ' + (err.message || err), 'error');
+                uploadClearBtn.classList.remove('visible');
+                voicePromptSelect.disabled = false;
+            }
+        }
+
+        voiceUploadInput.addEventListener('change', (ev) => {
+            const file = ev.target.files && ev.target.files[0];
+            if (file) uploadVoiceFile(file);
+        });
+
+        function clearUploadedVoice() {
+            uploadedVoiceFilename = null;
+            voiceUploadInput.value = '';
+            setUploadStatus('', '');
+            uploadClearBtn.classList.remove('visible');
+            voicePromptSelect.disabled = false;
+        }
         
         function showSetupView() {
             setupView.classList.remove('hidden');
@@ -1211,7 +1435,9 @@ registerProcessor('pcm-player', P);`;
                 const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
                 const wsUrl = new URL(wsProtocol + '://' + window.location.host + '/api/chat');
                 wsUrl.searchParams.set('text_prompt', textPromptInput.value || '');
-                wsUrl.searchParams.set('voice_prompt', voicePromptSelect.value || '');
+                // Uploaded voice wins over preset when both are present.
+                const voiceParam = uploadedVoiceFilename || voicePromptSelect.value || '';
+                wsUrl.searchParams.set('voice_prompt', voiceParam);
                 wsUrl.searchParams.set('text_temperature', textTempSlider.value);
                 wsUrl.searchParams.set('text_topk', textTopkSlider.value);
                 wsUrl.searchParams.set('audio_temperature', audioTempSlider.value);
