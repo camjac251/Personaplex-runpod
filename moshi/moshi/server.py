@@ -326,9 +326,14 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
-                        opus_reader.append_bytes(payload)
+                        try:
+                            opus_reader.append_bytes(payload)
+                        except Exception as e:
+                            clog.log("warning", f"opus decode failed: {type(e).__name__}: {e}")
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
+            except Exception as e:
+                clog.log("error", f"recv_loop: {type(e).__name__}: {e}")
             finally:
                 close = True
                 clog.log("info", "connection closed")
@@ -337,33 +342,55 @@ class ServerState:
             loop = asyncio.get_event_loop()
             all_pcm_data = None
 
-            while True:
-                if close:
-                    return
-                await asyncio.sleep(0.001)
-                pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
-                    continue
-                if all_pcm_data is None:
-                    all_pcm_data = pcm
-                else:
-                    all_pcm_data = np.concatenate((all_pcm_data, pcm))
-                while all_pcm_data.shape[-1] >= self.frame_size:
-                    chunk = all_pcm_data[: self.frame_size]
-                    all_pcm_data = all_pcm_data[self.frame_size:]
+            try:
+                while True:
+                    if close:
+                        return
+                    await asyncio.sleep(0.001)
+                    pcm = opus_reader.read_pcm()
+                    if pcm.shape[-1] == 0:
+                        continue
+                    if all_pcm_data is None:
+                        all_pcm_data = pcm
+                    else:
+                        all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                    while all_pcm_data.shape[-1] >= self.frame_size:
+                        chunk = all_pcm_data[: self.frame_size]
+                        all_pcm_data = all_pcm_data[self.frame_size:]
 
-                    # Offload GPU inference to thread so event loop stays
-                    # responsive for send_loop and recv_loop
-                    results = await loop.run_in_executor(
-                        None, self._process_audio_frame, chunk
-                    )
+                        # Offload GPU inference to a thread so the event loop
+                        # stays responsive for recv_loop. Wrap with shield so
+                        # that if opus_loop gets cancelled (e.g. the session
+                        # is torn down on disconnect) the GPU thread finishes
+                        # its current frame before cancellation propagates.
+                        # Otherwise the outer code releases self.lock while
+                        # this thread is still mutating mimi / lm_gen state,
+                        # and the next session's reset_streaming() races with
+                        # in-flight CUDA work.
+                        in_flight = asyncio.ensure_future(
+                            loop.run_in_executor(
+                                None, self._process_audio_frame, chunk
+                            )
+                        )
+                        try:
+                            results = await asyncio.shield(in_flight)
+                        except asyncio.CancelledError:
+                            try:
+                                await in_flight
+                            except BaseException:
+                                pass
+                            raise
 
-                    for pcm_data, text in results:
-                        # Send raw PCM float32 directly (bypass Opus codec)
-                        await ws.send_bytes(b"\x01" + pcm_data.astype(np.float32).tobytes())
-                        if text is not None:
-                            msg = b"\x02" + bytes(text, encoding="utf8")
-                            await ws.send_bytes(msg)
+                        for pcm_data, text in results:
+                            # Send raw PCM float32 directly (bypass Opus codec)
+                            await ws.send_bytes(b"\x01" + pcm_data.astype(np.float32).tobytes())
+                            if text is not None:
+                                msg = b"\x02" + bytes(text, encoding="utf8")
+                                await ws.send_bytes(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                clog.log("error", f"opus_loop: {type(e).__name__}: {e}")
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
