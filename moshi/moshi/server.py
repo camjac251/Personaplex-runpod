@@ -31,7 +31,6 @@ import random
 import os
 from pathlib import Path
 import tarfile
-import time
 import secrets
 import sys
 from typing import Literal, Optional
@@ -43,9 +42,7 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
-from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
 from .utils.connection import create_ssl_context, get_lan_ip
