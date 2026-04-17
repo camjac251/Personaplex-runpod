@@ -303,7 +303,7 @@ class ServerState:
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        seed = _qint("seed", -1) if "seed" in request.query else None
 
         async def recv_loop():
             nonlocal close
@@ -773,6 +773,18 @@ def main():
         .slider-reset { background: rgba(255,255,255,0.85); color: #5f5136; border: 1px solid rgba(156, 131, 84, 0.4);
                         border-radius: 6px; padding: 6px 12px; font-size: 0.78em; cursor: pointer; }
         .slider-reset:hover { background: #2f5d50; color: #f7f1e6; border-color: #2f5d50; }
+        .seed-row { margin-bottom: 14px; }
+        .seed-row .seed-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78em;
+                                  color: #5f5136; font-weight: 500; cursor: pointer; user-select: none; }
+        .seed-row .seed-toggle input { accent-color: #2f5d50; cursor: pointer; }
+        .seed-row input[type="number"] { width: 100%; padding: 8px 10px; border-radius: 8px;
+                                          border: 1px solid rgba(156, 131, 84, 0.4); background: rgba(255, 255, 255, 0.9);
+                                          color: #1c1a17; font-size: 0.9em; font-family: inherit;
+                                          font-variant-numeric: tabular-nums; }
+        .seed-row input[type="number"]:focus { outline: none; border-color: #9a7a3a;
+                                                box-shadow: 0 0 0 3px rgba(198,161,91,0.2); }
+        .seed-row input[type="number"]:disabled { opacity: 0.5; cursor: not-allowed;
+                                                   background: rgba(245, 240, 228, 0.6); }
         
         /* Conversation view */
         .visualizer-container { display: flex; gap: 30px; justify-content: center; margin: 30px 0; }
@@ -782,12 +794,8 @@ def main():
         .visualizer.ai { border: 3px solid #00a8cc; }
         .visualizer.user { border: 3px solid #76b900; }
         .visualizer-label { position: absolute; bottom: -30px; font-size: 0.9em; color: #666; font-weight: 500; }
-        .visualizer-ring { position: absolute; width: 100%; height: 100%; border-radius: 50%; 
-                          border: 3px solid transparent; }
-        .visualizer.active .visualizer-ring { animation: ring-pulse 0.5s infinite; }
-        .visualizer.ai.active .visualizer-ring { border-color: #00a8cc; }
-        .visualizer.user.active .visualizer-ring { border-color: #76b900; }
-        @keyframes ring-pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.3); opacity: 0; } }
+        .visualizer-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+                             border-radius: 50%; pointer-events: none; }
         
         .transcript { background: rgba(255,255,255,0.9); border-radius: 12px; padding: 20px; min-height: 100px; 
                       max-height: 200px; overflow-y: auto; margin-bottom: 24px; 
@@ -994,6 +1002,17 @@ def main():
                             <input type="range" id="repContextSlider" min="0" max="256" step="8" value="64">
                             <div class="slider-hint">How many recent text tokens the penalty considers.</div>
                         </div>
+                        <div class="seed-row">
+                            <div class="slider-label">
+                                <span>Random seed</span>
+                                <label class="seed-toggle">
+                                    <input type="checkbox" id="seedRandomToggle" checked>
+                                    <span>Use random</span>
+                                </label>
+                            </div>
+                            <input type="number" id="seedInput" min="0" max="2147483647" step="1" value="42" disabled>
+                            <div class="slider-hint">Set a fixed seed to reproduce a take. Uncheck "Use random" to enable.</div>
+                        </div>
                         <div class="slider-actions">
                             <button class="slider-reset" type="button" onclick="resetAdvanced()">Reset to defaults</button>
                         </div>
@@ -1026,19 +1045,11 @@ def main():
             
             <div class="visualizer-container">
                 <div class="visualizer ai" id="aiVisualizer">
-                    <svg width="50" height="50" viewBox="0 0 24 24" fill="none" stroke="#00a8cc" stroke-width="2">
-                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>
-                    </svg>
-                    <div class="visualizer-ring"></div>
+                    <canvas class="visualizer-canvas" id="aiCanvas"></canvas>
                     <span class="visualizer-label">AI</span>
                 </div>
                 <div class="visualizer user" id="userVisualizer">
-                    <svg width="50" height="50" viewBox="0 0 24 24" fill="none" stroke="#76b900" stroke-width="2">
-                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>
-                    </svg>
-                    <div class="visualizer-ring"></div>
+                    <canvas class="visualizer-canvas" id="userCanvas"></canvas>
                     <span class="visualizer-label">You</span>
                 </div>
             </div>
@@ -1093,6 +1104,9 @@ def main():
         let micSource = null;
         let shouldShowDownload = false;
         let playerNode = null;
+        let aiAnalyser = null;
+        let userAnalyser = null;
+        let visualizerRAF = null;
         const SAMPLE_RATE = 24000;
         
         // View elements
@@ -1149,6 +1163,8 @@ def main():
         const repPenaltyValue = document.getElementById('repPenaltyValue');
         const repContextSlider = document.getElementById('repContextSlider');
         const repContextValue = document.getElementById('repContextValue');
+        const seedRandomToggle = document.getElementById('seedRandomToggle');
+        const seedInput = document.getElementById('seedInput');
 
         function bindSlider(slider, label, decimals) {
             const update = () => {
@@ -1169,6 +1185,26 @@ def main():
         bindSlider(audioTopkSlider, audioTopkValue, 0);
         bindSlider(repPenaltySlider, repPenaltyValue, 2);
         bindSlider(repContextSlider, repContextValue, 0);
+
+        // Seed control: persisted to localStorage. When "Use random" is checked, no seed
+        // query param is sent; the server picks one. Otherwise the value in seedInput is used.
+        function syncSeedDisabled() {
+            seedInput.disabled = seedRandomToggle.checked;
+        }
+        try {
+            const savedRandom = localStorage.getItem('pp_seedRandom');
+            if (savedRandom !== null) seedRandomToggle.checked = savedRandom === '1';
+            const savedSeed = localStorage.getItem('pp_seedValue');
+            if (savedSeed !== null) seedInput.value = savedSeed;
+        } catch (e) {}
+        syncSeedDisabled();
+        seedRandomToggle.addEventListener('change', () => {
+            syncSeedDisabled();
+            try { localStorage.setItem('pp_seedRandom', seedRandomToggle.checked ? '1' : '0'); } catch (e) {}
+        });
+        seedInput.addEventListener('input', () => {
+            try { localStorage.setItem('pp_seedValue', seedInput.value); } catch (e) {}
+        });
 
         function toggleAdvanced() {
             advancedToggle.classList.toggle('open');
@@ -1191,6 +1227,10 @@ def main():
             repContextSlider.value = ADVANCED_DEFAULTS.repContext;
             [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider]
                 .forEach(s => s.dispatchEvent(new Event('input')));
+            seedRandomToggle.checked = true;
+            seedInput.value = '42';
+            seedRandomToggle.dispatchEvent(new Event('change'));
+            seedInput.dispatchEvent(new Event('input'));
         }
         
         // Set preset text
@@ -1341,7 +1381,11 @@ registerProcessor('pcm-player', P);`;
                 const blob = new Blob([code], { type: 'application/javascript' });
                 await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
                 playerNode = new AudioWorkletNode(audioContext, 'pcm-player');
-                playerNode.connect(audioContext.destination);
+                aiAnalyser = audioContext.createAnalyser();
+                aiAnalyser.fftSize = 256;
+                aiAnalyser.smoothingTimeConstant = 0.85;
+                playerNode.connect(aiAnalyser);
+                aiAnalyser.connect(audioContext.destination);
             }
         }
 
@@ -1363,9 +1407,15 @@ registerProcessor('pcm-player', P);`;
                     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     micSource = audioContext.createMediaStreamSource(micStream);
                     micSource.connect(recordingDestination);
+                    userAnalyser = audioContext.createAnalyser();
+                    userAnalyser.fftSize = 256;
+                    userAnalyser.smoothingTimeConstant = 0.85;
+                    micSource.connect(userAnalyser);
                 } catch (err) {
                     console.warn('Could not attach mic stream to recording:', err);
                 }
+                // Start the visualizer loop regardless of mic outcome so the AI side animates.
+                startVisualizers();
 
                 mediaRecorder = new MediaRecorder(recordingDestination.stream);
                 mediaRecorder.ondataavailable = (event) => {
@@ -1408,8 +1458,79 @@ registerProcessor('pcm-player', P);`;
         function playDecodedAudio(pcmData) {
             if (!playerNode || !pcmData || pcmData.length === 0) return;
             playerNode.port.postMessage(pcmData);
-            aiVisualizer.classList.add('active');
-            setTimeout(() => aiVisualizer.classList.remove('active'), 100);
+        }
+
+        // Canvas visualizers driven by AnalyserNode RMS. One RAF loop draws both circles.
+        const aiCanvas = document.getElementById('aiCanvas');
+        const userCanvas = document.getElementById('userCanvas');
+        const VIZ_AI_COLOR = '#00a8cc';
+        const VIZ_USER_COLOR = '#76b900';
+        let vizBuffer = null;
+
+        function fitCanvas(canvas) {
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            const w = Math.max(1, Math.floor(rect.width * dpr));
+            const h = Math.max(1, Math.floor(rect.height * dpr));
+            if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w;
+                canvas.height = h;
+            }
+            return dpr;
+        }
+
+        function drawVisualizer(canvas, analyser, color, isLive) {
+            const ctx = canvas.getContext('2d');
+            const dpr = fitCanvas(canvas);
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+            const cx = w / 2;
+            const cy = h / 2;
+            const maxR = Math.min(w, h) * 0.46;
+            let intensity = 0;
+            if (analyser && isLive) {
+                if (!vizBuffer || vizBuffer.length !== analyser.frequencyBinCount) {
+                    vizBuffer = new Uint8Array(analyser.frequencyBinCount);
+                }
+                analyser.getByteFrequencyData(vizBuffer);
+                let sumSq = 0;
+                for (let i = 0; i < vizBuffer.length; i++) sumSq += vizBuffer[i] * vizBuffer[i];
+                intensity = Math.min(1, Math.sqrt(sumSq / vizBuffer.length) / 110);
+            }
+            const baseR = maxR * 0.35;
+            const r = baseR + (maxR - baseR) * intensity;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.globalAlpha = 0.85;
+            ctx.fill();
+            ctx.globalAlpha = 1;
+            // Inner solid dot when audio is active.
+            if (isLive) {
+                ctx.beginPath();
+                ctx.arc(cx, cy, maxR * 0.18, 0, Math.PI * 2);
+                ctx.fillStyle = color;
+                ctx.fill();
+            }
+        }
+
+        function startVisualizers() {
+            stopVisualizers();
+            const tick = () => {
+                const live = !!(socket && socket.readyState === WebSocket.OPEN);
+                drawVisualizer(aiCanvas, aiAnalyser, VIZ_AI_COLOR, live);
+                drawVisualizer(userCanvas, userAnalyser, VIZ_USER_COLOR, live);
+                visualizerRAF = requestAnimationFrame(tick);
+            };
+            visualizerRAF = requestAnimationFrame(tick);
+        }
+
+        function stopVisualizers() {
+            if (visualizerRAF != null) {
+                cancelAnimationFrame(visualizerRAF);
+                visualizerRAF = null;
+            }
         }
         
         
@@ -1444,6 +1565,9 @@ registerProcessor('pcm-player', P);`;
                 wsUrl.searchParams.set('audio_topk', audioTopkSlider.value);
                 wsUrl.searchParams.set('repetition_penalty', repPenaltySlider.value);
                 wsUrl.searchParams.set('repetition_penalty_context', repContextSlider.value);
+                if (!seedRandomToggle.checked && seedInput.value !== '') {
+                    wsUrl.searchParams.set('seed', seedInput.value);
+                }
                 
                 socket = new WebSocket(wsUrl.toString());
                 socket.binaryType = 'arraybuffer';
@@ -1519,8 +1643,6 @@ registerProcessor('pcm-player', P);`;
                 
                 recorder.ondataavailable = (data) => {
                     if (socket && socket.readyState === WebSocket.OPEN) {
-                        userVisualizer.classList.add('active');
-                        setTimeout(() => userVisualizer.classList.remove('active'), 100);
                         const msg = new Uint8Array(1 + data.length);
                         msg[0] = 0x01;
                         msg.set(data, 1);
@@ -1572,8 +1694,15 @@ registerProcessor('pcm-player', P);`;
             }
             connectBtn.disabled = false;
             connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
-            aiVisualizer.classList.remove('active');
-            userVisualizer.classList.remove('active');
+            stopVisualizers();
+            if (aiAnalyser) {
+                try { aiAnalyser.disconnect(); } catch(e) {}
+                aiAnalyser = null;
+            }
+            if (userAnalyser) {
+                try { userAnalyser.disconnect(); } catch(e) {}
+                userAnalyser = null;
+            }
             if (playerNode) {
                 playerNode.port.postMessage('flush');
                 playerNode.disconnect();
