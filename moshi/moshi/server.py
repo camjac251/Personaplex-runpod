@@ -270,6 +270,7 @@ class ServerState:
                 0, min(_qint("repetition_penalty_context", 64), MAX_REPETITION_CONTEXT)
             ),
             "padding_bonus": max(0.0, _qfloat("padding_bonus", 0.0)),
+            "max_turn_text_tokens": max(0, _qint("max_turn_text_tokens", 0)),
         }
         
         # Construct full voice prompt path. Two sources:
@@ -418,6 +419,10 @@ class ServerState:
             # connections cannot interleave their settings on the shared lm_gen.
             for k, v in sampling_params.items():
                 setattr(self.lm_gen, k, v)
+            # Reset the max-turn cap's internal counters so a prior session's
+            # state doesn't carry into this one.
+            self.lm_gen._non_pad_streak = 0
+            self.lm_gen._pad_force_remaining = 0
 
             # ~200 ms ceiling on backlog at 20 ms client-side chunks. Overflow
             # drops newest in recv_loop so GPU stalls don't balloon memory or
@@ -1058,6 +1063,14 @@ def main():
                             <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="0">
                             <div class="slider-hint">Biases the model toward silence tokens. 0 = off. 2-4 stops rambling by making it yield the turn sooner.</div>
                         </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Max turn length (tokens)</span>
+                                <span class="slider-value" id="maxTurnValue">0</span>
+                            </div>
+                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="0">
+                            <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 500 ≈ 40 s sustained talk. Safety net under padding_bonus.</div>
+                        </div>
                         <div class="seed-row">
                             <div class="slider-label">
                                 <span>Random seed</span>
@@ -1215,6 +1228,7 @@ def main():
             audioTemp: 0.7, audioTopk: 250,
             repPenalty: 1.2, repContext: 64,
             padBonus: 0.0,
+            maxTurn: 0,
         };
         const advancedToggle = document.getElementById('advancedToggle');
         const advancedBody = document.getElementById('advancedBody');
@@ -1232,6 +1246,8 @@ def main():
         const repContextValue = document.getElementById('repContextValue');
         const padBonusSlider = document.getElementById('padBonusSlider');
         const padBonusValue = document.getElementById('padBonusValue');
+        const maxTurnSlider = document.getElementById('maxTurnSlider');
+        const maxTurnValue = document.getElementById('maxTurnValue');
         const seedRandomToggle = document.getElementById('seedRandomToggle');
         const seedInput = document.getElementById('seedInput');
 
@@ -1255,6 +1271,7 @@ def main():
         bindSlider(repPenaltySlider, repPenaltyValue, 2);
         bindSlider(repContextSlider, repContextValue, 0);
         bindSlider(padBonusSlider, padBonusValue, 1);
+        bindSlider(maxTurnSlider, maxTurnValue, 0);
 
         // Seed control: persisted to localStorage. When "Use random" is checked, no seed
         // query param is sent; the server picks one. Otherwise the value in seedInput is used.
@@ -1296,7 +1313,8 @@ def main():
             repPenaltySlider.value = ADVANCED_DEFAULTS.repPenalty;
             repContextSlider.value = ADVANCED_DEFAULTS.repContext;
             padBonusSlider.value = ADVANCED_DEFAULTS.padBonus;
-            [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider, padBonusSlider]
+            maxTurnSlider.value = ADVANCED_DEFAULTS.maxTurn;
+            [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider, padBonusSlider, maxTurnSlider]
                 .forEach(s => s.dispatchEvent(new Event('input')));
             seedRandomToggle.checked = true;
             seedInput.value = '42';
@@ -1417,7 +1435,27 @@ def main():
         
         async function initAudio() {
             if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                } catch (err) {
+                    // Some Safari / Android / Bluetooth configs reject an
+                    // explicit 24 kHz context. Fall back to hardware rate;
+                    // the resample path to Mimi still works.
+                    console.warn('AudioContext at 24 kHz rejected, falling back to hardware rate:', err);
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                // Device switch (headphones unplugged, default output
+                // changes) pauses the context; without this, mic capture
+                // silently stops until the user clicks Stop. Auto-resume
+                // keeps the session alive across common system events.
+                audioContext.addEventListener('statechange', () => {
+                    console.log('AudioContext state:', audioContext.state);
+                    if (audioContext.state === 'suspended' || audioContext.state === 'interrupted') {
+                        audioContext.resume().catch((err) => {
+                            console.warn('AudioContext auto-resume failed:', err);
+                        });
+                    }
+                });
             }
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
@@ -1694,6 +1732,7 @@ registerProcessor('mic-capture', MicCapture);`;
                 wsUrl.searchParams.set('repetition_penalty', repPenaltySlider.value);
                 wsUrl.searchParams.set('repetition_penalty_context', repContextSlider.value);
                 wsUrl.searchParams.set('padding_bonus', padBonusSlider.value);
+                wsUrl.searchParams.set('max_turn_text_tokens', maxTurnSlider.value);
                 if (!seedRandomToggle.checked && seedInput.value !== '') {
                     wsUrl.searchParams.set('seed', seedInput.value);
                 }
@@ -1763,13 +1802,18 @@ registerProcessor('mic-capture', MicCapture);`;
                 return;
             }
             try {
+                // Tighter thresholds than the library defaults: 0.75 and 6
+                // speech frames (~200 ms at 32 ms hop) reduce false-positive
+                // speechStart on speaker bleed when browser AEC isn't fully
+                // subtracting the model's own output. Cost: ~75 ms extra
+                // latency on barge-in onset, acceptable for voice convos.
                 micVad = await window.vad.MicVAD.new({
                     stream: micWorkletStream,
                     onSpeechStart: () => { userSpeaking = true; },
                     onSpeechEnd: () => { userSpeaking = false; },
                     onVADMisfire: () => { userSpeaking = false; },
-                    positiveSpeechThreshold: 0.6,
-                    minSpeechFrames: 3,
+                    positiveSpeechThreshold: 0.75,
+                    minSpeechFrames: 6,
                 });
                 micVad.start();
                 console.log('VAD running, feedback guard active');

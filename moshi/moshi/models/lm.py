@@ -669,6 +669,7 @@ class LMGen(StreamingModule[_LMGenState]):
         repetition_penalty: float = 1.0,
         repetition_penalty_context: int = 64,
         padding_bonus: float = 0.0,
+        max_turn_text_tokens: int = 0,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -682,6 +683,9 @@ class LMGen(StreamingModule[_LMGenState]):
         self.repetition_penalty = repetition_penalty
         self.repetition_penalty_context = max(0, min(repetition_penalty_context, MAX_REPETITION_CONTEXT))
         self.padding_bonus = padding_bonus
+        self.max_turn_text_tokens = max_turn_text_tokens
+        self._non_pad_streak = 0
+        self._pad_force_remaining = 0
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
@@ -927,6 +931,27 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+
+        # Hard cap on turn length. If the model emits N consecutive non-pad
+        # text tokens, force pad for ~1 s of text frames (12.5 Hz) so the
+        # audio decoder produces real silence and the turn actually yields.
+        # Safety net under padding_bonus; no effect when max_turn_text_tokens
+        # is 0. batch=1 is asserted above, so .item() is fine.
+        if self.max_turn_text_tokens > 0:
+            pad_id = lm_model.text_padding_token_id
+            if self._pad_force_remaining > 0:
+                next_text_token = torch.full_like(next_text_token, pad_id)
+                self._pad_force_remaining -= 1
+            else:
+                tok = int(next_text_token[0].item())
+                if tok == pad_id or tok == 0:
+                    self._non_pad_streak = 0
+                else:
+                    self._non_pad_streak += 1
+                    if self._non_pad_streak > self.max_turn_text_tokens:
+                        self._pad_force_remaining = 12
+                        self._non_pad_streak = 0
+                        next_text_token = torch.full_like(next_text_token, pad_id)
 
         # Update repetition penalty ring buffer with the chosen text token.
         # Skip pad (0) and silence (3) so they do not crowd the context. Also,
