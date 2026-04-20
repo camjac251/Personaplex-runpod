@@ -1156,7 +1156,11 @@ def main():
         let micWorkletSource = null;
         let micVad = null;
         let userSpeaking = false;
-        let modelSpeakingUntil = 0;  // performance.now() threshold
+        // Ground-truth "model is playing audio right now" signal, posted by
+        // the pcm-player AudioWorklet on its empty<->non-empty edges. This
+        // replaces a 400 ms trailing timer that could lapse during GPU
+        // stalls or persist past the actual end of a response.
+        let modelPlaying = false;
         const SILENT_CHUNK = new Float32Array(480);  // 20 ms of zeros at 24 kHz
         let audioContext = null;
         let recordingDestination = null;
@@ -1425,8 +1429,13 @@ class P extends AudioWorkletProcessor {
         super();
         this.chunks = [];
         this.offset = 0;
+        this.playing = false;
         this.port.onmessage = (e) => {
-            if (e.data === 'flush') { this.chunks = []; this.offset = 0; return; }
+            if (e.data === 'flush') {
+                this.chunks = []; this.offset = 0;
+                if (this.playing) { this.playing = false; this.port.postMessage('idle'); }
+                return;
+            }
             this.chunks.push(e.data);
         };
     }
@@ -1440,6 +1449,14 @@ class P extends AudioWorkletProcessor {
             w += n;
             this.offset += n;
             if (this.offset >= c.length) { this.chunks.shift(); this.offset = 0; }
+        }
+        // Ground-truth "model is audibly playing" signal: notify main thread
+        // on the empty<->non-empty edge. Replaces a 400 ms timer heuristic
+        // with the actual state of the output buffer.
+        const nowPlaying = this.chunks.length > 0;
+        if (nowPlaying !== this.playing) {
+            this.playing = nowPlaying;
+            this.port.postMessage(nowPlaying ? 'playing' : 'idle');
         }
         return true;
     }
@@ -1475,6 +1492,10 @@ registerProcessor('mic-capture', MicCapture);`;
                 const blob = new Blob([code], { type: 'application/javascript' });
                 await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
                 playerNode = new AudioWorkletNode(audioContext, 'pcm-player');
+                playerNode.port.onmessage = (e) => {
+                    if (e.data === 'playing') modelPlaying = true;
+                    else if (e.data === 'idle') modelPlaying = false;
+                };
                 aiAnalyser = audioContext.createAnalyser();
                 aiAnalyser.fftSize = 256;
                 aiAnalyser.smoothingTimeConstant = 0.85;
@@ -1699,11 +1720,6 @@ registerProcessor('mic-capture', MicCapture);`;
                         // share one MediaStream (one set of AEC/NS state).
                         startMicRecording().then(() => startSessionRecording());
                     } else if (msgType === 0x01) {
-                        // Extend the "model speaking" window 400 ms past the
-                        // latest audio frame so short gaps between server
-                        // sends don't reopen the mic. VAD still lets the user
-                        // barge in at any point.
-                        modelSpeakingUntil = performance.now() + 400;
                         const pcm = new Float32Array(payload.buffer, payload.byteOffset, payload.byteLength / 4);
                         playDecodedAudio(pcm);
                     } else if (msgType === 0x02) {
@@ -1782,8 +1798,7 @@ registerProcessor('mic-capture', MicCapture);`;
                     // barge-in working: once the user starts speaking, real
                     // PCM flows even mid-model-response.
                     let pcm = e.data;  // Float32Array, 480 samples (20 ms)
-                    const modelSpeaking = performance.now() < modelSpeakingUntil;
-                    if (modelSpeaking && !userSpeaking) {
+                    if (modelPlaying && !userSpeaking) {
                         pcm = SILENT_CHUNK;
                     }
                     const msg = new Uint8Array(1 + pcm.byteLength);
@@ -1831,7 +1846,7 @@ registerProcessor('mic-capture', MicCapture);`;
                 micVad = null;
             }
             userSpeaking = false;
-            modelSpeakingUntil = 0;
+            modelPlaying = false;
             if (micCaptureNode) {
                 try { micCaptureNode.port.onmessage = null; } catch(e) {}
                 try { micCaptureNode.disconnect(); } catch(e) {}
