@@ -816,6 +816,19 @@ def main():
         .advanced-toggle.open .arrow { transform: rotate(90deg); }
         .advanced-body { display: none; margin-top: 16px; }
         .advanced-body.open { display: block; }
+        .slider-group-title { font-size: 0.75em; font-weight: 600; color: #2f5d50;
+                              text-transform: uppercase; letter-spacing: 0.14em;
+                              margin: 18px 0 10px; padding-bottom: 6px;
+                              border-bottom: 1px solid rgba(47, 93, 80, 0.2); }
+        .slider-group-title:first-child { margin-top: 0; }
+        .toggle-row { display: flex; align-items: center; justify-content: space-between;
+                      padding: 8px 0; font-size: 0.88em; color: #3a3329; }
+        .toggle-row label { display: flex; align-items: center; gap: 10px; cursor: pointer;
+                            user-select: none; font-weight: 500; }
+        .toggle-row input[type="checkbox"] { accent-color: #2f5d50; cursor: pointer;
+                                              width: 16px; height: 16px; }
+        .toggle-row-hint { font-size: 0.72em; color: #8a7a5a; margin: -2px 0 10px 26px;
+                            line-height: 1.4; }
         .slider-row { margin-bottom: 14px; }
         .slider-row .slider-label { display: flex; justify-content: space-between; font-size: 0.82em;
                                     color: #3a3329; margin-bottom: 6px; font-weight: 500; }
@@ -1007,6 +1020,7 @@ def main():
                         <span class="arrow">&#9656;</span>
                     </div>
                     <div class="advanced-body" id="advancedBody">
+                        <div class="slider-group-title">Text sampling</div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Text temperature</span>
@@ -1023,6 +1037,7 @@ def main():
                             <input type="range" id="textTopkSlider" min="1" max="500" step="1" value="25">
                             <div class="slider-hint">Number of word candidates considered each step.</div>
                         </div>
+                        <div class="slider-group-title">Audio sampling</div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Audio temperature</span>
@@ -1039,6 +1054,7 @@ def main():
                             <input type="range" id="audioTopkSlider" min="1" max="2048" step="1" value="250">
                             <div class="slider-hint">Number of audio token candidates considered each step.</div>
                         </div>
+                        <div class="slider-group-title">Behavior</div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Repetition penalty</span>
@@ -1071,6 +1087,20 @@ def main():
                             <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="0">
                             <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 500 ≈ 40 s sustained talk. Safety net under padding_bonus.</div>
                         </div>
+                        <div class="slider-group-title">Microphone input</div>
+                        <div class="toggle-row">
+                            <label><input type="checkbox" id="echoCancelToggle" checked> Echo cancellation</label>
+                        </div>
+                        <div class="toggle-row-hint">Keep on. Off = speaker bleed reaches the model and can start a feedback loop.</div>
+                        <div class="toggle-row">
+                            <label><input type="checkbox" id="noiseSuppToggle" checked> Noise suppression</label>
+                        </div>
+                        <div class="toggle-row-hint">On suppresses keyboard / fan / room hiss before the model hears it.</div>
+                        <div class="toggle-row">
+                            <label><input type="checkbox" id="autoGainToggle"> Auto gain control</label>
+                        </div>
+                        <div class="toggle-row-hint">Off by default. Browser AGC can cause amplitude swings that confuse Moshi at 24 kHz.</div>
+                        <div class="slider-group-title">Reproducibility</div>
                         <div class="seed-row">
                             <div class="slider-label">
                                 <span>Random seed</span>
@@ -1250,6 +1280,51 @@ def main():
         const maxTurnValue = document.getElementById('maxTurnValue');
         const seedRandomToggle = document.getElementById('seedRandomToggle');
         const seedInput = document.getElementById('seedInput');
+        const echoCancelToggle = document.getElementById('echoCancelToggle');
+        const noiseSuppToggle = document.getElementById('noiseSuppToggle');
+        const autoGainToggle = document.getElementById('autoGainToggle');
+
+        const MIC_DEFAULTS = { echoCancel: true, noiseSupp: true, autoGain: false };
+        try {
+            const e = localStorage.getItem('pp_echoCancel');
+            if (e !== null) echoCancelToggle.checked = e === '1';
+            const n = localStorage.getItem('pp_noiseSupp');
+            if (n !== null) noiseSuppToggle.checked = n === '1';
+            const g = localStorage.getItem('pp_autoGain');
+            if (g !== null) autoGainToggle.checked = g === '1';
+        } catch (e) {}
+
+        function getMicConstraints() {
+            return {
+                echoCancellation: echoCancelToggle.checked,
+                noiseSuppression: noiseSuppToggle.checked,
+                autoGainControl: autoGainToggle.checked,
+            };
+        }
+
+        function applyMicConstraintsLive() {
+            // Live-apply to the running capture. Browser decides whether it
+            // can honor the change without reconnecting the track; if not,
+            // the new setting takes effect on the next getUserMedia (next
+            // session).
+            if (!micWorkletStream) return;
+            const track = micWorkletStream.getAudioTracks()[0];
+            if (!track) return;
+            track.applyConstraints(getMicConstraints()).catch((err) => {
+                console.warn('applyConstraints failed (takes effect next session):', err);
+            });
+        }
+
+        [
+            [echoCancelToggle, 'pp_echoCancel'],
+            [noiseSuppToggle, 'pp_noiseSupp'],
+            [autoGainToggle, 'pp_autoGain'],
+        ].forEach(([tog, key]) => {
+            tog.addEventListener('change', () => {
+                try { localStorage.setItem(key, tog.checked ? '1' : '0'); } catch (e) {}
+                applyMicConstraintsLive();
+            });
+        });
 
         function bindSlider(slider, label, decimals) {
             const update = () => {
@@ -1316,6 +1391,11 @@ def main():
             maxTurnSlider.value = ADVANCED_DEFAULTS.maxTurn;
             [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider, padBonusSlider, maxTurnSlider]
                 .forEach(s => s.dispatchEvent(new Event('input')));
+            echoCancelToggle.checked = MIC_DEFAULTS.echoCancel;
+            noiseSuppToggle.checked = MIC_DEFAULTS.noiseSupp;
+            autoGainToggle.checked = MIC_DEFAULTS.autoGain;
+            [echoCancelToggle, noiseSuppToggle, autoGainToggle]
+                .forEach(t => t.dispatchEvent(new Event('change')));
             seedRandomToggle.checked = true;
             seedInput.value = '42';
             seedRandomToggle.dispatchEvent(new Event('change'));
@@ -1565,7 +1645,7 @@ registerProcessor('mic-capture', MicCapture);`;
                     if (micWorkletStream) {
                         micStream = micWorkletStream;
                     } else {
-                        micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+                        micStream = await navigator.mediaDevices.getUserMedia({ audio: getMicConstraints() });
                     }
                     micSource = audioContext.createMediaStreamSource(micStream);
                     micSource.connect(recordingDestination);
@@ -1710,7 +1790,7 @@ registerProcessor('mic-capture', MicCapture);`;
                 await initAudio();
                 
                 // Check microphone permission
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: getMicConstraints() });
                 stream.getTracks().forEach(track => track.stop());
                 
                 // Switch to conversation view
@@ -1826,7 +1906,7 @@ registerProcessor('mic-capture', MicCapture);`;
         async function startMicRecording() {
             try {
                 micWorkletStream = await navigator.mediaDevices.getUserMedia({
-                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+                    audio: getMicConstraints(),
                 });
                 micWorkletSource = audioContext.createMediaStreamSource(micWorkletStream);
                 micCaptureNode = new AudioWorkletNode(audioContext, 'mic-capture');
