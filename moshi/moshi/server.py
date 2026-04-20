@@ -325,12 +325,23 @@ class ServerState:
                         clog.log("warning", "empty message")
                         continue
                     kind = message[0]
-                    if kind == 1:  # audio
+                    if kind == 1:  # audio, raw float32 PCM at mimi.sample_rate
                         payload = message[1:]
+                        if len(payload) == 0 or len(payload) % 4 != 0:
+                            clog.log("warning", f"bad audio payload length {len(payload)}")
+                            continue
                         try:
-                            opus_reader.append_bytes(payload)
+                            pcm = np.frombuffer(payload, dtype=np.float32)
                         except Exception as e:
-                            clog.log("warning", f"opus decode failed: {type(e).__name__}: {e}")
+                            clog.log("warning", f"pcm decode failed: {type(e).__name__}: {e}")
+                            continue
+                        try:
+                            pcm_queue.put_nowait(pcm)
+                        except asyncio.QueueFull:
+                            # GPU is falling behind. Drop the newest chunk so
+                            # the existing timeline survives rather than
+                            # sliding forward with stale audio.
+                            clog.log("warning", f"pcm queue full ({pcm_queue.qsize()}), dropping chunk")
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             except Exception as e:
@@ -339,16 +350,16 @@ class ServerState:
                 close = True
                 clog.log("info", "connection closed")
 
-        async def opus_loop():
+        async def process_loop():
             loop = asyncio.get_event_loop()
             all_pcm_data = None
 
             try:
-                while True:
-                    if close:
-                        return
-                    await asyncio.sleep(0.001)
-                    pcm = opus_reader.read_pcm()
+                while not close:
+                    try:
+                        pcm = await asyncio.wait_for(pcm_queue.get(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
                     if pcm.shape[-1] == 0:
                         continue
                     if all_pcm_data is None:
@@ -361,7 +372,7 @@ class ServerState:
 
                         # Offload GPU inference to a thread so the event loop
                         # stays responsive for recv_loop. Wrap with shield so
-                        # that if opus_loop gets cancelled (e.g. the session
+                        # that if process_loop gets cancelled (e.g. the session
                         # is torn down on disconnect) the GPU thread finishes
                         # its current frame before cancellation propagates.
                         # Otherwise the outer code releases self.lock while
@@ -383,7 +394,7 @@ class ServerState:
                             raise
 
                         for pcm_data, text in results:
-                            # Send raw PCM float32 directly (bypass Opus codec)
+                            # Send raw PCM float32 directly.
                             await ws.send_bytes(b"\x01" + pcm_data.astype(np.float32).tobytes())
                             if text is not None:
                                 msg = b"\x02" + bytes(text, encoding="utf8")
@@ -391,7 +402,7 @@ class ServerState:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                clog.log("error", f"opus_loop: {type(e).__name__}: {e}")
+                clog.log("error", f"process_loop: {type(e).__name__}: {e}")
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -408,7 +419,10 @@ class ServerState:
             for k, v in sampling_params.items():
                 setattr(self.lm_gen, k, v)
 
-            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            # ~200 ms ceiling on backlog at 20 ms client-side chunks. Overflow
+            # drops newest in recv_loop so GPU stalls don't balloon memory or
+            # desync the timeline by serving stale audio.
+            pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
@@ -436,7 +450,7 @@ class ServerState:
                 # Clean cancellation manager
                 tasks = [
                     asyncio.create_task(recv_loop()),
-                    asyncio.create_task(opus_loop()),
+                    asyncio.create_task(process_loop()),
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -449,7 +463,6 @@ class ServerState:
                         pass
                 await ws.close()
                 clog.log("info", "session closed")
-                # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         clog.log("info", "done with connection")
         return ws
 
@@ -1116,8 +1129,6 @@ def main():
            <a href="https://huggingface.co/nvidia/personaplex-7b-v1" target="_blank">NVIDIA PersonaPlex</a></p>
     </div>
 
-    <!-- Opus Recorder from CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/opus-recorder@8.0.5/dist/recorder.min.js"></script>
     <script>
         // Text prompt presets
         const PRESETS = {
@@ -1128,7 +1139,9 @@ def main():
         };
         
         let socket = null;
-        let recorder = null;
+        let micCaptureNode = null;
+        let micWorkletStream = null;
+        let micWorkletSource = null;
         let audioContext = null;
         let recordingDestination = null;
         let mediaRecorder = null;
@@ -1415,7 +1428,34 @@ class P extends AudioWorkletProcessor {
         return true;
     }
 }
-registerProcessor('pcm-player', P);`;
+registerProcessor('pcm-player', P);
+
+class MicCapture extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        // 20 ms at 24 kHz = 480 samples per outbound chunk.
+        this.buffer = new Float32Array(480);
+        this.idx = 0;
+    }
+    process(inputs) {
+        const input = inputs[0] && inputs[0][0];
+        if (!input) return true;
+        let i = 0;
+        while (i < input.length) {
+            const n = Math.min(input.length - i, this.buffer.length - this.idx);
+            this.buffer.set(input.subarray(i, i + n), this.idx);
+            i += n;
+            this.idx += n;
+            if (this.idx === this.buffer.length) {
+                // Copy so we can reuse the ring buffer without racing the consumer.
+                this.port.postMessage(this.buffer.slice());
+                this.idx = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('mic-capture', MicCapture);`;
                 const blob = new Blob([code], { type: 'application/javascript' });
                 await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
                 playerNode = new AudioWorkletNode(audioContext, 'pcm-player');
@@ -1668,32 +1708,26 @@ registerProcessor('pcm-player', P);`;
         
         async function startMicRecording() {
             try {
-                const encoderPath = 'https://cdn.jsdelivr.net/npm/opus-recorder@8.0.5/dist/encoderWorker.min.js';
-                
-                recorder = new Recorder({
-                    encoderPath: encoderPath,
-                    encoderSampleRate: SAMPLE_RATE,
-                    encoderFrameSize: 20,
-                    maxFramesPerPage: 2,
-                    numberOfChannels: 1,
-                    streamPages: true,
-                    encoderApplication: 2049,
+                micWorkletStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
                 });
-                
-                recorder.ondataavailable = (data) => {
-                    if (socket && socket.readyState === WebSocket.OPEN) {
-                        const msg = new Uint8Array(1 + data.length);
-                        msg[0] = 0x01;
-                        msg.set(data, 1);
-                        socket.send(msg);
-                    }
+                micWorkletSource = audioContext.createMediaStreamSource(micWorkletStream);
+                micCaptureNode = new AudioWorkletNode(audioContext, 'mic-capture');
+                // Deliver captured PCM chunks to the server as raw float32 at
+                // mimi.sample_rate (24 kHz). No encoder in the path means no
+                // encode/decode latency and no CDN dependency.
+                micCaptureNode.port.onmessage = (e) => {
+                    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+                    const pcm = e.data;  // Float32Array, 480 samples (20 ms)
+                    const msg = new Uint8Array(1 + pcm.byteLength);
+                    msg[0] = 0x01;
+                    msg.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
+                    socket.send(msg);
                 };
-                
-                recorder.onstart = () => {
-                    console.log('Microphone recording started');
-                };
-                
-                await recorder.start();
+                // No speaker connection; we only need the worklet to run on
+                // captured audio, not emit anything to the output graph.
+                micWorkletSource.connect(micCaptureNode);
+                console.log('Microphone capture started (raw PCM)');
             } catch (err) {
                 console.error('Microphone error:', err);
                 showError('Microphone error: ' + (err.message || 'Could not start recording'), true);
@@ -1723,9 +1757,18 @@ registerProcessor('pcm-player', P);`;
         
         function cleanup() {
             stopSessionRecording(null);
-            if (recorder) {
-                try { recorder.stop(); } catch(e) {}
-                recorder = null;
+            if (micCaptureNode) {
+                try { micCaptureNode.port.onmessage = null; } catch(e) {}
+                try { micCaptureNode.disconnect(); } catch(e) {}
+                micCaptureNode = null;
+            }
+            if (micWorkletSource) {
+                try { micWorkletSource.disconnect(); } catch(e) {}
+                micWorkletSource = null;
+            }
+            if (micWorkletStream) {
+                try { micWorkletStream.getTracks().forEach(t => t.stop()); } catch(e) {}
+                micWorkletStream = null;
             }
             if (socket) {
                 try { socket.close(); } catch(e) {}
