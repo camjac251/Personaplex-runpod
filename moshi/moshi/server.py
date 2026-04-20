@@ -269,6 +269,7 @@ class ServerState:
             "repetition_penalty_context": max(
                 0, min(_qint("repetition_penalty_context", 64), MAX_REPETITION_CONTEXT)
             ),
+            "padding_bonus": max(0.0, _qfloat("padding_bonus", 0.0)),
         }
         
         # Construct full voice prompt path. Two sources:
@@ -1026,6 +1027,14 @@ def main():
                             <input type="range" id="repContextSlider" min="0" max="256" step="8" value="64">
                             <div class="slider-hint">How many recent text tokens the penalty considers.</div>
                         </div>
+                        <div class="slider-row">
+                            <div class="slider-label">
+                                <span>Padding bonus</span>
+                                <span class="slider-value" id="padBonusValue">0.0</span>
+                            </div>
+                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="0">
+                            <div class="slider-hint">Biases the model toward silence tokens. 0 = off. 2-4 stops rambling by making it yield the turn sooner.</div>
+                        </div>
                         <div class="seed-row">
                             <div class="slider-label">
                                 <span>Random seed</span>
@@ -1172,6 +1181,7 @@ def main():
             textTemp: 0.7, textTopk: 25,
             audioTemp: 0.7, audioTopk: 250,
             repPenalty: 1.2, repContext: 64,
+            padBonus: 0.0,
         };
         const advancedToggle = document.getElementById('advancedToggle');
         const advancedBody = document.getElementById('advancedBody');
@@ -1187,6 +1197,8 @@ def main():
         const repPenaltyValue = document.getElementById('repPenaltyValue');
         const repContextSlider = document.getElementById('repContextSlider');
         const repContextValue = document.getElementById('repContextValue');
+        const padBonusSlider = document.getElementById('padBonusSlider');
+        const padBonusValue = document.getElementById('padBonusValue');
         const seedRandomToggle = document.getElementById('seedRandomToggle');
         const seedInput = document.getElementById('seedInput');
 
@@ -1209,6 +1221,7 @@ def main():
         bindSlider(audioTopkSlider, audioTopkValue, 0);
         bindSlider(repPenaltySlider, repPenaltyValue, 2);
         bindSlider(repContextSlider, repContextValue, 0);
+        bindSlider(padBonusSlider, padBonusValue, 1);
 
         // Seed control: persisted to localStorage. When "Use random" is checked, no seed
         // query param is sent; the server picks one. Otherwise the value in seedInput is used.
@@ -1249,7 +1262,8 @@ def main():
             audioTopkSlider.value = ADVANCED_DEFAULTS.audioTopk;
             repPenaltySlider.value = ADVANCED_DEFAULTS.repPenalty;
             repContextSlider.value = ADVANCED_DEFAULTS.repContext;
-            [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider]
+            padBonusSlider.value = ADVANCED_DEFAULTS.padBonus;
+            [textTempSlider, textTopkSlider, audioTempSlider, audioTopkSlider, repPenaltySlider, repContextSlider, padBonusSlider]
                 .forEach(s => s.dispatchEvent(new Event('input')));
             seedRandomToggle.checked = true;
             seedInput.value = '42';
@@ -1589,6 +1603,7 @@ registerProcessor('pcm-player', P);`;
                 wsUrl.searchParams.set('audio_topk', audioTopkSlider.value);
                 wsUrl.searchParams.set('repetition_penalty', repPenaltySlider.value);
                 wsUrl.searchParams.set('repetition_penalty_context', repContextSlider.value);
+                wsUrl.searchParams.set('padding_bonus', padBonusSlider.value);
                 if (!seedRandomToggle.checked && seedInput.value !== '') {
                     wsUrl.searchParams.set('seed', seedInput.value);
                 }

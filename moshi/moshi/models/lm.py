@@ -668,6 +668,7 @@ class LMGen(StreamingModule[_LMGenState]):
         frame_rate: int = FRAME_RATE_HZ,
         repetition_penalty: float = 1.0,
         repetition_penalty_context: int = 64,
+        padding_bonus: float = 0.0,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -680,6 +681,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.top_k_text = top_k_text
         self.repetition_penalty = repetition_penalty
         self.repetition_penalty_context = max(0, min(repetition_penalty_context, MAX_REPETITION_CONTEXT))
+        self.padding_bonus = padding_bonus
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
@@ -895,6 +897,11 @@ class LMGen(StreamingModule[_LMGenState]):
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
         text_logits_f = text_logits.float()
+        # Bias the text padding token up to encourage the model to yield its
+        # turn. Moshi emits text_padding_token when it has nothing to say; a
+        # positive bonus shortens rambling. 0 = off, 2-4 typical.
+        if self.padding_bonus != 0.0:
+            text_logits_f[..., lm_model.text_padding_token_id] += self.padding_bonus
         if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
             ctx = self.repetition_penalty_context
             text_logits_f = apply_repetition_penalty(
