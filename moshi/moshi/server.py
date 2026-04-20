@@ -1835,6 +1835,12 @@ registerProcessor('mic-capture', MicCapture);`;
                 // encode/decode latency and no CDN dependency.
                 micCaptureNode.port.onmessage = (e) => {
                     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+                    // Drop locally when the WS send buffer is backing up. 1 MB
+                    // is ~20 seconds of raw float32 at 24 kHz; past that point
+                    // the network can't keep up and the server would drop
+                    // anyway. Matching client-side policy avoids a runaway
+                    // postMessage queue in the AudioWorklet.
+                    if (socket.bufferedAmount > 1_000_000) return;
                     // Swap in silence when the model is actively speaking and
                     // the user isn't. Moshi still gets a continuous stream
                     // (so turn-taking state stays aligned), but mic bleed
@@ -1928,6 +1934,23 @@ registerProcessor('mic-capture', MicCapture);`;
         
         // Handle page unload
         window.addEventListener('beforeunload', cleanup);
+
+        // Pause the mic pipeline when the tab is hidden. Without this, Chrome
+        // throttles AudioWorklet on backgrounded tabs and then dumps the
+        // backlog in one burst on foregrounding, blowing past the server's
+        // 200 ms PCM queue cap (architected drop policy triggers, log spam).
+        document.addEventListener('visibilitychange', () => {
+            if (!micCaptureNode || !micWorkletSource) return;
+            if (document.hidden) {
+                try { micWorkletSource.disconnect(micCaptureNode); } catch(e) {}
+                try { micVad && micVad.pause && micVad.pause(); } catch(e) {}
+            } else {
+                try { micWorkletSource.connect(micCaptureNode); } catch(e) {}
+                try { micVad && micVad.start && micVad.start(); } catch(e) {}
+                // Drop any lingering speech state that accumulated while paused.
+                userSpeaking = false;
+            }
+        });
     </script>
 </body>
 </html>"""
