@@ -261,7 +261,7 @@ class ServerState:
         # Parse sampling params here, but apply them inside the session lock below
         # to avoid races between concurrent connections mutating shared lm_gen state.
         sampling_params = {
-            "temp": _qfloat("audio_temperature", 0.8),
+            "temp": _qfloat("audio_temperature", 0.7),
             "temp_text": _qfloat("text_temperature", 0.7),
             "top_k_text": max(1, _qint("text_topk", 25)),
             "top_k": max(1, _qint("audio_topk", 250)),
@@ -997,9 +997,9 @@ def main():
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Audio temperature</span>
-                                <span class="slider-value" id="audioTempValue">0.80</span>
+                                <span class="slider-value" id="audioTempValue">0.70</span>
                             </div>
-                            <input type="range" id="audioTempSlider" min="0.1" max="1.5" step="0.05" value="0.8">
+                            <input type="range" id="audioTempSlider" min="0.1" max="1.5" step="0.05" value="0.7">
                             <div class="slider-hint">Higher = more expressive prosody. Lower = flatter delivery.</div>
                         </div>
                         <div class="slider-row">
@@ -1170,7 +1170,7 @@ def main():
         // Advanced sampling sliders
         const ADVANCED_DEFAULTS = {
             textTemp: 0.7, textTopk: 25,
-            audioTemp: 0.8, audioTopk: 250,
+            audioTemp: 0.7, audioTopk: 250,
             repPenalty: 1.2, repContext: 64,
         };
         const advancedToggle = document.getElementById('advancedToggle');
@@ -1428,7 +1428,7 @@ registerProcessor('pcm-player', P);`;
                     playerNode.connect(recordingDestination);
                 }
                 try {
-                    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
                     micSource = audioContext.createMediaStreamSource(micStream);
                     micSource.connect(recordingDestination);
                     userAnalyser = audioContext.createAnalyser();
@@ -1568,7 +1568,7 @@ registerProcessor('pcm-player', P);`;
                 await initAudio();
                 
                 // Check microphone permission
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
                 stream.getTracks().forEach(track => track.stop());
                 
                 // Switch to conversation view
