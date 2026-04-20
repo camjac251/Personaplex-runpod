@@ -1129,6 +1129,8 @@ def main():
            <a href="https://huggingface.co/nvidia/personaplex-7b-v1" target="_blank">NVIDIA PersonaPlex</a></p>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
     <script>
         // Text prompt presets
         const PRESETS = {
@@ -1142,6 +1144,10 @@ def main():
         let micCaptureNode = null;
         let micWorkletStream = null;
         let micWorkletSource = null;
+        let micVad = null;
+        let userSpeaking = false;
+        let modelSpeakingUntil = 0;  // performance.now() threshold
+        const SILENT_CHUNK = new Float32Array(480);  // 20 ms of zeros at 24 kHz
         let audioContext = null;
         let recordingDestination = null;
         let mediaRecorder = null;
@@ -1669,6 +1675,11 @@ registerProcessor('mic-capture', MicCapture);`;
                         startMicRecording();
                         startSessionRecording();
                     } else if (msgType === 0x01) {
+                        // Extend the "model speaking" window 400 ms past the
+                        // latest audio frame so short gaps between server
+                        // sends don't reopen the mic. VAD still lets the user
+                        // barge in at any point.
+                        modelSpeakingUntil = performance.now() + 400;
                         const pcm = new Float32Array(payload.buffer, payload.byteOffset, payload.byteLength / 4);
                         playDecodedAudio(pcm);
                     } else if (msgType === 0x02) {
@@ -1706,6 +1717,28 @@ registerProcessor('mic-capture', MicCapture);`;
             }
         }
         
+        async function initVAD() {
+            if (!window.vad || !window.vad.MicVAD) {
+                console.warn('VAD library not loaded; barge-in still works, mic-mute during model speech will not');
+                return;
+            }
+            try {
+                micVad = await window.vad.MicVAD.new({
+                    stream: micWorkletStream,
+                    onSpeechStart: () => { userSpeaking = true; },
+                    onSpeechEnd: () => { userSpeaking = false; },
+                    onVADMisfire: () => { userSpeaking = false; },
+                    positiveSpeechThreshold: 0.6,
+                    minSpeechFrames: 3,
+                });
+                micVad.start();
+                console.log('VAD running, feedback guard active');
+            } catch (err) {
+                console.warn('VAD init failed; continuing without it:', err);
+                micVad = null;
+            }
+        }
+
         async function startMicRecording() {
             try {
                 micWorkletStream = await navigator.mediaDevices.getUserMedia({
@@ -1718,7 +1751,17 @@ registerProcessor('mic-capture', MicCapture);`;
                 // encode/decode latency and no CDN dependency.
                 micCaptureNode.port.onmessage = (e) => {
                     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-                    const pcm = e.data;  // Float32Array, 480 samples (20 ms)
+                    // Swap in silence when the model is actively speaking and
+                    // the user isn't. Moshi still gets a continuous stream
+                    // (so turn-taking state stays aligned), but mic bleed
+                    // from the speakers doesn't reach the encoder. VAD keeps
+                    // barge-in working: once the user starts speaking, real
+                    // PCM flows even mid-model-response.
+                    let pcm = e.data;  // Float32Array, 480 samples (20 ms)
+                    const modelSpeaking = performance.now() < modelSpeakingUntil;
+                    if (modelSpeaking && !userSpeaking) {
+                        pcm = SILENT_CHUNK;
+                    }
                     const msg = new Uint8Array(1 + pcm.byteLength);
                     msg[0] = 0x01;
                     msg.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
@@ -1727,6 +1770,7 @@ registerProcessor('mic-capture', MicCapture);`;
                 // No speaker connection; we only need the worklet to run on
                 // captured audio, not emit anything to the output graph.
                 micWorkletSource.connect(micCaptureNode);
+                await initVAD();
                 console.log('Microphone capture started (raw PCM)');
             } catch (err) {
                 console.error('Microphone error:', err);
@@ -1757,6 +1801,13 @@ registerProcessor('mic-capture', MicCapture);`;
         
         function cleanup() {
             stopSessionRecording(null);
+            if (micVad) {
+                try { micVad.pause(); } catch(e) {}
+                try { micVad.destroy && micVad.destroy(); } catch(e) {}
+                micVad = null;
+            }
+            userSpeaking = false;
+            modelSpeakingUntil = 0;
             if (micCaptureNode) {
                 try { micCaptureNode.port.onmessage = null; } catch(e) {}
                 try { micCaptureNode.disconnect(); } catch(e) {}
