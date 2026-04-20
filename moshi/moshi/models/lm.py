@@ -895,8 +895,14 @@ class LMGen(StreamingModule[_LMGenState]):
         state = self._streaming_state
         lm_model = self.lm_model
 
-        # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
+        # Shape of text_logits should be [B, K_text=1, T=1, Card_text].
+        # text_logits may alias a CUDA-graph captured output buffer (see
+        # graphed_main); any in-place write must go through a clone, matching
+        # the pattern in apply_repetition_penalty. .float() is a no-op copy
+        # when dtype is already float32, so we clone explicitly.
         text_logits_f = text_logits.float()
+        if text_logits_f.data_ptr() == text_logits.data_ptr():
+            text_logits_f = text_logits_f.clone()
         # Bias the text padding token up to encourage the model to yield its
         # turn. Moshi emits text_padding_token when it has nothing to say; a
         # positive bonus shortens rambling. 0 = off, 2-4 typical.

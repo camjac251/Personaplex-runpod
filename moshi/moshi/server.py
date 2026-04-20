@@ -688,6 +688,16 @@ def main():
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
+    # Surface the inner-monologue yield token so a mismatch with the
+    # checkpoint's actual padding semantics is obvious at boot. If
+    # padding_bonus silently does nothing, it's usually because this piece is
+    # not what the fine-tune emits during silence.
+    try:
+        _pad_id = lm.text_padding_token_id
+        _pad_piece = text_tokenizer.id_to_piece(_pad_id)
+        logger.info(f"text_padding_token_id={_pad_id} piece={_pad_piece!r} (target of padding_bonus)")
+    except Exception as e:
+        logger.warning(f"could not resolve text_padding_token_id: {e}")
     state = ServerState(
         mimi=mimi,
         text_tokenizer=text_tokenizer,
@@ -1488,7 +1498,16 @@ registerProcessor('mic-capture', MicCapture);`;
                     playerNode.connect(recordingDestination);
                 }
                 try {
-                    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+                    // Reuse the mic stream acquired by startMicRecording if it's
+                    // up already; otherwise fall back to a fresh getUserMedia.
+                    // Two independent captures of the same mic diverge on AEC/NS
+                    // state and can produce different effective audio, so prefer
+                    // sharing one track across worklet + recording + analyser.
+                    if (micWorkletStream) {
+                        micStream = micWorkletStream;
+                    } else {
+                        micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+                    }
                     micSource = audioContext.createMediaStreamSource(micStream);
                     micSource.connect(recordingDestination);
                     userAnalyser = audioContext.createAnalyser();
@@ -1533,10 +1552,14 @@ registerProcessor('mic-capture', MicCapture);`;
                 try { micSource.disconnect(); } catch (err) {}
                 micSource = null;
             }
-            if (micStream) {
+            // Do not stop micStream tracks here when it aliases micWorkletStream;
+            // cleanup() stops micWorkletStream explicitly. Dropping the shared
+            // track twice fires onended on a stream the worklet is still
+            // consuming, producing spurious warnings.
+            if (micStream && micStream !== micWorkletStream) {
                 micStream.getTracks().forEach(track => track.stop());
-                micStream = null;
             }
+            micStream = null;
         }
         
         function playDecodedAudio(pcmData) {
@@ -1672,8 +1695,9 @@ registerProcessor('mic-capture', MicCapture);`;
                         setStatus('connected', 'Connected - Speak now!');
                         stopBtn.disabled = false;
                         transcript.textContent = '';
-                        startMicRecording();
-                        startSessionRecording();
+                        // Await mic worklet before session recording so they
+                        // share one MediaStream (one set of AEC/NS state).
+                        startMicRecording().then(() => startSessionRecording());
                     } else if (msgType === 0x01) {
                         // Extend the "model speaking" window 400 ms past the
                         // latest audio frame so short gaps between server
