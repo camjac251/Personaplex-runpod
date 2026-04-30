@@ -294,7 +294,7 @@ class ServerState:
             ttl_seconds = 86400  # Cloudflare's documented max.
             url = (
                 "https://rtc.live.cloudflare.com/v1/turn/keys/"
-                f"{self._turn_key_id}/credentials/generate-ica"
+                f"{self._turn_key_id}/credentials/generate"
             )
             try:
                 async with aiohttp.ClientSession() as session:
