@@ -39,14 +39,43 @@ WEBRTC_SAMPLE_RATE = 48_000
 OUTBOUND_FRAME_MS = 20
 OUTBOUND_FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * OUTBOUND_FRAME_MS // 1000  # 960
 OUTBOUND_BUFFER_CAP_SAMPLES = WEBRTC_SAMPLE_RATE * 2  # 2 seconds; sanity cap.
-DEFAULT_ICE_SERVERS = (
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
+
+# STUN-only fallback used when no TURN credentials are configured. Works
+# only when both peers can reach each other directly over UDP, which is
+# not the case behind RunPod's HTTPS-only proxy. Production deployments
+# should provide TURN credentials via the env vars consumed in server.py.
+DEFAULT_STUN_FALLBACK: tuple[dict, ...] = (
+    {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
 )
 
 
 ProcessFrameFn = Callable[[np.ndarray], list[tuple[np.ndarray, Optional[str]]]]
 LogFn = Callable[[str, str], None]
+
+
+def ice_servers_to_aiortc(servers: list[dict]) -> list[RTCIceServer]:
+    """Translate a Cloudflare-style iceServers JSON list to aiortc objects.
+
+    Accepts entries shaped like ``{"urls": [...], "username": "...",
+    "credential": "..."}`` (matching what the browser ``RTCPeerConnection``
+    constructor expects), so server- and client-side configs can share
+    the same on-the-wire format.
+    """
+    out: list[RTCIceServer] = []
+    for entry in servers:
+        urls = entry.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        if not urls:
+            continue
+        out.append(
+            RTCIceServer(
+                urls=list(urls),
+                username=entry.get("username"),
+                credential=entry.get("credential"),
+            )
+        )
+    return out
 
 
 def _f32_to_s16(samples: np.ndarray) -> np.ndarray:
@@ -187,15 +216,23 @@ class RTCSession:
         frame_size: int,
         process_fn: ProcessFrameFn,
         log: LogFn,
-        ice_servers: tuple[str, ...] = DEFAULT_ICE_SERVERS,
+        ice_servers: Optional[list[dict]] = None,
     ) -> None:
+        """Create a peer-connection session.
+
+        ``ice_servers`` is a Cloudflare-shaped iceServers list (entries of
+        ``{"urls": [...], "username": "...", "credential": "..."}``).
+        ``None`` falls back to STUN-only, which won't traverse the RunPod
+        HTTPS proxy and is intended for local LAN dev.
+        """
         self._frame_size = frame_size
         self._process_fn = process_fn
         self._log = log
 
+        configured = ice_servers if ice_servers else list(DEFAULT_STUN_FALLBACK)
         self._pc = RTCPeerConnection(
             configuration=RTCConfiguration(
-                iceServers=[RTCIceServer(urls=list(ice_servers))]
+                iceServers=ice_servers_to_aiortc(configured)
             )
         )
         self._output_track = MimiOutputTrack()

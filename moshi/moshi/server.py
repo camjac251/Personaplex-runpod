@@ -27,14 +27,17 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
 import tarfile
 import secrets
 import sys
+import time
 from typing import Literal, Optional
 
+import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
 import numpy as np
@@ -46,7 +49,7 @@ from aiortc import RTCSessionDescription
 
 from .models import loaders, MimiModel, LMModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
-from .rtc_session import RTCSession, SessionConfig
+from .rtc_session import DEFAULT_STUN_FALLBACK, RTCSession, SessionConfig
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -122,6 +125,14 @@ class ServerState:
         # set, the runner task that owns the lock can be garbage-collected
         # mid-session, leaving the lock permanently held.
         self._session_tasks: set[asyncio.Task] = set()
+        # Cloudflare TURN credentials (optional). When both are set we mint
+        # ephemeral creds via their API per session; otherwise STUN-only.
+        # Read from env so the values never enter the repo.
+        self._turn_key_id = os.environ.get("TURN_KEY_ID", "").strip() or None
+        self._turn_api_token = os.environ.get("TURN_KEY_API_TOKEN", "").strip() or None
+        self._ice_cache: Optional[list[dict]] = None
+        self._ice_cache_expires_at: float = 0.0
+        self._ice_cache_lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
@@ -263,6 +274,82 @@ class ServerState:
             )
         return requested, requested
 
+    async def _fetch_ice_servers(self) -> list[dict]:
+        """Return iceServers config for the current session.
+
+        With ``TURN_KEY_ID`` and ``TURN_KEY_API_TOKEN`` set, mints a fresh
+        24-hour credential pack from Cloudflare Realtime and caches it for
+        12 hours. Otherwise returns the STUN-only fallback, which only
+        works when both peers can reach each other directly over UDP
+        (i.e. on LAN; not through RunPod's HTTPS proxy).
+        """
+        if not (self._turn_key_id and self._turn_api_token):
+            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+
+        async with self._ice_cache_lock:
+            now = time.monotonic()
+            if self._ice_cache is not None and now < self._ice_cache_expires_at:
+                return self._ice_cache
+
+            ttl_seconds = 86400  # Cloudflare's documented max.
+            url = (
+                "https://rtc.live.cloudflare.com/v1/turn/keys/"
+                f"{self._turn_key_id}/credentials/generate-ica"
+            )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {self._turn_api_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"ttl": ttl_seconds},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        body_text = await resp.text()
+                        if resp.status >= 400:
+                            logger.warning(
+                                "Cloudflare TURN creds fetch failed: "
+                                f"{resp.status} {body_text[:200]}"
+                            )
+                            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+                        try:
+                            data = json.loads(body_text)
+                        except ValueError as exc:
+                            logger.warning(
+                                f"Cloudflare TURN creds fetch returned non-JSON: {exc}"
+                            )
+                            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(f"Cloudflare TURN creds fetch error: {exc}")
+                return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+
+            servers = data.get("iceServers")
+            if isinstance(servers, dict):
+                # Cloudflare currently returns a single object; spec also
+                # allows an array. Accept both.
+                servers = [servers]
+            if not isinstance(servers, list) or not servers:
+                logger.warning(
+                    "Cloudflare returned no iceServers; falling back to STUN"
+                )
+                return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+
+            self._ice_cache = servers
+            # Refresh halfway through the TTL so we never serve creds that
+            # are about to expire mid-session.
+            self._ice_cache_expires_at = now + ttl_seconds / 2
+            logger.info(
+                f"Cloudflare TURN creds minted (ttl={ttl_seconds}s, "
+                f"refresh at +{ttl_seconds // 2}s)"
+            )
+            return servers
+
+    async def handle_ice_servers(self, _request):
+        servers = await self._fetch_ice_servers()
+        return web.json_response({"iceServers": servers})
+
     async def _try_acquire_session_lock(self, timeout: float) -> bool:
         """Acquire ``self.lock`` with a timeout, safe against the known
         ``asyncio.wait_for(lock.acquire())`` race.
@@ -350,10 +437,12 @@ class ServerState:
                 config_holder["cfg"] = cfg
                 config_event.set()
 
+            ice_servers = await self._fetch_ice_servers()
             session = RTCSession(
                 frame_size=self.frame_size,
                 process_fn=self._process_audio_frame,
                 log=clog.log,
+                ice_servers=ice_servers,
             )
             session.set_config_handler(on_config)
 
@@ -726,6 +815,7 @@ def main():
     state.warmup()
     app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
     app.router.add_post("/api/rtc/offer", state.handle_rtc_offer)
+    app.router.add_get("/api/rtc/ice-servers", state.handle_ice_servers)
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     if static_path is not None:
         async def handle_root(_):
@@ -1204,9 +1294,25 @@ def main():
             astronaut: "You enjoy having a good conversation. Have a technical discussion about fixing a reactor core on a spaceship to Mars. You are an astronaut on a Mars mission. Your name is Alex. You are already dealing with a reactor core meltdown on a Mars mission. Several ship systems are failing, and continued instability will lead to catastrophic failure. You explain what is happening and you urgently ask for help thinking through how to stabilize the reactor."
         };
 
-        const ICE_SERVERS = [
+        // STUN-only fallback if /api/rtc/ice-servers fails. Will not work
+        // through the RunPod HTTPS proxy; only useful on a LAN dev box.
+        const ICE_SERVERS_FALLBACK = [
             { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
         ];
+
+        async function fetchIceServers() {
+            try {
+                const res = await fetch('/api/rtc/ice-servers', { method: 'GET' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+                    return data.iceServers;
+                }
+            } catch (err) {
+                console.warn('ice-servers fetch failed, falling back to STUN:', err);
+            }
+            return ICE_SERVERS_FALLBACK;
+        }
         const CONNECT_BTN_HTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
 
         // Peer connection + track refs.
@@ -1790,7 +1896,8 @@ def main():
                 setStatus('connecting', 'Negotiating...');
                 transcript.textContent = 'Connecting to server...';
 
-                pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+                const iceServers = await fetchIceServers();
+                pc = new RTCPeerConnection({ iceServers });
 
                 pc.ontrack = (event) => {
                     aiStream = event.streams && event.streams[0]
