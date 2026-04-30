@@ -207,9 +207,11 @@ class RTCSession:
         self._control: Optional[RTCDataChannel] = None
         self._inbound_task: Optional[asyncio.Task] = None
         self._process_task: Optional[asyncio.Task] = None
+        # Strong refs to short-lived control-message handler tasks so the
+        # event loop doesn't garbage-collect them mid-execution.
+        self._control_tasks: set[asyncio.Task] = set()
         self._closed = asyncio.Event()
         self._on_config: Optional[Callable[[SessionConfig], Awaitable[None]]] = None
-        self._on_reset: Optional[Callable[[], Awaitable[None]]] = None
         self._ready_sent = False
 
         @self._pc.on("track")
@@ -232,7 +234,9 @@ class RTCSession:
         def _on_state() -> None:
             state = self._pc.connectionState
             self._log("info", f"connection state -> {state}")
-            if state in ("closed", "failed", "disconnected"):
+            # 'disconnected' is transient per spec; ICE may recover. Only
+            # 'failed' and 'closed' are terminal.
+            if state in ("closed", "failed"):
                 self._closed.set()
 
     # ------------------------------------------------------------------ #
@@ -243,9 +247,6 @@ class RTCSession:
         self, handler: Callable[[SessionConfig], Awaitable[None]]
     ) -> None:
         self._on_config = handler
-
-    def set_reset_handler(self, handler: Callable[[], Awaitable[None]]) -> None:
-        self._on_reset = handler
 
     async def negotiate(self, offer: RTCSessionDescription) -> RTCSessionDescription:
         """Set remote offer, build answer, wait for ICE, return answer.
@@ -285,13 +286,31 @@ class RTCSession:
         await self._closed.wait()
 
     async def close(self) -> None:
-        if self._closed.is_set():
-            return
+        """Idempotent shutdown.
+
+        Awaits the cancelled inbound/process tasks before returning so that
+        any in-flight GPU work (shielded inside ``_process_loop``) finishes
+        and releases its grip on shared lm_gen / mimi state. Without this
+        await, the caller's ``self.lock.release()`` could fire while the
+        GPU thread is still mutating those tensors, racing the next
+        session's ``reset_streaming()``.
+        """
         self._closed.set()
-        if self._inbound_task is not None:
-            self._inbound_task.cancel()
-        if self._process_task is not None:
-            self._process_task.cancel()
+        pending: list[asyncio.Task] = []
+        for task in (self._inbound_task, self._process_task, *self._control_tasks):
+            if task is not None and not task.done():
+                task.cancel()
+                pending.append(task)
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._log(
+                    "warning",
+                    f"task drain raised: {type(exc).__name__}: {exc}",
+                )
         try:
             await self._pc.close()
         except Exception as exc:
@@ -316,7 +335,15 @@ class RTCSession:
     # Internals
     # ------------------------------------------------------------------ #
 
-    async def _wait_ice_complete(self) -> None:
+    async def _wait_ice_complete(self, timeout: float = 10.0) -> None:
+        """Wait for ICE gathering to complete, with a hard upper bound.
+
+        Without a timeout, an unreachable STUN server or a misbehaving NIC
+        stuck in 'gathering' wedges the request handler indefinitely while
+        ``self.lock`` is held, returning HTTP 409 to every subsequent
+        connection. 10 s is plenty for trickle ICE on the LAN; a stalled
+        gather past that point should fail loudly.
+        """
         if self._pc.iceGatheringState == "complete":
             return
         fut: asyncio.Future[None] = asyncio.get_event_loop().create_future()
@@ -326,7 +353,12 @@ class RTCSession:
             if self._pc.iceGatheringState == "complete" and not fut.done():
                 fut.set_result(None)
 
-        await fut
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"ICE gathering did not complete within {timeout:.0f}s"
+            ) from exc
 
     def _wire_control_channel(self, channel: RTCDataChannel) -> None:
         @channel.on("open")
@@ -335,40 +367,63 @@ class RTCSession:
 
         @channel.on("message")
         def _on_message(message: object) -> None:
-            asyncio.create_task(self._handle_control_message(message))
+            # Hold a strong ref so the event loop's weak set can't GC the
+            # task mid-handler.
+            task = asyncio.create_task(self._handle_control_message(message))
+            self._control_tasks.add(task)
+            task.add_done_callback(self._control_tasks.discard)
 
     async def _handle_control_message(self, message: object) -> None:
         if not isinstance(message, str):
-            self._log("warning", f"control: ignoring non-string message {type(message)}")
+            self._log(
+                "warning",
+                f"control: ignoring non-string message {type(message).__name__}",
+            )
             return
         try:
             payload = json.loads(message)
         except json.JSONDecodeError as exc:
             self._log("warning", f"control: bad JSON: {exc}")
             return
+        if not isinstance(payload, dict):
+            self._log(
+                "warning",
+                f"control: payload is not an object: {type(payload).__name__}",
+            )
+            return
         kind = payload.get("type")
         if kind == "config":
-            cfg = SessionConfig(
-                voice_prompt=str(payload.get("voice_prompt", "")),
-                text_prompt=str(payload.get("text_prompt", "")),
-                seed=payload.get("seed"),
-                audio_temperature=float(payload.get("audio_temperature", 0.7)),
-                text_temperature=float(payload.get("text_temperature", 0.7)),
-                text_topk=int(payload.get("text_topk", 25)),
-                audio_topk=int(payload.get("audio_topk", 250)),
-                repetition_penalty=float(payload.get("repetition_penalty", 1.2)),
-                repetition_penalty_context=int(
-                    payload.get("repetition_penalty_context", 64)
-                ),
-                padding_bonus=float(payload.get("padding_bonus", 0.0)),
-                max_turn_text_tokens=int(payload.get("max_turn_text_tokens", 0)),
-            )
+            try:
+                seed_raw = payload.get("seed")
+                seed = None if seed_raw is None else int(seed_raw)
+                cfg = SessionConfig(
+                    voice_prompt=str(payload.get("voice_prompt", "")),
+                    text_prompt=str(payload.get("text_prompt", "")),
+                    seed=seed,
+                    audio_temperature=float(payload.get("audio_temperature", 0.7)),
+                    text_temperature=float(payload.get("text_temperature", 0.7)),
+                    text_topk=int(payload.get("text_topk", 25)),
+                    audio_topk=int(payload.get("audio_topk", 250)),
+                    repetition_penalty=float(payload.get("repetition_penalty", 1.2)),
+                    repetition_penalty_context=int(
+                        payload.get("repetition_penalty_context", 64)
+                    ),
+                    padding_bonus=float(payload.get("padding_bonus", 0.0)),
+                    max_turn_text_tokens=int(payload.get("max_turn_text_tokens", 0)),
+                )
+            except (TypeError, ValueError) as exc:
+                self._log("warning", f"control: bad config: {exc}")
+                self.send_error(f"bad_config: {exc}")
+                return
             if self._on_config is not None:
                 await self._on_config(cfg)
-        elif kind == "reset":
-            if self._on_reset is not None:
-                await self._on_reset()
         else:
+            # 'reset' was intentionally not implemented: mid-session resets
+            # racing the executor's GPU thread is the same hazard the
+            # original WebSocket handler's lock + shield carefully avoided
+            # at session boundaries. If/when we want it, route through the
+            # process loop between frames so the reset shares a thread
+            # with the inference work.
             self._log("warning", f"control: unknown type {kind!r}")
 
     async def _inbound_loop(self, track: MediaStreamTrack) -> None:

@@ -117,6 +117,11 @@ class ServerState:
         )
         
         self.lock = asyncio.Lock()
+        # Strong refs to long-running session tasks. asyncio holds only
+        # weak references to tasks created via create_task; without this
+        # set, the runner task that owns the lock can be garbage-collected
+        # mid-session, leaving the lock permanently held.
+        self._session_tasks: set[asyncio.Task] = set()
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
@@ -258,6 +263,43 @@ class ServerState:
             )
         return requested, requested
 
+    async def _try_acquire_session_lock(self, timeout: float) -> bool:
+        """Acquire ``self.lock`` with a timeout, safe against the known
+        ``asyncio.wait_for(lock.acquire())`` race.
+
+        ``asyncio.wait_for`` cancels the inner coroutine on timeout, but
+        ``Lock.acquire`` can complete the acquisition in the same tick the
+        cancellation arrives. Older asyncio versions then leak the lock
+        (cancellation propagates to the caller while the locked flag stays
+        set). We work around it by shielding the acquire task and, on
+        timeout, releasing the lock if the task in fact succeeded.
+        """
+        waiter = asyncio.create_task(self.lock.acquire())
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            waiter.cancel()
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            # If the cancellation arrived after acquire() returned True,
+            # the task is done with no exception and the lock is held by
+            # this coroutine. Release it so future offers can proceed.
+            if (
+                waiter.done()
+                and not waiter.cancelled()
+                and waiter.exception() is None
+            ):
+                try:
+                    self.lock.release()
+                except RuntimeError:
+                    pass
+            return False
+
     async def handle_rtc_offer(self, request):
         """WebRTC signaling: accept SDP offer, return SDP answer.
 
@@ -277,60 +319,80 @@ class ServerState:
         except (ValueError, KeyError) as exc:
             return web.json_response({"error": f"invalid offer: {exc}"}, status=400)
 
-        try:
-            await asyncio.wait_for(self.lock.acquire(), timeout=0.25)
-        except asyncio.TimeoutError:
+        if not await self._try_acquire_session_lock(timeout=0.25):
             return web.json_response({"error": "session_busy"}, status=409)
 
-        clog = ColorizedLog.randomize()
-        peer = request.remote
-        peer_port = (
-            request.transport.get_extra_info("peername")[1]
-            if request.transport is not None else "?"
-        )
-        clog.log("info", f"Incoming RTC offer from {peer}:{peer_port}")
-
-        config_event: asyncio.Event = asyncio.Event()
-        config_holder: dict = {"cfg": None}
-
-        async def on_config(cfg: SessionConfig) -> None:
-            if config_event.is_set():
-                clog.log("warning", "ignoring duplicate config message")
-                return
-            config_holder["cfg"] = cfg
-            config_event.set()
-
-        async def on_reset() -> None:
-            # Soft reset: clear streaming state without re-running
-            # system prompts. Same idea as starting a new turn.
-            self.mimi.reset_streaming()
-            self.lm_gen.reset_streaming()
-
-        session = RTCSession(
-            frame_size=self.frame_size,
-            process_fn=self._process_audio_frame,
-            log=clog.log,
-        )
-        session.set_config_handler(on_config)
-        session.set_reset_handler(on_reset)
-
+        # Once the lock is acquired, every failure path below MUST release
+        # it. asyncio.CancelledError does not inherit from Exception in
+        # Python 3.8+, so we use a bare ``except`` and re-raise after
+        # cleanup. Without this, a client closing the HTTP connection
+        # mid-negotiation, or any unexpected exception in RTCSession
+        # construction, leaves the lock permanently held and every future
+        # offer wedged on HTTP 409 until restart.
+        session: Optional[RTCSession] = None
+        owns_lock = True
         try:
-            answer = await session.negotiate(offer)
-        except Exception as exc:
-            clog.log("error", f"negotiate failed: {type(exc).__name__}: {exc}")
-            await session.close()
-            self.lock.release()
-            return web.json_response(
-                {"error": f"negotiate failed: {exc}"}, status=500
+            clog = ColorizedLog.randomize()
+            peer = request.remote
+            peer_port = (
+                request.transport.get_extra_info("peername")[1]
+                if request.transport is not None else "?"
             )
+            clog.log("info", f"Incoming RTC offer from {peer}:{peer_port}")
 
-        # Spawn the long-running session runner. It owns the lock until
-        # the peer connection closes; we never await it from here.
-        asyncio.create_task(
-            self._run_rtc_session(session, config_event, config_holder, clog)
-        )
+            config_event: asyncio.Event = asyncio.Event()
+            config_holder: dict = {"cfg": None}
 
-        return web.json_response({"sdp": answer.sdp, "type": answer.type})
+            async def on_config(cfg: SessionConfig) -> None:
+                if config_event.is_set():
+                    clog.log("warning", "ignoring duplicate config message")
+                    return
+                config_holder["cfg"] = cfg
+                config_event.set()
+
+            session = RTCSession(
+                frame_size=self.frame_size,
+                process_fn=self._process_audio_frame,
+                log=clog.log,
+            )
+            session.set_config_handler(on_config)
+
+            try:
+                answer = await session.negotiate(offer)
+            except Exception as exc:
+                clog.log("error", f"negotiate failed: {type(exc).__name__}: {exc}")
+                await session.close()
+                self.lock.release()
+                owns_lock = False
+                return web.json_response(
+                    {"error": f"negotiate failed: {exc}"}, status=500
+                )
+
+            # Spawn the long-running session runner. It owns the lock from
+            # this point on. Strong-ref the task so the event loop's weak
+            # set cannot garbage-collect it.
+            task = asyncio.create_task(
+                self._run_rtc_session(session, config_event, config_holder, clog)
+            )
+            self._session_tasks.add(task)
+            task.add_done_callback(self._session_tasks.discard)
+            owns_lock = False  # ownership transferred to the runner
+            return web.json_response({"sdp": answer.sdp, "type": answer.type})
+        except BaseException:
+            # Anything from a torn transport (peer_port lookup) to
+            # RTCPeerConnection construction failures, including
+            # asyncio.CancelledError if the client drops the request.
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            if owns_lock:
+                try:
+                    self.lock.release()
+                except RuntimeError:
+                    pass
+            raise
 
     async def _run_rtc_session(
         self,
@@ -1749,13 +1811,17 @@ def main():
                 pc.onconnectionstatechange = () => {
                     console.log('pc state:', pc && pc.connectionState);
                     if (!pc) return;
+                    // 'disconnected' is transient per spec; ICE may
+                    // recover. Only 'failed' and 'closed' are terminal.
                     if (pc.connectionState === 'failed') {
                         showError('Connection failed. Network or NAT may be blocking media.', true);
                         cleanup();
-                    } else if (pc.connectionState === 'disconnected'
-                               || pc.connectionState === 'closed') {
+                    } else if (pc.connectionState === 'closed') {
                         if (isReady) setStatus('disconnected', 'Disconnected');
                         cleanup();
+                    } else if (pc.connectionState === 'disconnected') {
+                        // Show a soft-warning status; do not tear down.
+                        setStatus('connecting', 'Reconnecting...');
                     }
                 };
 
