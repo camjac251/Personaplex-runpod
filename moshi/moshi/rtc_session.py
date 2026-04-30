@@ -242,6 +242,14 @@ class RTCSession:
         # Buffered queues. Match the existing 200 ms cap on inbound PCM
         # so GPU stalls drop the newest chunk rather than ballooning.
         self._pcm_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=10)
+        # Inbound audio is dropped silently until start_processing() runs.
+        # Otherwise the warmup phase (~10 s for raw-audio voice prompts)
+        # spams ~50 "pcm queue full" warnings per second while the model
+        # is not yet listening. Once processing starts, queue-full
+        # warnings are rate-limited to one per second so a sustained
+        # overrun logs once, not on every dropped chunk.
+        self._processing_started = False
+        self._last_drop_warn_at = 0.0
         self._control: Optional[RTCDataChannel] = None
         self._inbound_task: Optional[asyncio.Task] = None
         self._process_task: Optional[asyncio.Task] = None
@@ -389,13 +397,16 @@ class RTCSession:
 
         Drains any pre-ready audio first; whatever the client streamed
         before the model finished warming up is stale and would otherwise
-        be the first thing fed into freshly-reset mimi state.
+        be the first thing fed into freshly-reset mimi state. Flips
+        ``_processing_started`` so ``_inbound_loop`` stops silently
+        dropping new audio.
         """
         while True:
             try:
                 self._pcm_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        self._processing_started = True
         if self._process_task is None:
             self._process_task = asyncio.create_task(self._process_loop())
 
@@ -535,13 +546,21 @@ class RTCSession:
                 samples = _frame_to_mono_24k_f32(frame, resampler)
                 if samples.size == 0:
                     continue
+                if not self._processing_started:
+                    # Warmup phase: model is not consuming yet. Dropping
+                    # this chunk is the right thing; do it silently so
+                    # the log is not flooded by ~10 s of warning spam.
+                    continue
                 try:
                     self._pcm_queue.put_nowait(samples)
                 except asyncio.QueueFull:
-                    self._log(
-                        "warning",
-                        f"pcm queue full ({self._pcm_queue.qsize()}), dropping chunk",
-                    )
+                    now = asyncio.get_event_loop().time()
+                    if now - self._last_drop_warn_at >= 1.0:
+                        self._log(
+                            "warning",
+                            f"pcm queue full ({self._pcm_queue.qsize()}), dropping inbound audio",
+                        )
+                        self._last_drop_warn_at = now
         except asyncio.CancelledError:
             raise
         except Exception as exc:

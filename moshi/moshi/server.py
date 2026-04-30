@@ -2293,6 +2293,23 @@ def main():
     if setup_tunnel is not None:
         tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
         logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
+
+    # Cloudflare's TURN returns a bare 401 on CHANNEL_BIND that aioice
+    # cannot retry, leaving "Task exception was never retrieved" stack
+    # traces in the log even though the WebRTC connection succeeds via
+    # plain Send-Indication. Filter those out at the asyncio exception
+    # handler so unrelated exceptions still surface normally.
+    async def _install_aioice_noise_filter(_app):
+        def _handler(loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, Exception):
+                mod = type(exc).__module__ or ""
+                if mod.startswith("aioice."):
+                    return
+            loop.default_exception_handler(context)
+        asyncio.get_event_loop().set_exception_handler(_handler)
+    app.on_startup.append(_install_aioice_noise_filter)
+
     web.run_app(app, port=args.port, ssl_context=ssl_context)
 
 
