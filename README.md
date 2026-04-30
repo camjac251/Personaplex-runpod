@@ -1,138 +1,152 @@
-# PersonaPlex One-Click Installer (Windows)
+# PersonaPlex on RunPod
 
 [![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
 [![Paper](https://img.shields.io/badge/📄-Paper-blue)](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
 [![Demo](https://img.shields.io/badge/🎮-Demo-green)](https://research.nvidia.com/labs/adlr/personaplex/)
 [![Discord](https://img.shields.io/badge/Discord-Join-purple?logo=discord)](https://discord.gg/5jAXrrbwRb)
 
-PersonaPlex is a real-time, full-duplex speech-to-speech conversational model with persona control via text prompts and audio voice conditioning. This repository provides a **Windows one-click installer** so you can get up and running without manual setup.
+PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
 
 <p align="center">
   <img src="assets/architecture_diagram.png" alt="PersonaPlex Model Architecture">
   <br>
-  <em>PersonaPlex Architecture</em>
+  <em>Upstream PersonaPlex architecture</em>
 </p>
 
----
+## Credits
 
-## Credits & Acknowledgements
+- **Model and research**: NVIDIA PersonaPlex team. All credit for the core AI belongs to the original authors. See [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex).
+- **Windows installer this fork was branched from**: [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
+- **RunPod packaging + WebRTC transport**: [@camjac251](https://github.com/camjac251).
 
-This repository is a **Windows-focused one-click installer and launcher** built on top of the original PersonaPlex project.
+## Deploy on RunPod
 
-**Original research & core implementation**  
-The PersonaPlex model, architecture, and main codebase are created and maintained by the **NVIDIA PersonaPlex research team**. All credit for the core AI, speech model, and research innovation belongs to the original authors and contributors.
+### 1. HuggingFace token
 
-**Windows one-click installer & packaging**  
-The Windows one-click setup, automation scripts, and launchers in this repo were created by **Suresh Pydikondala**, with the goal of making PersonaPlex easier to install, test, and run on Windows without complex manual setup.
+Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and accept the model license at [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1).
 
-This repository does not modify the fundamental model or research logic—it focuses on **accessibility, automation, and practical usability** on Windows.
+### 2. Cloudflare TURN credentials
 
----
+WebRTC media is UDP. RunPod's `*.proxy.runpod.net` is Cloudflare-fronted and only carries HTTP/WS, so the browser needs a TURN relay to reach the pod. Cloudflare's free tier covers a personal voice agent comfortably (1 TB egress/month).
 
-## Quick Start (Windows)
+1. Sign in to Cloudflare. Dashboard -> **Realtime** -> **TURN Server**.
+2. Click **Create TURN App**, name it.
+3. Copy the **Turn Token ID** and **API Token**. The API token is shown once. Lose it and you regenerate.
 
-1. **Download or clone** this repository.
-2. **Double-click** `INSTALL_PERSONAPLEX.bat` — it handles environment, dependencies, and client build.
-3. **Follow the prompts** to set your HuggingFace token (required for model access).
-4. When installation finishes, **double-click** `START_PERSONAPLEX.bat` to launch.
+### 3. RunPod secrets
 
-**Requirements:** Windows 10 or 11, Python 3.10+, Node.js 18+, and an NVIDIA GPU (12GB+ VRAM recommended).
+In the RunPod console, go to **Secrets** -> **Create secret** and add three:
 
-> **Note — First-time installation and first run:**  
-> The first time you run the installer and the first time you start PersonaPlex, the app will **download roughly 14GB of model files** from HuggingFace. This can take **30–60 minutes** or more depending on your connection. Please be patient and keep the window open until it completes. After that, models are cached locally and future launches are much faster (~30–60 seconds).
+| Secret name | Value |
+|---|---|
+| `HF_TOKEN` | HuggingFace Read token |
+| `TURN_KEY_ID` | Cloudflare Turn Token ID |
+| `TURN_KEY_API_TOKEN` | Cloudflare API Token |
 
-For detailed steps and troubleshooting, see [INSTALL.md](INSTALL.md).
+### 4. Pod template
 
----
+Create a Pod template (Templates -> New Template). Settings:
 
-## What the installer does
+- **Type**: Pod
+- **Compute**: NVIDIA GPU
+- **Container image**: `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
+- **Container disk**: 20 GB
+- **Volume disk**: 40 GB
+- **Volume mount path**: `/workspace`
 
-- Checks system requirements (Python, Node.js, GPU, RAM).
-- Creates a virtual environment and installs Python dependencies (including `moshi`).
-- Builds the web client so you can use the UI in your browser.
-- Guides you through HuggingFace token setup.
-- Optionally launches PersonaPlex when done.
+**Container start command**:
 
----
+```bash
+bash -c "curl -sL https://raw.githubusercontent.com/camjac251/Personaplex-runpod/main/start.sh -o /workspace/start.sh && chmod +x /workspace/start.sh && /workspace/start.sh & /start.sh"
+```
 
-## After installation
+**HTTP ports**: `8998` (PersonaPlex). `8888` (JupyterLab) is optional.
 
-| Action              | What to run                          |
-|---------------------|--------------------------------------|
-| Start PersonaPlex   | `START_PERSONAPLEX.bat`              |
-| Low VRAM / OOM      | `START_PERSONAPLEX_CPU_OFFLOAD.bat`  |
-| Public share link   | `START_PERSONAPLEX_PUBLIC.bat`       |
-| All options / menu  | `LAUNCHER.bat`                       |
-| Check setup         | `CHECK_STATUS.bat`                   |
-| Set HuggingFace     | `SETUP_HUGGINGFACE.bat`              |
+**TCP ports**: none.
 
-Open the Web UI at **https://localhost:8998** (accept the self-signed certificate warning in the browser if prompted).
+**Environment variables**:
 
----
+| Name | Value |
+|---|---|
+| `HF_TOKEN` | `{{ RUNPOD_SECRET_HF_TOKEN }}` |
+| `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
+| `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
 
-## HuggingFace setup (required)
+### 5. Launch and connect
 
-1. Create an account at [huggingface.co](https://huggingface.co).
-2. Accept the model license: [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1).
-3. Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
-4. Run `SETUP_HUGGINGFACE.bat` and paste your token when asked.
+Pick a GPU with at least 12 GB VRAM (RTX 4090 / A6000 / L40S all work). Start the pod with the template above.
 
----
+First boot downloads ~14 GB of weights and voice prompts. Expect 30-60 minutes depending on the data centre. The volume disk caches them, so subsequent boots reach "ready" in under a minute.
+
+When the server log prints `Serving embedded web client (no build required)`, open the proxy URL from the pod (looks like `https://<pod-id>-8998.proxy.runpod.net/`). Click **Connect**, allow microphone access, and speak.
+
+To confirm TURN is doing its job: open `chrome://webrtc-internals` in another tab while a session is live. The active candidate pair under `selectedCandidatePairId` should have `relayProtocol: tcp` or `udp` and a remote address pointing at `turn.cloudflare.com`. If it shows `host` or `srflx` and you see no audio, TURN didn't engage.
 
 ## Voices
 
 Pre-packaged voice embeddings:
 
-- **Natural (female):** NATF0, NATF1, NATF2, NATF3  
-- **Natural (male):** NATM0, NATM1, NATM2, NATM3  
-- **Variety (female):** VARF0–VARF4  
-- **Variety (male):** VARM0–VARM4  
+- **Natural (female)**: NATF0, NATF1, NATF2, NATF3
+- **Natural (male)**: NATM0, NATM1, NATM2, NATM3
+- **Variety (female)**: VARF0 through VARF4
+- **Variety (male)**: VARM0 through VARM4
 
----
+You can also upload 10-30 s of clean audio for any speaker via the **Clone a voice** panel. Mono or stereo, any common format. The model uses it as a voice prefix and continues in that timbre. Not zero-shot perfect, but recognisable.
 
-## Hardware testing & environment
+## Hardware
 
-This setup has been personally tested by the maintainer on:
+| Component | Tested |
+|---|---|
+| GPU | RTX 4090 |
+| VRAM | 24 GB |
+| Driver | RunPod default |
 
-| Component | Tested configuration |
-|-----------|------------------------|
-| **OS**    | Windows 10/11          |
-| **GPU**   | NVIDIA RTX 4090        |
-| **VRAM**  | 24 GB                  |
+Other modern NVIDIA cards with 12 GB+ VRAM work. Smaller cards can run with CPU offload at the cost of latency.
 
-Performance, stability, and behavior may vary on your system (GPU model, VRAM, CPU, RAM, drivers, OS). Please test and tune parameters according to your own hardware.
+## Architecture notes
 
----
+Audio path:
 
-## Known issues & observations
+1. Browser captures mic via `getUserMedia` and sends Opus-encoded frames over `RTCPeerConnection`.
+2. Server (aiortc) decodes to 48 kHz, resamples to Mimi's 24 kHz, feeds the inference pipeline. GPU work runs in a thread executor so the asyncio loop stays responsive.
+3. TTS PCM goes back the same way: 24 kHz -> 48 kHz -> Opus -> `<audio>` element in the browser.
+4. A `RTCDataChannel` labelled `control` carries the session config (voice, sampling parameters, prompts) and streams text tokens for the transcript.
 
-Based on personal testing, the following are known and originate from the **upstream** codebase (not from this Windows installer):
+Browser AEC, noise suppression, and AGC handle echo and ambient noise. Backgrounded tabs keep playing AI audio because WebRTC is treated as active media by the browser.
 
-- **Optimization:** Some parts of the pipeline are not fully optimized yet, which may lead to higher GPU usage or occasional inefficiencies.
-- **Voice response looping:** In certain scenarios, the AI voice may enter a loop and repeat replies. When it does not loop, responses are often accurate and natural.
+Single-session: `self.lock` in `ServerState` enforces one peer connection at a time. A second connect attempt while a session is live returns HTTP 409 `session_busy` instead of hanging.
 
-These are shared as practical observations to set expectations. For core model issues or research discussions, please refer to the [original PersonaPlex repository](https://github.com/NVIDIA/personaplex).
+## Known issues
 
----
+These come from the upstream model, not the RunPod packaging:
 
-## Disclaimer
+- **Response looping**: under certain prompts the model can repeat itself. The repetition penalty / context window sliders in the Advanced panel usually break the loop.
+- **Pipeline efficiency**: GPU utilisation is occasionally spiky; some kernels are not yet optimised.
 
-This project is provided as a **community convenience wrapper** around the original PersonaPlex work. For core model issues, research discussions, or fundamental behavior, please refer to the [original PersonaPlex repository and authors](https://github.com/NVIDIA/personaplex).
+For core model issues, file at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues).
 
----
+## Local dev
 
-## Support and license
+If you want to run outside RunPod (LAN only, no TURN required since both peers can reach each other directly):
 
-- **Issues (upstream):** [NVIDIA/personaplex issues](https://github.com/NVIDIA/personaplex/issues)
-- **Discord:** [PersonaPlex Discord](https://discord.gg/5jAXrrbwRb)
+```bash
+uv sync --frozen
+uv run moshi-server --host 127.0.0.1 --port 8998 --static none --voice-prompt-dir voices
+```
 
-Code is under the MIT license. Model weights use the NVIDIA Open Model license.
+Voice prompts need to be downloaded manually (see `start.sh` for the HuggingFace pull recipe) or symlinked from a previous RunPod volume.
 
----
+Run the resampler smoke tests:
 
-## Citation (upstream work)
+```bash
+uv run python moshi/tests/test_rtc_resampler.py
+```
 
-If you use PersonaPlex in research, please cite:
+## License
+
+Code: MIT. Model weights: NVIDIA Open Model License.
+
+## Citation
 
 ```bibtex
 @article{roy2026personaplex,
