@@ -108,14 +108,26 @@ def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
 
 
 def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
-    """Normalize **mono** audio to a target LUFS level."""
+    """Normalize audio to a target LUFS level. Returns mono (T,)."""
     import pyloudnorm as pyln
-    # Ensure shape is (T,)
-    if wav.ndim == 2 and wav.shape[0] == 1:
-        wav = wav[0]
 
-    meter = pyln.Meter(sr)
-    loudness = meter.integrated_loudness(wav)
+    # sphn.read returns (C, T). Downmix to mono so the rest of the
+    # pipeline (mimi encode of channel 0) gets a faithful mono signal
+    # regardless of the upload's channel count.
+    if wav.ndim == 2:
+        wav = wav.mean(axis=0)
+
+    # pyloudnorm needs at least one full block (default 0.4 s) to
+    # measure integrated loudness. Silent or near-silent audio returns
+    # -inf, which would scale the signal to inf. In either case, skip
+    # the LUFS pass and return the raw mono signal so the upload still
+    # produces some kind of voice prompt instead of a hard failure.
+    block_samples = int(0.4 * sr)
+    if wav.shape[-1] < block_samples:
+        return wav
+    loudness = pyln.Meter(sr).integrated_loudness(wav)
+    if not np.isfinite(loudness):
+        return wav
     return pyln.normalize.loudness(wav, loudness, target_lufs)
 
 
@@ -1039,20 +1051,15 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt(self, voice_prompt: str):
         self.voice_prompt = voice_prompt
-        raw_audio = load_audio(
-            voice_prompt, self._sample_rate,
-        )  # shape: (1, T) for mono
-
-        # Normalize to -24 LUFS (mono-safe)
+        # sphn.read returns (C, T). normalize_audio downmixes to mono and
+        # returns (T,). Re-add the channel dim so the encoder gets (1, T).
+        raw_audio = load_audio(voice_prompt, self._sample_rate)
         raw_audio = normalize_audio(raw_audio, self._sample_rate, -24.0)
-
-        # Keep shape (1, T) because your encoder expects channels-first
         if raw_audio.ndim == 1:
             raw_audio = raw_audio[None, :]
-
         self.voice_prompt_audio = raw_audio
-        self.voice_prompt_cache: Optional[torch.Tensor] = None
-        self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        self.voice_prompt_cache = None
+        self.voice_prompt_embeddings = None
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path

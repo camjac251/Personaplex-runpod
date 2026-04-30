@@ -14,6 +14,7 @@ dependencies = [
     "aiohttp>=3.10.5, <3.11",
     "aiortc >= 1.9, < 2",
     "av >= 12, < 14",
+    "pyloudnorm >= 0.1.1, < 0.2",
 ]
 authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
 maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
