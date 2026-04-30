@@ -437,7 +437,12 @@ class ServerState:
                 config_holder["cfg"] = cfg
                 config_event.set()
 
+            t_ice = time.monotonic()
             ice_servers = await self._fetch_ice_servers()
+            clog.log(
+                "info",
+                f"timing: ice_servers fetched in {(time.monotonic() - t_ice) * 1000:.0f} ms",
+            )
             session = RTCSession(
                 frame_size=self.frame_size,
                 process_fn=self._process_audio_frame,
@@ -447,7 +452,12 @@ class ServerState:
             session.set_config_handler(on_config)
 
             try:
+                t_neg = time.monotonic()
                 answer = await session.negotiate(offer)
+                clog.log(
+                    "info",
+                    f"timing: negotiate (incl. server ICE gather) {(time.monotonic() - t_neg) * 1000:.0f} ms",
+                )
             except Exception as exc:
                 clog.log("error", f"negotiate failed: {type(exc).__name__}: {exc}")
                 await session.close()
@@ -511,11 +521,15 @@ class ServerState:
                 return
 
             if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
+                t_vp = time.monotonic()
                 if voice_prompt_path.endswith(".pt"):
                     self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
                 else:
                     self.lm_gen.load_voice_prompt(voice_prompt_path)
-                clog.log("info", f"loaded voice prompt: {voice_prompt_path} (requested: {requested})")
+                clog.log(
+                    "info",
+                    f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
+                )
 
             self.lm_gen.text_prompt_tokens = (
                 self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
@@ -543,9 +557,13 @@ class ServerState:
             async def is_alive():
                 return session.is_alive()
 
+            t_sp = time.monotonic()
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
-            clog.log("info", "system prompts done")
+            clog.log(
+                "info",
+                f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
+            )
 
             if not session.is_alive():
                 clog.log("info", "client disconnected during warmup")
@@ -786,6 +804,21 @@ def main():
     )
     logger.info("warming up the model")
     state.warmup()
+
+    # Pre-warm Cloudflare TURN credentials so the very first session
+    # after boot does not pay the credential mint round-trip. The
+    # creds are cached in-process for 12 h after this call. No-op
+    # when TURN_KEY_ID / TURN_KEY_API_TOKEN are unset.
+    if state._turn_key_id and state._turn_api_token:
+        try:
+            t0 = time.monotonic()
+            asyncio.run(state._fetch_ice_servers())
+            logger.info(
+                f"TURN creds pre-warmed in {(time.monotonic() - t0) * 1000:.0f} ms"
+            )
+        except Exception as exc:  # never block startup on a TURN hiccup
+            logger.warning(f"TURN pre-warm failed (will mint on demand): {exc}")
+
     app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
     app.router.add_post("/api/rtc/offer", state.handle_rtc_offer)
     app.router.add_get("/api/rtc/ice-servers", state.handle_ice_servers)
@@ -1292,6 +1325,12 @@ def main():
         let micStream = null;       // local MediaStream from getUserMedia
         let aiStream = null;        // remote MediaStream from pc.ontrack
         let isReady = false;        // server has signalled 'ready'
+        let connectT0 = 0;          // performance.now() at Connect click
+        let connectTimings = null;  // per-phase elapsed ms, logged at 'ready'
+        function markConnect(name) {
+            if (!connectTimings) return;
+            connectTimings[name] = Math.round(performance.now() - connectT0);
+        }
 
         // AudioContext is used only to host AnalyserNodes for the visualizer
         // and to mux mic + AI streams into a single MediaRecorder destination
@@ -1822,6 +1861,12 @@ def main():
         function handleControlMessage(msg) {
             if (msg.type === 'ready') {
                 isReady = true;
+                markConnect('ready');
+                if (connectTimings) {
+                    console.groupCollapsed('connect timings (ms from Connect click)');
+                    Object.entries(connectTimings).forEach(([k, v]) => console.log(k.padEnd(22), v));
+                    console.groupEnd();
+                }
                 console.log('Server ready');
                 setStatus('connected', 'Connected - Speak now!');
                 stopBtn.disabled = false;
@@ -1853,19 +1898,32 @@ def main():
                 downloadLink.removeAttribute('href');
                 isReady = false;
 
+                // Per-phase timing for diagnosing slow session starts.
+                // Logged to the console as a grouped breakdown when the
+                // server signals 'ready'.
+                connectT0 = performance.now();
+                connectTimings = {};
+
                 // Mic permission + capture. With browser defaults (AEC, NS,
                 // AGC governed by the toggles) this is the only audio
                 // capture in the pipeline.
                 micStream = await navigator.mediaDevices.getUserMedia({
                     audio: getMicConstraints(),
                 });
+                markConnect('getUserMedia');
 
                 showConversationView();
                 setStatus('connecting', 'Negotiating...');
                 transcript.textContent = 'Connecting to server...';
 
                 const iceServers = await fetchIceServers();
-                pc = new RTCPeerConnection({ iceServers });
+                markConnect('fetchIceServers');
+                // iceCandidatePoolSize triggers candidate gathering as
+                // soon as the PeerConnection is created, overlapping it
+                // with track add and createOffer. Without this the
+                // gather only starts AFTER setLocalDescription, which
+                // serializes ~1-3 s of TURN allocation before signaling.
+                pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 1 });
 
                 pc.ontrack = (event) => {
                     aiStream = event.streams && event.streams[0]
@@ -1905,6 +1963,7 @@ def main():
                 // pc.on('datachannel') by label.
                 controlChannel = pc.createDataChannel('control');
                 controlChannel.onopen = () => {
+                    markConnect('dataChannelOpen');
                     const cfg = buildConfigPayload();
                     controlChannel.send(JSON.stringify({ type: 'config', ...cfg }));
                     setStatus('connecting', 'Loading AI model (this may take a moment)...');
@@ -1926,7 +1985,9 @@ def main():
 
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
+                markConnect('setLocalDescription');
                 await waitForIceComplete(pc);
+                markConnect('iceGatherComplete');
 
                 const res = await fetch('/api/rtc/offer', {
                     method: 'POST',
@@ -1945,7 +2006,9 @@ def main():
                     throw new Error('Server returned ' + res.status + (detail ? (': ' + detail) : ''));
                 }
                 const answer = await res.json();
+                markConnect('serverAnswer');
                 await pc.setRemoteDescription(answer);
+                markConnect('setRemoteDescription');
 
                 // Init the AudioContext now (after the user-gesture-driven
                 // Connect click) so the analyser graph is ready when the
