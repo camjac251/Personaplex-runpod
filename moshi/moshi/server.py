@@ -133,6 +133,10 @@ class ServerState:
         self._ice_cache: Optional[list[dict]] = None
         self._ice_cache_expires_at: float = 0.0
         self._ice_cache_lock = asyncio.Lock()
+        # Live sessions awaiting trickled candidates. Keyed by the
+        # opaque session_id returned in the offer response. Entries are
+        # cleared in _run_rtc_session's finally block.
+        self._candidate_sessions: dict[str, "RTCSession"] = {}
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
@@ -350,6 +354,74 @@ class ServerState:
         servers = await self._fetch_ice_servers()
         return web.json_response({"iceServers": servers})
 
+    async def handle_rtc_candidate(self, request):
+        """Accept a peer-trickled ICE candidate.
+
+        Body: ``{"session_id": str, "candidate": str | null,
+        "sdpMid": str | null, "sdpMLineIndex": int | null}``.
+        ``candidate=null`` (or omitted) means the peer has finished
+        gathering and we forward that as ``addIceCandidate(None)``.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            return web.json_response({"error": f"invalid json: {exc}"}, status=400)
+
+        session_id = body.get("session_id")
+        if not session_id or session_id not in self._candidate_sessions:
+            return web.json_response({"error": "unknown session_id"}, status=404)
+
+        session = self._candidate_sessions[session_id]
+        try:
+            await session.add_remote_candidate(
+                body.get("candidate"),
+                body.get("sdpMid"),
+                body.get("sdpMLineIndex"),
+            )
+        except Exception as exc:
+            logger.warning(f"addIceCandidate failed: {exc}")
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def handle_rtc_candidates_stream(self, request):
+        """Stream local ICE candidates to the peer over SSE.
+
+        Polls aiortc's gatherer at ~100 ms cadence and emits each new
+        candidate as a server-sent event. Closes when gathering reports
+        ``complete`` or the session goes away. Single-shot per session;
+        the client opens this once after receiving the answer.
+        """
+        session_id = request.query.get("session_id", "")
+        session = self._candidate_sessions.get(session_id)
+        if session is None:
+            return web.json_response({"error": "unknown session_id"}, status=404)
+
+        resp = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                # Disable nginx-style proxy buffering so the
+                # Cloudflare/RunPod edge actually streams.
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await resp.prepare(request)
+        try:
+            async for cand in session.iter_local_candidates():
+                payload = json.dumps(cand)
+                await resp.write(f"data: {payload}\n\n".encode("utf-8"))
+            # Final sentinel so the client can close the EventSource
+            # cleanly without waiting for a connection error.
+            await resp.write(b"event: done\ndata: {}\n\n")
+        except (asyncio.CancelledError, ConnectionResetError):
+            raise
+        except Exception as exc:
+            logger.warning(f"candidate stream error: {exc}")
+        return resp
+
     async def _try_acquire_session_lock(self, timeout: float) -> bool:
         """Acquire ``self.lock`` with a timeout, safe against the known
         ``asyncio.wait_for(lock.acquire())`` race.
@@ -456,7 +528,7 @@ class ServerState:
                 answer = await session.negotiate(offer)
                 clog.log(
                     "info",
-                    f"timing: negotiate (incl. server ICE gather) {(time.monotonic() - t_neg) * 1000:.0f} ms",
+                    f"timing: negotiate (no ICE wait) {(time.monotonic() - t_neg) * 1000:.0f} ms",
                 )
             except Exception as exc:
                 clog.log("error", f"negotiate failed: {type(exc).__name__}: {exc}")
@@ -467,16 +539,30 @@ class ServerState:
                     {"error": f"negotiate failed: {exc}"}, status=500
                 )
 
+            session_id = secrets.token_urlsafe(16)
+            self._candidate_sessions[session_id] = session
+
             # Spawn the long-running session runner. It owns the lock from
             # this point on. Strong-ref the task so the event loop's weak
-            # set cannot garbage-collect it.
+            # set cannot garbage-collect it. The runner is also the one
+            # that removes session_id from _candidate_sessions on close,
+            # so the trickle endpoints stay live for the full negotiation
+            # window and a tick beyond.
             task = asyncio.create_task(
-                self._run_rtc_session(session, config_event, config_holder, clog)
+                self._run_rtc_session(
+                    session, config_event, config_holder, clog, session_id
+                )
             )
             self._session_tasks.add(task)
             task.add_done_callback(self._session_tasks.discard)
             owns_lock = False  # ownership transferred to the runner
-            return web.json_response({"sdp": answer.sdp, "type": answer.type})
+            return web.json_response(
+                {
+                    "sdp": answer.sdp,
+                    "type": answer.type,
+                    "session_id": session_id,
+                }
+            )
         except BaseException:
             # Anything from a torn transport (peer_port lookup) to
             # RTCPeerConnection construction failures, including
@@ -499,6 +585,7 @@ class ServerState:
         config_event: asyncio.Event,
         config_holder: dict,
         clog: ColorizedLog,
+        session_id: Optional[str] = None,
     ) -> None:
         try:
             try:
@@ -582,6 +669,8 @@ class ServerState:
             except Exception:
                 pass
         finally:
+            if session_id is not None:
+                self._candidate_sessions.pop(session_id, None)
             try:
                 await session.close()
             finally:
@@ -821,6 +910,8 @@ def main():
 
     app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
     app.router.add_post("/api/rtc/offer", state.handle_rtc_offer)
+    app.router.add_post("/api/rtc/candidate", state.handle_rtc_candidate)
+    app.router.add_get("/api/rtc/candidates", state.handle_rtc_candidates_stream)
     app.router.add_get("/api/rtc/ice-servers", state.handle_ice_servers)
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     if static_path is not None:
@@ -1327,9 +1418,34 @@ def main():
         let isReady = false;        // server has signalled 'ready'
         let connectT0 = 0;          // performance.now() at Connect click
         let connectTimings = null;  // per-phase elapsed ms, logged at 'ready'
+        let sessionId = null;       // server-issued session id for trickle ICE
+        let candidateStream = null; // EventSource for server-trickled candidates
+        let pendingCandidates = []; // local candidates gathered before sessionId arrived
         function markConnect(name) {
             if (!connectTimings) return;
             connectTimings[name] = Math.round(performance.now() - connectT0);
+        }
+        async function postCandidate(cand) {
+            if (!sessionId) return;
+            try {
+                await fetch('/api/rtc/candidate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        candidate: cand ? cand.candidate : null,
+                        sdpMid: cand ? cand.sdpMid : null,
+                        sdpMLineIndex: cand ? cand.sdpMLineIndex : null,
+                    }),
+                });
+            } catch (err) {
+                console.warn('candidate POST failed:', err);
+            }
+        }
+        async function flushPendingCandidates() {
+            const buf = pendingCandidates;
+            pendingCandidates = [];
+            for (const c of buf) await postCandidate(c);
         }
 
         // AudioContext is used only to host AnalyserNodes for the visualizer
@@ -1825,19 +1941,6 @@ def main():
             };
         }
 
-        function waitForIceComplete(p) {
-            if (p.iceGatheringState === 'complete') return Promise.resolve();
-            return new Promise((resolve) => {
-                const check = () => {
-                    if (p.iceGatheringState === 'complete') {
-                        p.removeEventListener('icegatheringstatechange', check);
-                        resolve();
-                    }
-                };
-                p.addEventListener('icegatheringstatechange', check);
-            });
-        }
-
         function claimMediaSession() {
             // Hint the browser to treat this like an active media session.
             // Helps reduce background-tab throttling on the audio element.
@@ -1903,6 +2006,12 @@ def main():
                 // server signals 'ready'.
                 connectT0 = performance.now();
                 connectTimings = {};
+                sessionId = null;
+                pendingCandidates = [];
+                if (candidateStream) {
+                    try { candidateStream.close(); } catch (e) {}
+                    candidateStream = null;
+                }
 
                 // Mic permission + capture. With browser defaults (AEC, NS,
                 // AGC governed by the toggles) this is the only audio
@@ -1976,6 +2085,15 @@ def main():
                     handleControlMessage(msg);
                 };
 
+                // Trickle ICE: ship each local candidate to the server as it
+                // is gathered, instead of waiting for full gathering before
+                // signaling. Candidates that arrive before sessionId is set
+                // are buffered and flushed once the offer response lands.
+                pc.onicecandidate = (e) => {
+                    if (sessionId) postCandidate(e.candidate);
+                    else pendingCandidates.push(e.candidate);
+                };
+
                 // Add the mic track. Pass the stream so the remote side sees
                 // it as part of one MediaStream group (cleaner ontrack
                 // semantics on the server, though aiortc tolerates either).
@@ -1986,8 +2104,6 @@ def main():
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
                 markConnect('setLocalDescription');
-                await waitForIceComplete(pc);
-                markConnect('iceGatherComplete');
 
                 const res = await fetch('/api/rtc/offer', {
                     method: 'POST',
@@ -2007,8 +2123,45 @@ def main():
                 }
                 const answer = await res.json();
                 markConnect('serverAnswer');
-                await pc.setRemoteDescription(answer);
+                sessionId = answer.session_id || null;
+                await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
                 markConnect('setRemoteDescription');
+
+                // Open the server->client candidate stream and flush any
+                // local candidates that the browser already gathered while
+                // we were waiting for the answer.
+                if (sessionId) {
+                    candidateStream = new EventSource(
+                        '/api/rtc/candidates?session_id=' + encodeURIComponent(sessionId)
+                    );
+                    candidateStream.onmessage = (e) => {
+                        try {
+                            const cand = JSON.parse(e.data);
+                            pc.addIceCandidate(cand).catch((err) => {
+                                console.warn('addIceCandidate failed:', err);
+                            });
+                        } catch (err) {
+                            console.warn('bad candidate JSON:', err);
+                        }
+                    };
+                    candidateStream.addEventListener('done', () => {
+                        if (candidateStream) {
+                            candidateStream.close();
+                            candidateStream = null;
+                        }
+                    });
+                    candidateStream.onerror = () => {
+                        // Browser closes EventSource on server hangup; that
+                        // is the normal path after gathering completes. The
+                        // 'done' event handler nulls candidateStream first,
+                        // so this onerror only fires for real network errors.
+                        if (candidateStream) {
+                            candidateStream.close();
+                            candidateStream = null;
+                        }
+                    };
+                    flushPendingCandidates();
+                }
 
                 // Init the AudioContext now (after the user-gesture-driven
                 // Connect click) so the analyser graph is ready when the
@@ -2052,6 +2205,12 @@ def main():
         function cleanup() {
             stopSessionRecording(null);
             isReady = false;
+            if (candidateStream) {
+                try { candidateStream.close(); } catch (e) {}
+                candidateStream = null;
+            }
+            sessionId = null;
+            pendingCandidates = [];
             if (controlChannel) {
                 try { controlChannel.close(); } catch (e) {}
                 controlChannel = null;
@@ -2059,6 +2218,7 @@ def main():
             if (pc) {
                 try { pc.ontrack = null; } catch (e) {}
                 try { pc.onconnectionstatechange = null; } catch (e) {}
+                try { pc.onicecandidate = null; } catch (e) {}
                 try { pc.close(); } catch (e) {}
                 pc = null;
             }

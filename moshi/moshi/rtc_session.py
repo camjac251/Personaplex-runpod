@@ -18,7 +18,7 @@ import asyncio
 import fractions
 import json
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import numpy as np
 from aiortc import (
@@ -30,6 +30,7 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.mediastreams import MediaStreamError
+from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from av.audio.frame import AudioFrame
 from av.audio.resampler import AudioResampler
 
@@ -286,20 +287,102 @@ class RTCSession:
         self._on_config = handler
 
     async def negotiate(self, offer: RTCSessionDescription) -> RTCSessionDescription:
-        """Set remote offer, build answer, wait for ICE, return answer.
+        """Set remote offer, build answer, return immediately.
 
-        Does NOT start the GPU-touching process loop. Inbound audio frames
-        will be received and queued (with the same 200 ms drop-newest cap
-        as the old WS path), but no model inference runs until
-        `start_processing()` is called. This lets the caller apply config
-        and run system prompts under its own lock before the lm_gen state
-        starts mutating from real audio.
+        Does NOT wait for ICE gathering, so the returned SDP only carries
+        candidates that aiortc had ready synchronously (typically host
+        candidates). The caller is expected to stream remaining server
+        candidates to the peer via ``iter_local_candidates`` and pump
+        peer candidates back via ``add_remote_candidate``.
+
+        Does NOT start the GPU-touching process loop. Inbound audio
+        frames will be received and queued (with the same 200 ms
+        drop-newest cap as the old WS path), but no model inference
+        runs until ``start_processing()`` is called.
         """
         await self._pc.setRemoteDescription(offer)
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
-        await self._wait_ice_complete()
         return self._pc.localDescription
+
+    async def add_remote_candidate(
+        self,
+        candidate_sdp: Optional[str],
+        sdp_mid: Optional[str],
+        sdp_mline_index: Optional[int],
+    ) -> None:
+        """Apply a peer-trickled ICE candidate.
+
+        ``candidate_sdp`` is the value of ``RTCIceCandidate.candidate``
+        from the browser, e.g. ``"candidate:842163049 1 udp ..."``.
+        ``None`` (or an empty string) signals end-of-candidates, which
+        we propagate to aiortc as ``addIceCandidate(None)``.
+        """
+        if not candidate_sdp:
+            await self._pc.addIceCandidate(None)
+            return
+        # Browser sends the full string with a leading "candidate:" token
+        # that aiortc's parser does not want.
+        body = candidate_sdp[len("candidate:"):] if candidate_sdp.startswith("candidate:") else candidate_sdp
+        candidate = candidate_from_sdp(body)
+        candidate.sdpMid = sdp_mid
+        candidate.sdpMLineIndex = sdp_mline_index
+        await self._pc.addIceCandidate(candidate)
+
+    async def iter_local_candidates(
+        self, poll_interval: float = 0.1
+    ) -> "AsyncIterator[dict]":
+        """Yield local ICE candidates as gathering produces them.
+
+        aiortc does not emit per-candidate events, so we poll
+        ``getLocalCandidates()`` at ``poll_interval`` (default 100 ms)
+        and yield any newly-seen candidate. The generator terminates
+        when ``iceGatheringState`` reaches ``"complete"`` or the
+        session closes; the caller is responsible for forwarding the
+        events on a side channel (SSE, WebSocket, etc.).
+
+        Each yielded item is a dict shaped like the browser's
+        ``RTCIceCandidate.toJSON()`` so the client can pass it straight
+        into ``new RTCIceCandidate({...})``.
+        """
+        # aiortc does not expose iceGatherers on a public attribute. The
+        # name-mangled list is the documented internal layout for aiortc
+        # 1.10. With BUNDLE the list collapses to a single transport, so
+        # element 0 owns every candidate we will gather.
+        ice_transports = getattr(
+            self._pc, "_RTCPeerConnection__iceTransports", None
+        )
+        if not ice_transports:
+            return
+        gatherer = ice_transports[0].iceGatherer
+        seen: set[tuple] = set()
+        # Best-effort: if there is exactly one m-line (one audio track
+        # plus a data channel multiplexed on it), sdpMLineIndex 0 covers
+        # all candidates. aiortc's bundle policy collapses to a single
+        # m-line per session in our setup.
+        sdp_mid = "0"
+        sdp_mline_index = 0
+        while not self._closed.is_set():
+            for cand in gatherer.getLocalCandidates():
+                key = (
+                    cand.foundation,
+                    cand.component,
+                    cand.protocol,
+                    cand.ip,
+                    cand.port,
+                    cand.type,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield {
+                    "candidate": "candidate:" + candidate_to_sdp(cand),
+                    "sdpMid": sdp_mid,
+                    "sdpMLineIndex": sdp_mline_index,
+                }
+            if self._pc.iceGatheringState == "complete":
+                return
+            await asyncio.sleep(poll_interval)
 
     def start_processing(self) -> None:
         """Start the GPU-side process loop. Call once, after system prompts.
@@ -371,31 +454,6 @@ class RTCSession:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-
-    async def _wait_ice_complete(self, timeout: float = 10.0) -> None:
-        """Wait for ICE gathering to complete, with a hard upper bound.
-
-        Without a timeout, an unreachable STUN server or a misbehaving NIC
-        stuck in 'gathering' wedges the request handler indefinitely while
-        ``self.lock`` is held, returning HTTP 409 to every subsequent
-        connection. 10 s is plenty for trickle ICE on the LAN; a stalled
-        gather past that point should fail loudly.
-        """
-        if self._pc.iceGatheringState == "complete":
-            return
-        fut: asyncio.Future[None] = asyncio.get_event_loop().create_future()
-
-        @self._pc.on("icegatheringstatechange")
-        def _on_change() -> None:
-            if self._pc.iceGatheringState == "complete" and not fut.done():
-                fut.set_result(None)
-
-        try:
-            await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"ICE gathering did not complete within {timeout:.0f}s"
-            ) from exc
 
     def _wire_control_channel(self, channel: RTCDataChannel) -> None:
         @channel.on("open")
