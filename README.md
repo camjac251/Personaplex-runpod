@@ -2,8 +2,6 @@
 
 [![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
 [![Paper](https://img.shields.io/badge/📄-Paper-blue)](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
-[![Demo](https://img.shields.io/badge/🎮-Demo-green)](https://research.nvidia.com/labs/adlr/personaplex/)
-[![Discord](https://img.shields.io/badge/Discord-Join-purple?logo=discord)](https://discord.gg/5jAXrrbwRb)
 
 PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
 
@@ -16,8 +14,7 @@ PersonaPlex is a real-time, full-duplex speech-to-speech model with persona cont
 ## Credits
 
 - **Model and research**: NVIDIA PersonaPlex team. All credit for the core AI belongs to the original authors. See [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex).
-- **Windows installer this fork was branched from**: [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
-- **RunPod packaging + WebRTC transport**: [@camjac251](https://github.com/camjac251).
+- **RunPod packaging + WebRTC client**: [@camjac251](https://github.com/camjac251), branched from a Windows-installer fork by [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
 
 ## Deploy on RunPod
 
@@ -95,13 +92,7 @@ You can also upload 10-30 s of clean audio for any speaker via the **Clone a voi
 
 ## Hardware
 
-| Component | Tested |
-|---|---|
-| GPU | RTX 4090 |
-| VRAM | 24 GB |
-| Driver | RunPod default |
-
-Other modern NVIDIA cards with 12 GB+ VRAM work. Smaller cards can run with CPU offload at the cost of latency.
+Tested on RTX 4090 (24 GB) with the default RunPod driver. Any modern NVIDIA card with 12 GB+ VRAM should work. Smaller cards can run with CPU offload at the cost of latency.
 
 ## Architecture notes
 
@@ -123,7 +114,7 @@ These come from the upstream model, not the RunPod packaging:
 - **Response looping**: under certain prompts the model can repeat itself. The repetition penalty / context window sliders in the Advanced panel usually break the loop.
 - **Pipeline efficiency**: GPU utilisation is occasionally spiky; some kernels are not yet optimised.
 
-For core model issues, file at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues).
+Core model issues belong upstream at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues). Bugs in the RunPod packaging or WebRTC client belong here.
 
 ## Local dev
 
