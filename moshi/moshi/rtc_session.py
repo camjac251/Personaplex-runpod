@@ -315,11 +315,11 @@ class RTCSession:
 
         ``candidate_sdp`` is the value of ``RTCIceCandidate.candidate``
         from the browser, e.g. ``"candidate:842163049 1 udp ..."``.
-        ``None`` (or an empty string) signals end-of-candidates, which
-        we propagate to aiortc as ``addIceCandidate(None)``.
+        ``None`` (or an empty string) is the end-of-candidates marker
+        from the browser; aiortc 1.10 manages gathering-complete on its
+        own and rejects ``addIceCandidate(None)``, so we just no-op.
         """
         if not candidate_sdp:
-            await self._pc.addIceCandidate(None)
             return
         # Browser sends the full string with a leading "candidate:" token
         # that aiortc's parser does not want.
@@ -345,16 +345,16 @@ class RTCSession:
         ``RTCIceCandidate.toJSON()`` so the client can pass it straight
         into ``new RTCIceCandidate({...})``.
         """
-        # aiortc does not expose iceGatherers on a public attribute. The
-        # name-mangled list is the documented internal layout for aiortc
-        # 1.10. With BUNDLE the list collapses to a single transport, so
-        # element 0 owns every candidate we will gather.
+        # aiortc 1.10 stores iceTransports as a Set on a name-mangled
+        # private attribute. With BUNDLE, the set collapses to a single
+        # transport, so any element owns every candidate we will gather.
         ice_transports = getattr(
             self._pc, "_RTCPeerConnection__iceTransports", None
         )
-        if not ice_transports:
+        transport = next(iter(ice_transports), None) if ice_transports else None
+        if transport is None:
             return
-        gatherer = ice_transports[0].iceGatherer
+        gatherer = transport.iceGatherer
         seen: set[tuple] = set()
         # Best-effort: if there is exactly one m-line (one audio track
         # plus a data channel multiplexed on it), sdpMLineIndex 0 covers
