@@ -156,7 +156,7 @@ def main():
     print("2. Check that GPU utilization is consistent (not spiking)")
     print("3. Ensure no other GPU-intensive apps are running")
     print("4. If using CPU offload, choppy audio is expected")
-    print("5. Try closing browser tabs to reduce WebSocket latency")
+    print("5. Try closing browser tabs to reduce contention with the WebRTC audio path")
     print("6. Ensure your GPU has at least 8GB VRAM for smooth operation")
 
 if __name__ == "__main__":

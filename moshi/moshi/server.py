@@ -35,7 +35,6 @@ import secrets
 import sys
 from typing import Literal, Optional
 
-import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
 import numpy as np
@@ -43,8 +42,11 @@ import sentencepiece
 import sphn
 import torch
 
+from aiortc import RTCSessionDescription
+
 from .models import loaders, MimiModel, LMModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
+from .rtc_session import RTCSession, SessionConfig
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -230,246 +232,192 @@ class ServerState:
             results.append((pcm_np, text))
         return results
 
-    async def handle_chat(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        clog = ColorizedLog.randomize()
-        peer = request.remote  # IP
-        peer_port = request.transport.get_extra_info("peername")[1]  # Port
-        clog.log("info", f"Incoming connection from {peer}:{peer_port}")
+    def _resolve_voice_prompt_path(self, voice_prompt_filename: str) -> tuple[Optional[str], Optional[str]]:
+        """Resolve the on-disk path for a voice prompt name.
 
-        def _qfloat(name, default):
-            raw = request.query.get(name)
-            if raw is None:
-                return default
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                clog.log("warning", f"bad float for {name}={raw!r}, using default {default}")
-                return default
-
-        def _qint(name, default):
-            raw = request.query.get(name)
-            if raw is None:
-                return default
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                clog.log("warning", f"bad int for {name}={raw!r}, using default {default}")
-                return default
-
-        # Parse sampling params here, but apply them inside the session lock below
-        # to avoid races between concurrent connections mutating shared lm_gen state.
-        sampling_params = {
-            "temp": _qfloat("audio_temperature", 0.7),
-            "temp_text": _qfloat("text_temperature", 0.7),
-            "top_k_text": max(1, _qint("text_topk", 25)),
-            "top_k": max(1, _qint("audio_topk", 250)),
-            "repetition_penalty": max(1.0, _qfloat("repetition_penalty", 1.2)),
-            "repetition_penalty_context": max(
-                0, min(_qint("repetition_penalty_context", 64), MAX_REPETITION_CONTEXT)
-            ),
-            "padding_bonus": max(0.0, _qfloat("padding_bonus", 0.0)),
-            "max_turn_text_tokens": max(0, _qint("max_turn_text_tokens", 0)),
-        }
-        
-        # Construct full voice prompt path. Two sources:
-        #   - "upload:<name>" -> uploads_dir/<name> (user-provided wav/mp3/etc.)
-        #   - "<name>"        -> voice_prompt_dir/<name> (preset .pt or audio)
-        requested_voice_prompt_path = None
-        voice_prompt_path = None
-        voice_prompt_filename = request.query.get("voice_prompt", "") or ""
+        Returns (resolved_path, requested_path). resolved_path is None
+        when no prompt was requested. Raises FileNotFoundError when a
+        named prompt is missing or escapes the uploads dir.
+        """
+        if not voice_prompt_filename:
+            return None, None
         if voice_prompt_filename.startswith(UPLOAD_PREFIX):
             upload_name = voice_prompt_filename[len(UPLOAD_PREFIX):]
-            requested_voice_prompt_path = self._resolve_upload_path(upload_name)
-            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
+            requested = self._resolve_upload_path(upload_name)
+            if requested is None or not os.path.exists(requested):
                 raise FileNotFoundError(
                     f"Uploaded voice prompt '{upload_name}' not found"
                 )
-            voice_prompt_path = requested_voice_prompt_path
-        elif self.voice_prompt_dir is not None and voice_prompt_filename:
-            requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            if not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+            return requested, requested
+        if self.voice_prompt_dir is None:
+            return None, None
+        requested = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+        if not os.path.exists(requested):
+            raise FileNotFoundError(
+                f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+            )
+        return requested, requested
+
+    async def handle_rtc_offer(self, request):
+        """WebRTC signaling: accept SDP offer, return SDP answer.
+
+        Lifecycle:
+          1. Try to acquire ``self.lock`` with a short timeout. Return 409
+             ``session_busy`` if a session is already live.
+          2. Negotiate the peer connection (no GPU work yet) and return
+             the answer. The browser opens its 'control' DataChannel.
+          3. A background task waits for a ``config`` DataChannel
+             message, applies it, runs system prompts under the lock,
+             sends ``ready``, then starts the GPU process loop and
+             holds the lock until the peer connection closes.
+        """
+        try:
+            body = await request.json()
+            offer = RTCSessionDescription(sdp=body["sdp"], type=body["type"])
+        except (ValueError, KeyError) as exc:
+            return web.json_response({"error": f"invalid offer: {exc}"}, status=400)
+
+        try:
+            await asyncio.wait_for(self.lock.acquire(), timeout=0.25)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "session_busy"}, status=409)
+
+        clog = ColorizedLog.randomize()
+        peer = request.remote
+        peer_port = (
+            request.transport.get_extra_info("peername")[1]
+            if request.transport is not None else "?"
+        )
+        clog.log("info", f"Incoming RTC offer from {peer}:{peer_port}")
+
+        config_event: asyncio.Event = asyncio.Event()
+        config_holder: dict = {"cfg": None}
+
+        async def on_config(cfg: SessionConfig) -> None:
+            if config_event.is_set():
+                clog.log("warning", "ignoring duplicate config message")
+                return
+            config_holder["cfg"] = cfg
+            config_event.set()
+
+        async def on_reset() -> None:
+            # Soft reset: clear streaming state without re-running
+            # system prompts. Same idea as starting a new turn.
+            self.mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+
+        session = RTCSession(
+            frame_size=self.frame_size,
+            process_fn=self._process_audio_frame,
+            log=clog.log,
+        )
+        session.set_config_handler(on_config)
+        session.set_reset_handler(on_reset)
+
+        try:
+            answer = await session.negotiate(offer)
+        except Exception as exc:
+            clog.log("error", f"negotiate failed: {type(exc).__name__}: {exc}")
+            await session.close()
+            self.lock.release()
+            return web.json_response(
+                {"error": f"negotiate failed: {exc}"}, status=500
+            )
+
+        # Spawn the long-running session runner. It owns the lock until
+        # the peer connection closes; we never await it from here.
+        asyncio.create_task(
+            self._run_rtc_session(session, config_event, config_holder, clog)
+        )
+
+        return web.json_response({"sdp": answer.sdp, "type": answer.type})
+
+    async def _run_rtc_session(
+        self,
+        session: "RTCSession",
+        config_event: asyncio.Event,
+        config_holder: dict,
+        clog: ColorizedLog,
+    ) -> None:
+        try:
+            try:
+                await asyncio.wait_for(config_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                clog.log("error", "no config received within 30 s, closing")
+                session.send_error("config_timeout")
+                return
+
+            cfg: SessionConfig = config_holder["cfg"]
+            clog.log("info", f"config: voice_prompt={cfg.voice_prompt!r}")
+
+            try:
+                voice_prompt_path, requested = self._resolve_voice_prompt_path(
+                    cfg.voice_prompt
                 )
-            voice_prompt_path = requested_voice_prompt_path
+            except FileNotFoundError as exc:
+                clog.log("error", str(exc))
+                session.send_error(f"voice_prompt_not_found: {exc}")
+                return
 
-        if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
-            if voice_prompt_path.endswith('.pt'):
-                # Load pre-saved voice prompt embeddings
-                self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-            else:
-                self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = _qint("seed", -1) if "seed" in request.query else None
+            if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
+                if voice_prompt_path.endswith(".pt"):
+                    self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                else:
+                    self.lm_gen.load_voice_prompt(voice_prompt_path)
+                clog.log("info", f"loaded voice prompt: {voice_prompt_path} (requested: {requested})")
 
-        async def recv_loop():
-            nonlocal close
-            try:
-                async for message in ws:
-                    if message.type == aiohttp.WSMsgType.ERROR:
-                        clog.log("error", f"{ws.exception()}")
-                        break
-                    elif message.type == aiohttp.WSMsgType.CLOSED:
-                        break
-                    elif message.type == aiohttp.WSMsgType.CLOSE:
-                        break
-                    elif message.type != aiohttp.WSMsgType.BINARY:
-                        clog.log("error", f"unexpected message type {message.type}")
-                        continue
-                    message = message.data
-                    if not isinstance(message, bytes):
-                        clog.log("error", f"unsupported message type {type(message)}")
-                        continue
-                    if len(message) == 0:
-                        clog.log("warning", "empty message")
-                        continue
-                    kind = message[0]
-                    if kind == 1:  # audio, raw float32 PCM at mimi.sample_rate
-                        payload = message[1:]
-                        if len(payload) == 0 or len(payload) % 4 != 0:
-                            clog.log("warning", f"bad audio payload length {len(payload)}")
-                            continue
-                        try:
-                            pcm = np.frombuffer(payload, dtype=np.float32)
-                        except Exception as e:
-                            clog.log("warning", f"pcm decode failed: {type(e).__name__}: {e}")
-                            continue
-                        try:
-                            pcm_queue.put_nowait(pcm)
-                        except asyncio.QueueFull:
-                            # GPU is falling behind. Drop the newest chunk so
-                            # the existing timeline survives rather than
-                            # sliding forward with stale audio.
-                            clog.log("warning", f"pcm queue full ({pcm_queue.qsize()}), dropping chunk")
-                    else:
-                        clog.log("warning", f"unknown message kind {kind}")
-            except Exception as e:
-                clog.log("error", f"recv_loop: {type(e).__name__}: {e}")
-            finally:
-                close = True
-                clog.log("info", "connection closed")
+            self.lm_gen.text_prompt_tokens = (
+                self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
+                if cfg.text_prompt else None
+            )
+            if cfg.seed is not None and cfg.seed != -1:
+                seed_all(cfg.seed)
 
-        async def process_loop():
-            loop = asyncio.get_event_loop()
-            all_pcm_data = None
-
-            try:
-                while not close:
-                    try:
-                        pcm = await asyncio.wait_for(pcm_queue.get(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        continue
-                    if pcm.shape[-1] == 0:
-                        continue
-                    if all_pcm_data is None:
-                        all_pcm_data = pcm
-                    else:
-                        all_pcm_data = np.concatenate((all_pcm_data, pcm))
-                    while all_pcm_data.shape[-1] >= self.frame_size:
-                        chunk = all_pcm_data[: self.frame_size]
-                        all_pcm_data = all_pcm_data[self.frame_size:]
-
-                        # Offload GPU inference to a thread so the event loop
-                        # stays responsive for recv_loop. Wrap with shield so
-                        # that if process_loop gets cancelled (e.g. the session
-                        # is torn down on disconnect) the GPU thread finishes
-                        # its current frame before cancellation propagates.
-                        # Otherwise the outer code releases self.lock while
-                        # this thread is still mutating mimi / lm_gen state,
-                        # and the next session's reset_streaming() races with
-                        # in-flight CUDA work.
-                        in_flight = asyncio.ensure_future(
-                            loop.run_in_executor(
-                                None, self._process_audio_frame, chunk
-                            )
-                        )
-                        try:
-                            results = await asyncio.shield(in_flight)
-                        except asyncio.CancelledError:
-                            try:
-                                await in_flight
-                            except BaseException:
-                                pass
-                            raise
-
-                        for pcm_data, text in results:
-                            # Send raw PCM float32 directly.
-                            await ws.send_bytes(b"\x01" + pcm_data.astype(np.float32).tobytes())
-                            if text is not None:
-                                msg = b"\x02" + bytes(text, encoding="utf8")
-                                await ws.send_bytes(msg)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                clog.log("error", f"process_loop: {type(e).__name__}: {e}")
-
-        clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
-        if len(request.query["voice_prompt"]) > 0:
-            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
-        close = False
-        async with self.lock:
-            if seed is not None and seed != -1:
-                seed_all(seed)
-
-            # Apply per-connection sampling params under the lock so concurrent
-            # connections cannot interleave their settings on the shared lm_gen.
-            for k, v in sampling_params.items():
-                setattr(self.lm_gen, k, v)
-            # Reset the max-turn cap's internal counters so a prior session's
-            # state doesn't carry into this one.
+            self.lm_gen.temp = cfg.audio_temperature
+            self.lm_gen.temp_text = cfg.text_temperature
+            self.lm_gen.top_k_text = max(1, cfg.text_topk)
+            self.lm_gen.top_k = max(1, cfg.audio_topk)
+            self.lm_gen.repetition_penalty = max(1.0, cfg.repetition_penalty)
+            self.lm_gen.repetition_penalty_context = max(
+                0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)
+            )
+            self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
+            self.lm_gen.max_turn_text_tokens = max(0, cfg.max_turn_text_tokens)
             self.lm_gen._non_pad_streak = 0
             self.lm_gen._pad_force_remaining = 0
 
-            # ~200 ms ceiling on backlog at 20 ms client-side chunks. Overflow
-            # drops newest in recv_loop so GPU stalls don't balloon memory or
-            # desync the timeline by serving stale audio.
-            pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+
             async def is_alive():
-                if close or ws.closed:
-                    return False
-                try:
-                    # Check for disconnect without waiting too long
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
-                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        return False
-                except asyncio.TimeoutError:
-                    # No messages → client probably still alive
-                    return True
-                except aiohttp.ClientConnectionError:
-                    return False
-                return True
-            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+                return session.is_alive()
+
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
-            clog.log("info", "done with system prompts")
-            # Send the handshake.
-            if await is_alive():
-                await ws.send_bytes(b"\x00")
-                clog.log("info", "sent handshake bytes")
-                # Clean cancellation manager
-                tasks = [
-                    asyncio.create_task(recv_loop()),
-                    asyncio.create_task(process_loop()),
-                ]
+            clog.log("info", "system prompts done")
 
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Force-kill remaining tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                await ws.close()
-                clog.log("info", "session closed")
-        clog.log("info", "done with connection")
-        return ws
+            if not session.is_alive():
+                clog.log("info", "client disconnected during warmup")
+                return
+
+            session.send_ready()
+            session.start_processing()
+            await session.wait_for_close()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            clog.log("error", f"_run_rtc_session: {type(exc).__name__}: {exc}")
+            try:
+                session.send_error(f"server_error: {exc}")
+            except Exception:
+                pass
+        finally:
+            try:
+                await session.close()
+            finally:
+                self.lock.release()
+                clog.log("info", "session closed, lock released")
 
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
@@ -715,7 +663,7 @@ def main():
     logger.info("warming up the model")
     state.warmup()
     app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
-    app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_post("/api/rtc/offer", state.handle_rtc_offer)
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     if static_path is not None:
         async def handle_root(_):
@@ -1173,6 +1121,7 @@ def main():
                 </div>
                 <a class="btn btn-primary" id="downloadLink" download="personaplex_conversation.webm">Download Audio</a>
             </div>
+            <audio id="aiAudio" autoplay playsinline style="display:none;"></audio>
             </div>
         </div>
     </div>
@@ -1192,31 +1141,35 @@ def main():
             bank: "You work for First Neuron Bank which is a bank and your name is Alexis Kim. Information: The customer's transaction for $1,200 at Home Depot was declined. Verify customer identity. The transaction was flagged due to unusual location (transaction attempted in Miami, FL; customer normally transacts in Seattle, WA).",
             astronaut: "You enjoy having a good conversation. Have a technical discussion about fixing a reactor core on a spaceship to Mars. You are an astronaut on a Mars mission. Your name is Alex. You are already dealing with a reactor core meltdown on a Mars mission. Several ship systems are failing, and continued instability will lead to catastrophic failure. You explain what is happening and you urgently ask for help thinking through how to stabilize the reactor."
         };
-        
-        let socket = null;
-        let micCaptureNode = null;
-        let micWorkletStream = null;
-        let micWorkletSource = null;
+
+        const ICE_SERVERS = [
+            { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+        ];
+        const CONNECT_BTN_HTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
+
+        // Peer connection + track refs.
+        let pc = null;
+        let controlChannel = null;
+        let micStream = null;       // local MediaStream from getUserMedia
+        let aiStream = null;        // remote MediaStream from pc.ontrack
         let micVad = null;
         let userSpeaking = false;
-        // Ground-truth "model is playing audio right now" signal, posted by
-        // the pcm-player AudioWorklet on its empty<->non-empty edges. This
-        // replaces a 400 ms trailing timer that could lapse during GPU
-        // stalls or persist past the actual end of a response.
-        let modelPlaying = false;
-        const SILENT_CHUNK = new Float32Array(480);  // 20 ms of zeros at 24 kHz
+        let isReady = false;        // server has signalled 'ready'
+
+        // AudioContext is used only to host AnalyserNodes for the visualizer
+        // and to mux mic + AI streams into a single MediaRecorder destination
+        // for the optional session download. It does not touch the realtime
+        // audio path; WebRTC owns capture and playback.
         let audioContext = null;
+        let aiSourceNode = null;
+        let userSourceNode = null;
+        let aiAnalyser = null;
+        let userAnalyser = null;
         let recordingDestination = null;
         let mediaRecorder = null;
         let recordedChunks = [];
-        let micStream = null;
-        let micSource = null;
         let shouldShowDownload = false;
-        let playerNode = null;
-        let aiAnalyser = null;
-        let userAnalyser = null;
         let visualizerRAF = null;
-        const SAMPLE_RATE = 24000;
         
         // View elements
         const setupView = document.getElementById('setupView');
@@ -1307,8 +1260,8 @@ def main():
             // can honor the change without reconnecting the track; if not,
             // the new setting takes effect on the next getUserMedia (next
             // session).
-            if (!micWorkletStream) return;
-            const track = micWorkletStream.getAudioTracks()[0];
+            if (!micStream) return;
+            const track = micStream.getAudioTracks()[0];
             if (!track) return;
             track.applyConstraints(getMicConstraints()).catch((err) => {
                 console.warn('applyConstraints failed (takes effect next session):', err);
@@ -1513,162 +1466,71 @@ def main():
             setTimeout(() => { el.style.display = 'none'; }, 8000);
         }
         
-        async function initAudio() {
+        // ============================================================
+        // Audio context. Used only to host AnalyserNodes for the visualizers
+        // and to mux mic + AI streams into one MediaStream for MediaRecorder.
+        // The realtime audio path lives entirely on the WebRTC peer
+        // connection: getUserMedia -> pc.addTrack on the way out, and
+        // pc.ontrack -> <audio>.srcObject on the way back.
+        // ============================================================
+
+        const aiAudioElement = document.getElementById('aiAudio');
+
+        async function initAudioContext() {
             if (!audioContext) {
-                try {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-                } catch (err) {
-                    // Some Safari / Android / Bluetooth configs reject an
-                    // explicit 24 kHz context. Fall back to hardware rate;
-                    // the resample path to Mimi still works.
-                    console.warn('AudioContext at 24 kHz rejected, falling back to hardware rate:', err);
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 // Device switch (headphones unplugged, default output
-                // changes) pauses the context; without this, mic capture
-                // silently stops until the user clicks Stop. Auto-resume
-                // keeps the session alive across common system events.
+                // changes) suspends the context. Auto-resume keeps the
+                // visualizer + recording graph alive across system events.
                 audioContext.addEventListener('statechange', () => {
-                    console.log('AudioContext state:', audioContext.state);
                     if (audioContext.state === 'suspended' || audioContext.state === 'interrupted') {
-                        audioContext.resume().catch((err) => {
-                            console.warn('AudioContext auto-resume failed:', err);
-                        });
+                        audioContext.resume().catch(() => {});
                     }
                 });
             }
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
-            if (!playerNode) {
-                const code = `
-class P extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        this.chunks = [];
-        this.offset = 0;
-        this.playing = false;
-        this.port.onmessage = (e) => {
-            if (e.data === 'flush') {
-                this.chunks = []; this.offset = 0;
-                if (this.playing) { this.playing = false; this.port.postMessage('idle'); }
-                return;
-            }
-            this.chunks.push(e.data);
-        };
-    }
-    process(inputs, outputs) {
-        const out = outputs[0][0];
-        let w = 0;
-        while (w < out.length && this.chunks.length > 0) {
-            const c = this.chunks[0];
-            const n = Math.min(out.length - w, c.length - this.offset);
-            out.set(c.subarray(this.offset, this.offset + n), w);
-            w += n;
-            this.offset += n;
-            if (this.offset >= c.length) { this.chunks.shift(); this.offset = 0; }
         }
-        // Ground-truth "model is audibly playing" signal: notify main thread
-        // on the empty<->non-empty edge. Replaces a 400 ms timer heuristic
-        // with the actual state of the output buffer.
-        const nowPlaying = this.chunks.length > 0;
-        if (nowPlaying !== this.playing) {
-            this.playing = nowPlaying;
-            this.port.postMessage(nowPlaying ? 'playing' : 'idle');
-        }
-        return true;
-    }
-}
-registerProcessor('pcm-player', P);
 
-class MicCapture extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        // 20 ms at 24 kHz = 480 samples per outbound chunk.
-        this.buffer = new Float32Array(480);
-        this.idx = 0;
-    }
-    process(inputs) {
-        const input = inputs[0] && inputs[0][0];
-        if (!input) return true;
-        let i = 0;
-        while (i < input.length) {
-            const n = Math.min(input.length - i, this.buffer.length - this.idx);
-            this.buffer.set(input.subarray(i, i + n), this.idx);
-            i += n;
-            this.idx += n;
-            if (this.idx === this.buffer.length) {
-                // Copy so we can reuse the ring buffer without racing the consumer.
-                this.port.postMessage(this.buffer.slice());
-                this.idx = 0;
+        function attachAudioGraph() {
+            // Wires the AI remote stream and the local mic stream into
+            // analysers (for visualizers) and a MediaStream destination
+            // (for MediaRecorder). Idempotent.
+            if (!audioContext) return;
+            if (!recordingDestination) {
+                recordingDestination = audioContext.createMediaStreamDestination();
             }
-        }
-        return true;
-    }
-}
-registerProcessor('mic-capture', MicCapture);`;
-                const blob = new Blob([code], { type: 'application/javascript' });
-                await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
-                playerNode = new AudioWorkletNode(audioContext, 'pcm-player');
-                playerNode.port.onmessage = (e) => {
-                    if (e.data === 'playing') modelPlaying = true;
-                    else if (e.data === 'idle') modelPlaying = false;
-                };
+            if (aiStream && !aiSourceNode) {
+                aiSourceNode = audioContext.createMediaStreamSource(aiStream);
                 aiAnalyser = audioContext.createAnalyser();
                 aiAnalyser.fftSize = 256;
                 aiAnalyser.smoothingTimeConstant = 0.85;
-                playerNode.connect(aiAnalyser);
-                aiAnalyser.connect(audioContext.destination);
+                aiSourceNode.connect(aiAnalyser);
+                aiSourceNode.connect(recordingDestination);
+            }
+            if (micStream && !userSourceNode) {
+                userSourceNode = audioContext.createMediaStreamSource(micStream);
+                userAnalyser = audioContext.createAnalyser();
+                userAnalyser.fftSize = 256;
+                userAnalyser.smoothingTimeConstant = 0.85;
+                userSourceNode.connect(userAnalyser);
+                userSourceNode.connect(recordingDestination);
             }
         }
 
-        async function startSessionRecording() {
+        function startSessionRecording() {
+            shouldShowDownload = false;
+            recordedChunks = [];
+            downloadRow.style.display = 'none';
+            if (!recordingDestination) return;
             try {
-                shouldShowDownload = false;
-                recordedChunks = [];
-                downloadRow.style.display = 'none';
-                if (!audioContext) {
-                    return;
-                }
-                if (!recordingDestination) {
-                    recordingDestination = audioContext.createMediaStreamDestination();
-                }
-                if (playerNode) {
-                    playerNode.connect(recordingDestination);
-                }
-                try {
-                    // Reuse the mic stream acquired by startMicRecording if it's
-                    // up already; otherwise fall back to a fresh getUserMedia.
-                    // Two independent captures of the same mic diverge on AEC/NS
-                    // state and can produce different effective audio, so prefer
-                    // sharing one track across worklet + recording + analyser.
-                    if (micWorkletStream) {
-                        micStream = micWorkletStream;
-                    } else {
-                        micStream = await navigator.mediaDevices.getUserMedia({ audio: getMicConstraints() });
-                    }
-                    micSource = audioContext.createMediaStreamSource(micStream);
-                    micSource.connect(recordingDestination);
-                    userAnalyser = audioContext.createAnalyser();
-                    userAnalyser.fftSize = 256;
-                    userAnalyser.smoothingTimeConstant = 0.85;
-                    micSource.connect(userAnalyser);
-                } catch (err) {
-                    console.warn('Could not attach mic stream to recording:', err);
-                }
-                // Start the visualizer loop regardless of mic outcome so the AI side animates.
-                startVisualizers();
-
                 mediaRecorder = new MediaRecorder(recordingDestination.stream);
                 mediaRecorder.ondataavailable = (event) => {
-                    if (event.data && event.data.size > 0) {
-                        recordedChunks.push(event.data);
-                    }
+                    if (event.data && event.data.size > 0) recordedChunks.push(event.data);
                 };
                 mediaRecorder.onstop = () => {
-                    if (!shouldShowDownload || recordedChunks.length === 0) {
-                        return;
-                    }
+                    if (!shouldShowDownload || recordedChunks.length === 0) return;
                     const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
                     const url = URL.createObjectURL(blob);
                     downloadLink.href = url;
@@ -1681,32 +1543,15 @@ registerProcessor('mic-capture', MicCapture);`;
         }
 
         function stopSessionRecording(showDownload = null) {
-            if (showDownload !== null) {
-                shouldShowDownload = showDownload;
-            }
+            if (showDownload !== null) shouldShowDownload = showDownload;
             if (mediaRecorder && mediaRecorder.state !== 'inactive') {
                 try { mediaRecorder.stop(); } catch (err) {}
             }
-            if (micSource) {
-                try { micSource.disconnect(); } catch (err) {}
-                micSource = null;
-            }
-            // Do not stop micStream tracks here when it aliases micWorkletStream;
-            // cleanup() stops micWorkletStream explicitly. Dropping the shared
-            // track twice fires onended on a stream the worklet is still
-            // consuming, producing spurious warnings.
-            if (micStream && micStream !== micWorkletStream) {
-                micStream.getTracks().forEach(track => track.stop());
-            }
-            micStream = null;
-        }
-        
-        function playDecodedAudio(pcmData) {
-            if (!playerNode || !pcmData || pcmData.length === 0) return;
-            playerNode.port.postMessage(pcmData);
         }
 
-        // Canvas visualizers driven by AnalyserNode RMS. One RAF loop draws both circles.
+        // ============================================================
+        // Visualizer
+        // ============================================================
         const aiCanvas = document.getElementById('aiCanvas');
         const userCanvas = document.getElementById('userCanvas');
         const VIZ_AI_COLOR = '#00a8cc';
@@ -1727,7 +1572,7 @@ registerProcessor('mic-capture', MicCapture);`;
 
         function drawVisualizer(canvas, analyser, color, isLive) {
             const ctx = canvas.getContext('2d');
-            const dpr = fitCanvas(canvas);
+            fitCanvas(canvas);
             const w = canvas.width;
             const h = canvas.height;
             ctx.clearRect(0, 0, w, h);
@@ -1752,7 +1597,6 @@ registerProcessor('mic-capture', MicCapture);`;
             ctx.globalAlpha = 0.85;
             ctx.fill();
             ctx.globalAlpha = 1;
-            // Inner solid dot when audio is active.
             if (isLive) {
                 ctx.beginPath();
                 ctx.arc(cx, cy, maxR * 0.18, 0, Math.PI * 2);
@@ -1761,10 +1605,14 @@ registerProcessor('mic-capture', MicCapture);`;
             }
         }
 
+        function isRtcLive() {
+            return !!(pc && (pc.connectionState === 'connected' || pc.connectionState === 'connecting'));
+        }
+
         function startVisualizers() {
             stopVisualizers();
             const tick = () => {
-                const live = !!(socket && socket.readyState === WebSocket.OPEN);
+                const live = isRtcLive() && isReady;
                 drawVisualizer(aiCanvas, aiAnalyser, VIZ_AI_COLOR, live);
                 drawVisualizer(userCanvas, userAnalyser, VIZ_USER_COLOR, live);
                 visualizerRAF = requestAnimationFrame(tick);
@@ -1778,91 +1626,190 @@ registerProcessor('mic-capture', MicCapture);`;
                 visualizerRAF = null;
             }
         }
-        
-        
+
+        // ============================================================
+        // WebRTC connection
+        // ============================================================
+
+        function buildConfigPayload() {
+            const voiceParam = uploadedVoiceFilename || voicePromptSelect.value || '';
+            const useSeed = !seedRandomToggle.checked && seedInput.value !== '';
+            return {
+                voice_prompt: voiceParam,
+                text_prompt: textPromptInput.value || '',
+                audio_temperature: parseFloat(audioTempSlider.value),
+                text_temperature: parseFloat(textTempSlider.value),
+                text_topk: parseInt(textTopkSlider.value, 10),
+                audio_topk: parseInt(audioTopkSlider.value, 10),
+                repetition_penalty: parseFloat(repPenaltySlider.value),
+                repetition_penalty_context: parseInt(repContextSlider.value, 10),
+                padding_bonus: parseFloat(padBonusSlider.value),
+                max_turn_text_tokens: parseInt(maxTurnSlider.value, 10),
+                seed: useSeed ? parseInt(seedInput.value, 10) : -1,
+            };
+        }
+
+        function waitForIceComplete(p) {
+            if (p.iceGatheringState === 'complete') return Promise.resolve();
+            return new Promise((resolve) => {
+                const check = () => {
+                    if (p.iceGatheringState === 'complete') {
+                        p.removeEventListener('icegatheringstatechange', check);
+                        resolve();
+                    }
+                };
+                p.addEventListener('icegatheringstatechange', check);
+            });
+        }
+
+        function claimMediaSession() {
+            // Hint the browser to treat this like an active media session.
+            // Helps reduce background-tab throttling on the audio element.
+            if (!('mediaSession' in navigator)) return;
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: 'PersonaPlex Conversation',
+                    artist: 'PersonaPlex',
+                });
+                navigator.mediaSession.playbackState = 'playing';
+            } catch (err) {
+                // Some Firefox builds reject MediaMetadata; non-fatal.
+            }
+        }
+
+        function releaseMediaSession() {
+            if (!('mediaSession' in navigator)) return;
+            try { navigator.mediaSession.playbackState = 'none'; } catch (err) {}
+        }
+
+        function handleControlMessage(msg) {
+            if (msg.type === 'ready') {
+                isReady = true;
+                console.log('Server ready');
+                setStatus('connected', 'Connected - Speak now!');
+                stopBtn.disabled = false;
+                transcript.textContent = '';
+                claimMediaSession();
+                attachAudioGraph();
+                startSessionRecording();
+                startVisualizers();
+                initVADForUI();
+            } else if (msg.type === 'text') {
+                transcript.textContent += msg.v || '';
+                transcript.scrollTop = transcript.scrollHeight;
+            } else if (msg.type === 'error') {
+                console.warn('server error:', msg.reason);
+                showError('Server error: ' + (msg.reason || 'unknown'), true);
+                cleanup();
+            } else if (msg.type === 'end') {
+                setStatus('disconnected', 'Disconnected');
+                cleanup();
+            } else {
+                console.warn('unknown control message:', msg);
+            }
+        }
+
         async function startConversation() {
             try {
                 connectBtn.disabled = true;
                 connectBtn.textContent = 'Connecting...';
                 downloadRow.style.display = 'none';
                 downloadLink.removeAttribute('href');
-                
-                await initAudio();
-                
-                // Check microphone permission
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: getMicConstraints() });
-                stream.getTracks().forEach(track => track.stop());
-                
-                // Switch to conversation view
+                isReady = false;
+
+                // Mic permission + capture. With browser defaults (AEC, NS,
+                // AGC governed by the toggles) this is the only audio
+                // capture in the pipeline.
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: getMicConstraints(),
+                });
+
                 showConversationView();
-                setStatus('connecting', 'Connecting...');
+                setStatus('connecting', 'Negotiating...');
                 transcript.textContent = 'Connecting to server...';
-                
-                // Build WebSocket URL
-                const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                const wsUrl = new URL(wsProtocol + '://' + window.location.host + '/api/chat');
-                wsUrl.searchParams.set('text_prompt', textPromptInput.value || '');
-                // Uploaded voice wins over preset when both are present.
-                const voiceParam = uploadedVoiceFilename || voicePromptSelect.value || '';
-                wsUrl.searchParams.set('voice_prompt', voiceParam);
-                wsUrl.searchParams.set('text_temperature', textTempSlider.value);
-                wsUrl.searchParams.set('text_topk', textTopkSlider.value);
-                wsUrl.searchParams.set('audio_temperature', audioTempSlider.value);
-                wsUrl.searchParams.set('audio_topk', audioTopkSlider.value);
-                wsUrl.searchParams.set('repetition_penalty', repPenaltySlider.value);
-                wsUrl.searchParams.set('repetition_penalty_context', repContextSlider.value);
-                wsUrl.searchParams.set('padding_bonus', padBonusSlider.value);
-                wsUrl.searchParams.set('max_turn_text_tokens', maxTurnSlider.value);
-                if (!seedRandomToggle.checked && seedInput.value !== '') {
-                    wsUrl.searchParams.set('seed', seedInput.value);
-                }
-                
-                socket = new WebSocket(wsUrl.toString());
-                socket.binaryType = 'arraybuffer';
-                
-                socket.onopen = () => {
-                    console.log('WebSocket connected, waiting for handshake...');
+
+                pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+                pc.ontrack = (event) => {
+                    aiStream = event.streams && event.streams[0]
+                        ? event.streams[0]
+                        : new MediaStream([event.track]);
+                    aiAudioElement.srcObject = aiStream;
+                    const playPromise = aiAudioElement.play();
+                    if (playPromise && playPromise.catch) {
+                        playPromise.catch((err) => {
+                            console.warn('AI audio autoplay blocked:', err);
+                        });
+                    }
+                    // Wire the analyser/recording graph if 'ready' has
+                    // already fired and we missed it earlier.
+                    if (audioContext) attachAudioGraph();
+                };
+
+                pc.onconnectionstatechange = () => {
+                    console.log('pc state:', pc && pc.connectionState);
+                    if (!pc) return;
+                    if (pc.connectionState === 'failed') {
+                        showError('Connection failed. Network or NAT may be blocking media.', true);
+                        cleanup();
+                    } else if (pc.connectionState === 'disconnected'
+                               || pc.connectionState === 'closed') {
+                        if (isReady) setStatus('disconnected', 'Disconnected');
+                        cleanup();
+                    }
+                };
+
+                // Data channel must be created BEFORE createOffer to appear
+                // in the SDP. The server side wires its handler on
+                // pc.on('datachannel') by label.
+                controlChannel = pc.createDataChannel('control');
+                controlChannel.onopen = () => {
+                    const cfg = buildConfigPayload();
+                    controlChannel.send(JSON.stringify({ type: 'config', ...cfg }));
                     setStatus('connecting', 'Loading AI model (this may take a moment)...');
                 };
-                
-                socket.onmessage = (event) => {
-                    const data = new Uint8Array(event.data);
-                    const msgType = data[0];
-                    const payload = data.slice(1);
-                    
-                    if (msgType === 0x00) {
-                        console.log('Handshake received, starting recording...');
-                        setStatus('connected', 'Connected - Speak now!');
-                        stopBtn.disabled = false;
-                        transcript.textContent = '';
-                        // Await mic worklet before session recording so they
-                        // share one MediaStream (one set of AEC/NS state).
-                        startMicRecording().then(() => startSessionRecording());
-                    } else if (msgType === 0x01) {
-                        const pcm = new Float32Array(payload.buffer, payload.byteOffset, payload.byteLength / 4);
-                        playDecodedAudio(pcm);
-                    } else if (msgType === 0x02) {
-                        const text = new TextDecoder().decode(payload);
-                        transcript.textContent += text;
-                        transcript.scrollTop = transcript.scrollHeight;
-                    }
+                controlChannel.onmessage = (e) => {
+                    if (typeof e.data !== 'string') return;
+                    let msg;
+                    try { msg = JSON.parse(e.data); }
+                    catch (err) { console.warn('bad control JSON:', err); return; }
+                    handleControlMessage(msg);
                 };
-                
-                socket.onerror = (err) => {
-                    console.error('WebSocket error:', err);
-                    showError('Connection error. Make sure you accepted the security certificate.', true);
-                    cleanup();
-                };
-                
-                socket.onclose = (event) => {
-                    console.log('WebSocket closed:', event.code, event.reason);
-                    if (event.code !== 1000) {
-                        showError('Connection closed unexpectedly. The server may still be loading the model.', true);
-                    }
-                    setStatus('disconnected', 'Disconnected');
-                    cleanup();
-                };
-                
+
+                // Add the mic track. Pass the stream so the remote side sees
+                // it as part of one MediaStream group (cleaner ontrack
+                // semantics on the server, though aiortc tolerates either).
+                micStream.getAudioTracks().forEach((track) => {
+                    pc.addTrack(track, micStream);
+                });
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                await waitForIceComplete(pc);
+
+                const res = await fetch('/api/rtc/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type,
+                    }),
+                });
+                if (res.status === 409) {
+                    throw new Error('Another session is already active. Please wait for it to end.');
+                }
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).error || ''; } catch (_) {}
+                    throw new Error('Server returned ' + res.status + (detail ? (': ' + detail) : ''));
+                }
+                const answer = await res.json();
+                await pc.setRemoteDescription(answer);
+
+                // Init the AudioContext now (after the user-gesture-driven
+                // Connect click) so the analyser graph is ready when the
+                // server signals 'ready'.
+                await initAudioContext();
             } catch (err) {
                 console.error('Error:', err);
                 if (err.name === 'NotAllowedError') {
@@ -1870,25 +1817,22 @@ registerProcessor('mic-capture', MicCapture);`;
                 } else {
                     showError(err.message || 'Failed to start conversation');
                 }
+                cleanup();
                 connectBtn.disabled = false;
-                connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
+                connectBtn.innerHTML = CONNECT_BTN_HTML;
                 showSetupView();
             }
         }
-        
-        async function initVAD() {
-            if (!window.vad || !window.vad.MicVAD) {
-                console.warn('VAD library not loaded; barge-in still works, mic-mute during model speech will not');
-                return;
-            }
+
+        async function initVADForUI() {
+            // Client-side VAD only drives UI feedback now (the visualizer's
+            // per-track 'isLive' check is binary on/off; userSpeaking can
+            // gate richer state in the future). Server-side echo handling
+            // lives in the browser AEC stack, which the toggles control.
+            if (!micStream || !window.vad || !window.vad.MicVAD) return;
             try {
-                // Tighter thresholds than the library defaults: 0.75 and 6
-                // speech frames (~200 ms at 32 ms hop) reduce false-positive
-                // speechStart on speaker bleed when browser AEC isn't fully
-                // subtracting the model's own output. Cost: ~75 ms extra
-                // latency on barge-in onset, acceptable for voice convos.
                 micVad = await window.vad.MicVAD.new({
-                    stream: micWorkletStream,
+                    stream: micStream,
                     onSpeechStart: () => { userSpeaking = true; },
                     onSpeechEnd: () => { userSpeaking = false; },
                     onVADMisfire: () => { userSpeaking = false; },
@@ -1896,57 +1840,12 @@ registerProcessor('mic-capture', MicCapture);`;
                     minSpeechFrames: 6,
                 });
                 micVad.start();
-                console.log('VAD running, feedback guard active');
             } catch (err) {
-                console.warn('VAD init failed; continuing without it:', err);
+                console.warn('VAD init failed:', err);
                 micVad = null;
             }
         }
 
-        async function startMicRecording() {
-            try {
-                micWorkletStream = await navigator.mediaDevices.getUserMedia({
-                    audio: getMicConstraints(),
-                });
-                micWorkletSource = audioContext.createMediaStreamSource(micWorkletStream);
-                micCaptureNode = new AudioWorkletNode(audioContext, 'mic-capture');
-                // Deliver captured PCM chunks to the server as raw float32 at
-                // mimi.sample_rate (24 kHz). No encoder in the path means no
-                // encode/decode latency and no CDN dependency.
-                micCaptureNode.port.onmessage = (e) => {
-                    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-                    // Drop locally when the WS send buffer is backing up. 1 MB
-                    // is ~20 seconds of raw float32 at 24 kHz; past that point
-                    // the network can't keep up and the server would drop
-                    // anyway. Matching client-side policy avoids a runaway
-                    // postMessage queue in the AudioWorklet.
-                    if (socket.bufferedAmount > 1_000_000) return;
-                    // Swap in silence when the model is actively speaking and
-                    // the user isn't. Moshi still gets a continuous stream
-                    // (so turn-taking state stays aligned), but mic bleed
-                    // from the speakers doesn't reach the encoder. VAD keeps
-                    // barge-in working: once the user starts speaking, real
-                    // PCM flows even mid-model-response.
-                    let pcm = e.data;  // Float32Array, 480 samples (20 ms)
-                    if (modelPlaying && !userSpeaking) {
-                        pcm = SILENT_CHUNK;
-                    }
-                    const msg = new Uint8Array(1 + pcm.byteLength);
-                    msg[0] = 0x01;
-                    msg.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
-                    socket.send(msg);
-                };
-                // No speaker connection; we only need the worklet to run on
-                // captured audio, not emit anything to the output graph.
-                micWorkletSource.connect(micCaptureNode);
-                await initVAD();
-                console.log('Microphone capture started (raw PCM)');
-            } catch (err) {
-                console.error('Microphone error:', err);
-                showError('Microphone error: ' + (err.message || 'Could not start recording'), true);
-            }
-        }
-        
         function stopConversation() {
             stopSessionRecording(true);
             cleanup();
@@ -1956,81 +1855,75 @@ registerProcessor('mic-capture', MicCapture);`;
             stopBtn.style.display = 'none';
             newConvBtn.style.display = 'inline-flex';
         }
-        
+
         function newConversation() {
             showSetupView();
             connectBtn.disabled = false;
-            connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
+            connectBtn.innerHTML = CONNECT_BTN_HTML;
             stopBtn.style.display = 'inline-flex';
             newConvBtn.style.display = 'none';
             setProgress(20, 'Ready');
             downloadRow.style.display = 'none';
             downloadLink.removeAttribute('href');
         }
-        
+
         function cleanup() {
             stopSessionRecording(null);
+            isReady = false;
+            userSpeaking = false;
             if (micVad) {
-                try { micVad.pause(); } catch(e) {}
-                try { micVad.destroy && micVad.destroy(); } catch(e) {}
+                try { micVad.pause(); } catch (e) {}
+                try { micVad.destroy && micVad.destroy(); } catch (e) {}
                 micVad = null;
             }
-            userSpeaking = false;
-            modelPlaying = false;
-            if (micCaptureNode) {
-                try { micCaptureNode.port.onmessage = null; } catch(e) {}
-                try { micCaptureNode.disconnect(); } catch(e) {}
-                micCaptureNode = null;
+            if (controlChannel) {
+                try { controlChannel.close(); } catch (e) {}
+                controlChannel = null;
             }
-            if (micWorkletSource) {
-                try { micWorkletSource.disconnect(); } catch(e) {}
-                micWorkletSource = null;
+            if (pc) {
+                try { pc.ontrack = null; } catch (e) {}
+                try { pc.onconnectionstatechange = null; } catch (e) {}
+                try { pc.close(); } catch (e) {}
+                pc = null;
             }
-            if (micWorkletStream) {
-                try { micWorkletStream.getTracks().forEach(t => t.stop()); } catch(e) {}
-                micWorkletStream = null;
+            if (aiAudioElement) {
+                try { aiAudioElement.pause(); } catch (e) {}
+                try { aiAudioElement.srcObject = null; } catch (e) {}
             }
-            if (socket) {
-                try { socket.close(); } catch(e) {}
-                socket = null;
+            if (aiSourceNode) {
+                try { aiSourceNode.disconnect(); } catch (e) {}
+                aiSourceNode = null;
             }
-            connectBtn.disabled = false;
-            connectBtn.innerHTML = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg> Connect';
-            stopVisualizers();
+            if (userSourceNode) {
+                try { userSourceNode.disconnect(); } catch (e) {}
+                userSourceNode = null;
+            }
             if (aiAnalyser) {
-                try { aiAnalyser.disconnect(); } catch(e) {}
+                try { aiAnalyser.disconnect(); } catch (e) {}
                 aiAnalyser = null;
             }
             if (userAnalyser) {
-                try { userAnalyser.disconnect(); } catch(e) {}
+                try { userAnalyser.disconnect(); } catch (e) {}
                 userAnalyser = null;
             }
-            if (playerNode) {
-                playerNode.port.postMessage('flush');
-                playerNode.disconnect();
-                playerNode = null;
+            if (recordingDestination) {
+                try { recordingDestination.disconnect(); } catch (e) {}
+                recordingDestination = null;
             }
+            mediaRecorder = null;
+            aiStream = null;
+            if (micStream) {
+                try { micStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+                micStream = null;
+            }
+            connectBtn.disabled = false;
+            connectBtn.innerHTML = CONNECT_BTN_HTML;
+            stopVisualizers();
+            releaseMediaSession();
         }
-        
+
         // Handle page unload
         window.addEventListener('beforeunload', cleanup);
-
-        // Pause the mic pipeline when the tab is hidden. Without this, Chrome
-        // throttles AudioWorklet on backgrounded tabs and then dumps the
-        // backlog in one burst on foregrounding, blowing past the server's
-        // 200 ms PCM queue cap (architected drop policy triggers, log spam).
-        document.addEventListener('visibilitychange', () => {
-            if (!micCaptureNode || !micWorkletSource) return;
-            if (document.hidden) {
-                try { micWorkletSource.disconnect(micCaptureNode); } catch(e) {}
-                try { micVad && micVad.pause && micVad.pause(); } catch(e) {}
-            } else {
-                try { micWorkletSource.connect(micCaptureNode); } catch(e) {}
-                try { micVad && micVad.start && micVad.start(); } catch(e) {}
-                // Drop any lingering speech state that accumulated while paused.
-                userSpeaking = false;
-            }
-        });
     </script>
 </body>
 </html>"""
@@ -2038,26 +1931,6 @@ registerProcessor('mic-capture', MicCapture);`;
         
         logger.info("Serving embedded web client (no build required)")
         app.router.add_get("/", handle_embedded_client)
-        
-        # Serve decoder files from client/public/assets if they exist
-        script_dir = Path(__file__).parent.parent.parent
-        decoder_path = script_dir / "client" / "public" / "assets"
-        if decoder_path.exists():
-            async def serve_decoder_js(_):
-                file_path = decoder_path / "decoderWorker.min.js"
-                if file_path.exists():
-                    return web.FileResponse(file_path)
-                return web.Response(status=404)
-            
-            async def serve_decoder_wasm(_):
-                file_path = decoder_path / "decoderWorker.min.wasm"
-                if file_path.exists():
-                    return web.FileResponse(file_path, headers={'Content-Type': 'application/wasm'})
-                return web.Response(status=404)
-            
-            app.router.add_get("/assets/decoderWorker.min.js", serve_decoder_js)
-            app.router.add_get("/assets/decoderWorker.min.wasm", serve_decoder_wasm)
-            logger.info(f"Serving decoder files from {decoder_path}")
     protocol = "http"
     ssl_context = None
     if args.ssl is not None:
