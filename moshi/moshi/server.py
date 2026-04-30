@@ -2000,6 +2000,9 @@ def main():
                 downloadRow.style.display = 'none';
                 downloadLink.removeAttribute('href');
                 isReady = false;
+                showConversationView();
+                setStatus('connecting', 'Setting up microphone...');
+                transcript.textContent = '';
 
                 // Per-phase timing for diagnosing slow session starts.
                 // Logged to the console as a grouped breakdown when the
@@ -2021,10 +2024,7 @@ def main():
                 });
                 markConnect('getUserMedia');
 
-                showConversationView();
-                setStatus('connecting', 'Negotiating...');
-                transcript.textContent = 'Connecting to server...';
-
+                setStatus('connecting', 'Fetching network config...');
                 const iceServers = await fetchIceServers();
                 markConnect('fetchIceServers');
                 // iceCandidatePoolSize triggers candidate gathering as
@@ -2067,6 +2067,22 @@ def main():
                     }
                 };
 
+                pc.oniceconnectionstatechange = () => {
+                    if (!pc || isReady) return;
+                    const s = pc.iceConnectionState;
+                    console.log('ice state:', s);
+                    if (s === 'checking') {
+                        setStatus('connecting', 'Connecting peers...');
+                    } else if (s === 'connected' || s === 'completed') {
+                        markConnect('iceConnected');
+                        // Brief: we are about to open the DataChannel.
+                        setStatus('connecting', 'Securing channel...');
+                    } else if (s === 'failed') {
+                        showError('ICE failed: could not establish a media path. TURN may be unreachable.', true);
+                        cleanup();
+                    }
+                };
+
                 // Data channel must be created BEFORE createOffer to appear
                 // in the SDP. The server side wires its handler on
                 // pc.on('datachannel') by label.
@@ -2105,6 +2121,7 @@ def main():
                 await pc.setLocalDescription(offer);
                 markConnect('setLocalDescription');
 
+                setStatus('connecting', 'Negotiating session...');
                 const res = await fetch('/api/rtc/offer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
