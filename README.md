@@ -5,16 +5,10 @@
 
 PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
 
-<p align="center">
-  <img src="assets/architecture_diagram.png" alt="PersonaPlex Model Architecture">
-  <br>
-  <em>Upstream PersonaPlex architecture</em>
-</p>
-
 ## Credits
 
 - **Model and research**: NVIDIA PersonaPlex team. All credit for the core AI belongs to the original authors. See [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex).
-- **RunPod packaging + WebRTC client**: [@camjac251](https://github.com/camjac251), branched from a Windows-installer fork by [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
+- **Windows-installer fork this repo branched from**: [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
 
 ## Deploy on RunPod
 
