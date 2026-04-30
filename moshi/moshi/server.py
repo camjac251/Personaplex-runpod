@@ -641,11 +641,20 @@ class ServerState:
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
 
-            async def is_alive():
-                return session.is_alive()
-
+            # System prompts are 10-25 s of synchronous Mimi+LM steps
+            # (longer for raw-audio voice prompts because every prompt
+            # frame goes through Mimi.encode). Running them inline on
+            # the asyncio main thread starves aiortc's RTCP keepalive
+            # and ICE consent-freshness tasks; after ~30 s with no
+            # outbound packets, the peer connection state flips to
+            # 'failed' and the client sees "Connection failed". Pushing
+            # the work into the default thread executor (the same path
+            # _process_audio_frame already uses) keeps the loop free.
             t_sp = time.monotonic()
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.lm_gen.step_system_prompts, self.mimi
+            )
             self.mimi.reset_streaming()
             clog.log(
                 "info",
