@@ -1283,8 +1283,6 @@ def main():
            <a href="https://huggingface.co/nvidia/personaplex-7b-v1" target="_blank">NVIDIA PersonaPlex</a></p>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
     <script>
         // Text prompt presets
         const PRESETS = {
@@ -1320,8 +1318,6 @@ def main():
         let controlChannel = null;
         let micStream = null;       // local MediaStream from getUserMedia
         let aiStream = null;        // remote MediaStream from pc.ontrack
-        let micVad = null;
-        let userSpeaking = false;
         let isReady = false;        // server has signalled 'ready'
 
         // AudioContext is used only to host AnalyserNodes for the visualizer
@@ -1861,7 +1857,6 @@ def main():
                 attachAudioGraph();
                 startSessionRecording();
                 startVisualizers();
-                initVADForUI();
             } else if (msg.type === 'text') {
                 transcript.textContent += msg.v || '';
                 transcript.scrollTop = transcript.scrollHeight;
@@ -1997,28 +1992,6 @@ def main():
             }
         }
 
-        async function initVADForUI() {
-            // Client-side VAD only drives UI feedback now (the visualizer's
-            // per-track 'isLive' check is binary on/off; userSpeaking can
-            // gate richer state in the future). Server-side echo handling
-            // lives in the browser AEC stack, which the toggles control.
-            if (!micStream || !window.vad || !window.vad.MicVAD) return;
-            try {
-                micVad = await window.vad.MicVAD.new({
-                    stream: micStream,
-                    onSpeechStart: () => { userSpeaking = true; },
-                    onSpeechEnd: () => { userSpeaking = false; },
-                    onVADMisfire: () => { userSpeaking = false; },
-                    positiveSpeechThreshold: 0.75,
-                    minSpeechFrames: 6,
-                });
-                micVad.start();
-            } catch (err) {
-                console.warn('VAD init failed:', err);
-                micVad = null;
-            }
-        }
-
         function stopConversation() {
             stopSessionRecording(true);
             cleanup();
@@ -2043,12 +2016,6 @@ def main():
         function cleanup() {
             stopSessionRecording(null);
             isReady = false;
-            userSpeaking = false;
-            if (micVad) {
-                try { micVad.pause(); } catch (e) {}
-                try { micVad.destroy && micVad.destroy(); } catch (e) {}
-                micVad = null;
-            }
             if (controlChannel) {
                 try { controlChannel.close(); } catch (e) {}
                 controlChannel = null;
