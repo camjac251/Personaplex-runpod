@@ -633,42 +633,15 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
         return None
 
 
-def _get_static_path(static: Optional[str], hf_repo: str) -> Optional[str]:
-    if static is None:
-        logger.info("retrieving the static content")
-        # Get HF_TOKEN from environment or cache
-        hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
-            try:
-                from huggingface_hub.utils import HfFolder
-                hf_token = HfFolder.get_token()
-            except Exception:
-                pass
-        
-        # Try to download dist.tgz from HuggingFace
-        try:
-            dist_tgz = hf_hub_download(hf_repo, "dist.tgz", token=hf_token)
-            dist_tgz = Path(dist_tgz)
-            dist = dist_tgz.parent / "dist"
-            if not dist.exists():
-                with tarfile.open(dist_tgz, "r:gz") as tar:
-                    tar.extractall(path=dist_tgz.parent)
-            return str(dist)
-        except Exception as e:
-            logger.warning(f"Could not download static content from HuggingFace: {e}")
-            # Try to find local client/dist folder
-            script_dir = Path(__file__).parent.parent.parent
-            local_dist = script_dir / "client" / "dist"
-            if local_dist.exists():
-                logger.info(f"Using local client dist: {local_dist}")
-                return str(local_dist)
-            logger.warning("No static content available. Web UI will not be served.")
-            logger.warning("To build the client, run: cd client && npm install && npm run build")
-            return None
-    elif static != "none":
-        # When set to the "none" string, we don't serve any static content.
-        return static
-    return None
+def _get_static_path(static: Optional[str]) -> Optional[str]:
+    """Resolve the static-content directory.
+
+    None or "none": return None so the embedded WebRTC HTML is served.
+    Any other value: a user-supplied directory of static files to serve.
+    """
+    if static is None or static == "none":
+        return None
+    return static
 
 
 def main():
@@ -737,7 +710,7 @@ def main():
         os.makedirs(args.uploads_dir, exist_ok=True)
     logger.info(f"uploads_dir = {args.uploads_dir}")
 
-    static_path: None | str = _get_static_path(args.static, args.hf_repo)
+    static_path: None | str = _get_static_path(args.static)
     assert static_path is None or os.path.exists(static_path), \
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
