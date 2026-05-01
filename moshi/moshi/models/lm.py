@@ -128,7 +128,17 @@ def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
     loudness = pyln.Meter(sr).integrated_loudness(wav)
     if not np.isfinite(loudness):
         return wav
-    return pyln.normalize.loudness(wav, loudness, target_lufs)
+    out = pyln.normalize.loudness(wav, loudness, target_lufs)
+    # pyloudnorm.normalize.loudness only WARNS on clipping; it does not
+    # rescale. A quiet upload (e.g. -50 LUFS gained to -24 LUFS = +26 dB)
+    # can hand mimi.encode samples well above |1.0|, which the codec
+    # treats as undefined and surfaces as a degraded voice clone with
+    # no error. Peak-normalize down to leave a small headroom margin
+    # if the LUFS pass pushed us over.
+    peak = float(np.max(np.abs(out)))
+    if peak > 0.99:
+        out = out * (0.99 / peak)
+    return out
 
 
 def load_audio(

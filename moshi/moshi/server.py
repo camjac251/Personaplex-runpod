@@ -92,6 +92,13 @@ def wrap_with_system_tags(text: str) -> str:
 UPLOAD_PREFIX = "upload:"
 UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 UPLOAD_ALLOWED_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+# Voice cloning timbre captures inside ~10 s; longer references add
+# prosody and emotional range. 60 s is the comfortable upper bound:
+# enough room for a self-introduction or read-aloud paragraph, while
+# keeping the warmup bounded since each prompt-second turns into ~12.5
+# sequential GPU encode steps that hold the session lock. A 5-minute
+# MP3 (allowed by the 20 MB byte cap) would be a self-DoS.
+UPLOAD_MAX_VOICE_PROMPT_SECONDS = 60.0
 
 
 @dataclass
@@ -221,12 +228,36 @@ class ServerState:
         # block the event loop on large files.
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(None, sphn.read, str(out_path))
+            sample_pcm, sample_sr = await loop.run_in_executor(
+                None, sphn.read, str(out_path)
+            )
         except Exception as e:
             out_path.unlink(missing_ok=True)
             return web.json_response({"error": f"could not decode audio: {e}"}, status=400)
 
-        logger.info(f"voice upload saved: {safe_name} ({total} bytes, original={original!r})")
+        # Reject long uploads early. sphn.read returns shape (C, T); duration
+        # in seconds is T / sample_sr. See UPLOAD_MAX_VOICE_PROMPT_SECONDS.
+        try:
+            duration = float(sample_pcm.shape[-1]) / float(sample_sr)
+        except (TypeError, ZeroDivisionError, AttributeError):
+            duration = 0.0
+        if duration > UPLOAD_MAX_VOICE_PROMPT_SECONDS:
+            out_path.unlink(missing_ok=True)
+            return web.json_response(
+                {
+                    "error": (
+                        f"audio too long ({duration:.1f}s); voice prompts "
+                        f"are capped at {UPLOAD_MAX_VOICE_PROMPT_SECONDS:.0f}s "
+                        "for clone quality and warmup time"
+                    )
+                },
+                status=400,
+            )
+
+        logger.info(
+            f"voice upload saved: {safe_name} ({total} bytes, "
+            f"{duration:.1f}s, original={original!r})"
+        )
         return web.json_response({"filename": f"{UPLOAD_PREFIX}{safe_name}", "bytes": total})
 
     @torch.no_grad()
@@ -278,28 +309,36 @@ class ServerState:
             )
         return requested, requested
 
-    async def _fetch_ice_servers(self) -> list[dict]:
-        """Return iceServers config for the current session.
+    async def _fetch_ice_servers(self) -> tuple[list[dict], bool]:
+        """Return ``(iceServers, turn_failed)`` for the current session.
 
         With ``TURN_KEY_ID`` and ``TURN_KEY_API_TOKEN`` set, mints a fresh
         24-hour credential pack from Cloudflare Realtime and caches it for
         12 hours. Otherwise returns the STUN-only fallback, which only
         works when both peers can reach each other directly over UDP
         (i.e. on LAN; not through RunPod's HTTPS proxy).
+
+        ``turn_failed`` is ``True`` only when TURN was configured but
+        provisioning failed (4xx, non-JSON, network error, empty list).
+        Callers facing the network use it to fail the session fast with
+        503 instead of silently handing the client a STUN-only config
+        that cannot traverse RunPod NAT. ``False`` for both healthy
+        TURN and the no-TURN-configured LAN dev case.
         """
         if not (self._turn_key_id and self._turn_api_token):
-            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+            return [dict(s) for s in DEFAULT_STUN_FALLBACK], False
 
         async with self._ice_cache_lock:
             now = time.monotonic()
             if self._ice_cache is not None and now < self._ice_cache_expires_at:
-                return self._ice_cache
+                return self._ice_cache, False
 
             ttl_seconds = 86400  # Cloudflare's documented max.
             url = (
                 "https://rtc.live.cloudflare.com/v1/turn/keys/"
                 f"{self._turn_key_id}/credentials/generate"
             )
+            stun_fallback = [dict(s) for s in DEFAULT_STUN_FALLBACK]
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
@@ -317,17 +356,17 @@ class ServerState:
                                 "Cloudflare TURN creds fetch failed: "
                                 f"{resp.status} {body_text[:200]}"
                             )
-                            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+                            return stun_fallback, True
                         try:
                             data = json.loads(body_text)
                         except ValueError as exc:
                             logger.warning(
                                 f"Cloudflare TURN creds fetch returned non-JSON: {exc}"
                             )
-                            return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+                            return stun_fallback, True
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 logger.warning(f"Cloudflare TURN creds fetch error: {exc}")
-                return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+                return stun_fallback, True
 
             servers = data.get("iceServers")
             if isinstance(servers, dict):
@@ -338,7 +377,7 @@ class ServerState:
                 logger.warning(
                     "Cloudflare returned no iceServers; falling back to STUN"
                 )
-                return [dict(s) for s in DEFAULT_STUN_FALLBACK]
+                return stun_fallback, True
 
             self._ice_cache = servers
             # Refresh halfway through the TTL so we never serve creds that
@@ -348,10 +387,24 @@ class ServerState:
                 f"Cloudflare TURN creds minted (ttl={ttl_seconds}s, "
                 f"refresh at +{ttl_seconds // 2}s)"
             )
-            return servers
+            return servers, False
 
     async def handle_ice_servers(self, _request):
-        servers = await self._fetch_ice_servers()
+        servers, turn_failed = await self._fetch_ice_servers()
+        if turn_failed:
+            return web.json_response(
+                {
+                    "error": "turn_unavailable",
+                    "detail": (
+                        "TURN provisioning failed; the server cannot mint "
+                        "Cloudflare credentials. Connections behind NAT "
+                        "(including RunPod's HTTPS proxy) will not work. "
+                        "Check TURN_KEY_ID / TURN_KEY_API_TOKEN and the "
+                        "Cloudflare Realtime dashboard."
+                    ),
+                },
+                status=503,
+            )
         return web.json_response({"iceServers": servers})
 
     async def handle_rtc_candidate(self, request):
@@ -510,11 +563,24 @@ class ServerState:
                 config_event.set()
 
             t_ice = time.monotonic()
-            ice_servers = await self._fetch_ice_servers()
+            ice_servers, turn_failed = await self._fetch_ice_servers()
             clog.log(
                 "info",
                 f"timing: ice_servers fetched in {(time.monotonic() - t_ice) * 1000:.0f} ms",
             )
+            if turn_failed:
+                # Refuse the session rather than hand the client a
+                # STUN-only config that will fail to traverse NAT 30 s
+                # later with no actionable signal.
+                clog.log(
+                    "error",
+                    "TURN unavailable; refusing offer to avoid silent NAT failure",
+                )
+                self.lock.release()
+                owns_lock = False
+                return web.json_response(
+                    {"error": "turn_unavailable"}, status=503
+                )
             session = RTCSession(
                 frame_size=self.frame_size,
                 process_fn=self._process_audio_frame,
@@ -618,9 +684,12 @@ class ServerState:
                     f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
                 )
 
+            # Empty list (not None) so _step_text_prompt_core iterates as a
+            # no-op when the user clears the textarea. Iterating None raises
+            # TypeError inside the executor and tears the session down.
             self.lm_gen.text_prompt_tokens = (
                 self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
-                if cfg.text_prompt else None
+                if cfg.text_prompt else []
             )
             if cfg.seed is not None and cfg.seed != -1:
                 seed_all(cfg.seed)
@@ -650,11 +719,43 @@ class ServerState:
             # 'failed' and the client sees "Connection failed". Pushing
             # the work into the default thread executor (the same path
             # _process_audio_frame already uses) keeps the loop free.
+            #
+            # Run the 4 phases sequentially in their own executor calls
+            # so we can check session.is_alive() between phases and
+            # bail early if the peer dropped mid-warmup. Each phase is
+            # shield+drained on cancel so the GPU thread cannot keep
+            # mutating lm_gen / mimi streaming state past the lock
+            # release in finally.
             t_sp = time.monotonic()
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.lm_gen.step_system_prompts, self.mimi
+            phases = (
+                ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
+                ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
+                ("text_prompt", self.lm_gen._step_text_prompt, ()),
+                ("audio_silence_b", self.lm_gen._step_audio_silence, ()),
             )
+            warmup_aborted = False
+            for phase_name, phase_fn, phase_args in phases:
+                if not session.is_alive():
+                    clog.log(
+                        "info",
+                        f"client disconnected during warmup before {phase_name}; aborting",
+                    )
+                    warmup_aborted = True
+                    break
+                in_flight = asyncio.ensure_future(
+                    loop.run_in_executor(None, phase_fn, *phase_args)
+                )
+                try:
+                    await asyncio.shield(in_flight)
+                except asyncio.CancelledError:
+                    try:
+                        await in_flight
+                    except BaseException:
+                        pass
+                    raise
+            if warmup_aborted:
+                return
             self.mimi.reset_streaming()
             clog.log(
                 "info",
@@ -910,10 +1011,16 @@ def main():
     if state._turn_key_id and state._turn_api_token:
         try:
             t0 = time.monotonic()
-            asyncio.run(state._fetch_ice_servers())
-            logger.info(
-                f"TURN creds pre-warmed in {(time.monotonic() - t0) * 1000:.0f} ms"
-            )
+            _, turn_failed = asyncio.run(state._fetch_ice_servers())
+            if turn_failed:
+                logger.warning(
+                    "TURN pre-warm failed; sessions will be refused with 503 "
+                    "until creds mint successfully on demand"
+                )
+            else:
+                logger.info(
+                    f"TURN creds pre-warmed in {(time.monotonic() - t0) * 1000:.0f} ms"
+                )
         except Exception as exc:  # never block startup on a TURN hiccup
             logger.warning(f"TURN pre-warm failed (will mint on demand): {exc}")
 
@@ -1405,15 +1512,30 @@ def main():
         ];
 
         async function fetchIceServers() {
+            const res = await fetch('/api/rtc/ice-servers', { method: 'GET' });
+            if (res.status === 503) {
+                // Server has TURN configured but cannot mint creds. Don't
+                // silently fall back to STUN. That would leave the user
+                // staring at a stuck connect for ~30 s before iceConnectionState
+                // times out, with no actionable signal.
+                let detail = 'TURN unavailable on the server. Connections behind NAT will fail.';
+                try {
+                    const data = await res.json();
+                    if (data && data.detail) detail = data.detail;
+                } catch (e) {}
+                throw new Error(detail);
+            }
+            if (!res.ok) {
+                console.warn('ice-servers fetch failed, falling back to STUN: HTTP ' + res.status);
+                return ICE_SERVERS_FALLBACK;
+            }
             try {
-                const res = await fetch('/api/rtc/ice-servers', { method: 'GET' });
-                if (!res.ok) throw new Error('HTTP ' + res.status);
                 const data = await res.json();
                 if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
                     return data.iceServers;
                 }
             } catch (err) {
-                console.warn('ice-servers fetch failed, falling back to STUN:', err);
+                console.warn('ice-servers fetch parse failed, falling back to STUN:', err);
             }
             return ICE_SERVERS_FALLBACK;
         }
@@ -2306,15 +2428,28 @@ def main():
     # Cloudflare's TURN returns a bare 401 on CHANNEL_BIND that aioice
     # cannot retry, leaving "Task exception was never retrieved" stack
     # traces in the log even though the WebRTC connection succeeds via
-    # plain Send-Indication. Filter those out at the asyncio exception
-    # handler so unrelated exceptions still surface normally.
+    # plain Send-Indication. Filter THAT specific symptom out at the
+    # asyncio exception handler. Other aioice failures (network outage,
+    # DNS failure, real TURN auth issues, malformed STUN responses)
+    # must keep surfacing or operators have no diagnostic when TURN is
+    # genuinely broken.
     async def _install_aioice_noise_filter(_app):
         def _handler(loop, context):
             exc = context.get("exception")
             if isinstance(exc, Exception):
-                mod = type(exc).__module__ or ""
-                if mod.startswith("aioice."):
-                    return
+                cls = type(exc)
+                mod = cls.__module__ or ""
+                if (
+                    mod.startswith("aioice.")
+                    and cls.__name__ == "TransactionFailed"
+                ):
+                    msg = str(exc)
+                    if (
+                        "CHANNEL_BIND" in msg
+                        or "401" in msg
+                        or "Unauthorized" in msg
+                    ):
+                        return
             loop.default_exception_handler(context)
         asyncio.get_event_loop().set_exception_handler(_handler)
     app.on_startup.append(_install_aioice_noise_filter)
