@@ -131,6 +131,13 @@ LIVE_PROMPT_BOUNDARY_STREAK = 2
 # a return to normal generation. ~4 s at 12.5 Hz.
 LIVE_PROMPT_MAX_STEPS = 48
 
+# Re-arm the vision-frame request flag every N pad frames of sustained
+# silence. Without this, the cadence task fires once when the model
+# enters a pad streak and never again until the streak breaks. Users
+# observing a static scene with no audio activity then see one frame
+# every fallback-timer interval. ~62 frames is ~5 s at 12.5 Hz.
+PAD_STREAK_REREQUEST_EVERY = 62
+
 # Auto-rewind: if the LM safety net (max_turn_text_tokens) triggers this
 # many times within COLLAPSE_WINDOW_SEC, treat that as a sign the model
 # is wobbling and restore the latest snapshot in-place. The thresholds
@@ -492,13 +499,21 @@ class ServerState:
 
             # --- server-driven vision cadence ------------------------
             # When the model just entered a pad streak (silence), ask the
-            # client to send a fresh frame. The cadence task on the event
-            # loop drains this flag and pushes the request_vision_frame
-            # control message.
-            if (
+            # client to send a fresh frame. Also re-arm periodically
+            # during sustained silence so observation-only sessions
+            # (user moving around without speaking) still get frames at
+            # a steady cadence; otherwise the transition fires once and
+            # the user sees nothing until the fallback timer.
+            entered_streak = (
                 prev_pad_streak < LIVE_PROMPT_BOUNDARY_STREAK
                 and self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
-            ):
+            )
+            sustained_rearm = (
+                self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+                and self._vision_pad_streak > prev_pad_streak
+                and self._vision_pad_streak % PAD_STREAK_REREQUEST_EVERY == 0
+            )
+            if entered_streak or sustained_rearm:
                 self._vision_request_pending = True
         return results
 
@@ -1991,17 +2006,17 @@ def main():
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Padding bonus</span>
-                                <span class="slider-value" id="padBonusValue">1.5</span>
+                                <span class="slider-value" id="padBonusValue">0.0</span>
                             </div>
-                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="1.5">
+                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="0">
                             <div class="slider-hint">Biases the model toward silence tokens. 0 = off. 2-4 stops rambling by making it yield the turn sooner.</div>
                         </div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Max turn length (tokens)</span>
-                                <span class="slider-value" id="maxTurnValue">150</span>
+                                <span class="slider-value" id="maxTurnValue">0</span>
                             </div>
-                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="150">
+                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="0">
                             <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 500 ≈ 40 s sustained talk. Safety net under padding_bonus.</div>
                         </div>
                         <div class="slider-group-title">Microphone input</div>
@@ -2073,9 +2088,9 @@ def main():
                     <select id="visionIntervalSelect">
                         <option value="1000">1 s</option>
                         <option value="3000">3 s</option>
-                        <option value="5000">5 s</option>
+                        <option value="5000" selected>5 s</option>
                         <option value="10000">10 s</option>
-                        <option value="15000" selected>15 s</option>
+                        <option value="15000">15 s</option>
                         <option value="30000">30 s</option>
                     </select>
                 </label>
@@ -2206,7 +2221,9 @@ def main():
         let visionPaused = false;
         let visionEnabledFromServer = true;  // assumed until server says otherwise
         let visionFramesSent = 0;
-        let visionFrameIntervalMs = 15000;  // fallback only; server drives most frames
+        let visionFrameIntervalMs = 5000;  // fallback only; server drives most frames
+        let visionLastSentAt = 0;
+        let visionStatusTickTimer = null;
 
         // Per-call cost estimate for Gemini 3.5 Flash with our payload
         // shape (~500 input tokens including transcript context, 50
@@ -2316,8 +2333,8 @@ def main():
             textTemp: 0.7, textTopk: 25,
             audioTemp: 0.7, audioTopk: 250,
             repPenalty: 1.2, repContext: 64,
-            padBonus: 1.5,
-            maxTurn: 150,
+            padBonus: 0.0,
+            maxTurn: 0,
         };
         const advancedToggle = document.getElementById('advancedToggle');
         const advancedBody = document.getElementById('advancedBody');
@@ -2635,9 +2652,13 @@ def main():
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data && event.data.size > 0) recordedChunks.push(event.data);
                 };
-                mediaRecorder.onstop = () => {
+                mediaRecorder.onstop = function () {
+                    // Use `this` (the MediaRecorder) instead of the closure
+                    // variable: cleanup() nulls `mediaRecorder` before this
+                    // async handler fires, which otherwise crashes on
+                    // `mediaRecorder.mimeType` after a fast disconnect.
                     if (!shouldShowDownload || recordedChunks.length === 0) return;
-                    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                    const blob = new Blob(recordedChunks, { type: this.mimeType || 'audio/webm' });
                     const url = URL.createObjectURL(blob);
                     downloadLink.href = url;
                     downloadRow.style.display = 'flex';
@@ -2799,6 +2820,11 @@ def main():
             } else if (msg.type === 'vision_caption') {
                 showVisionCaption(msg.text || '');
                 addCaptionToLog(msg.text || '');
+                const el = document.getElementById('visionStatus');
+                if (el) {
+                    el.textContent = 'Response received';
+                    setTimeout(updateVisionStatus, 1500);
+                }
             } else if (msg.type === 'vision_status') {
                 visionEnabledFromServer = !!msg.enabled;
                 if (!visionEnabledFromServer) {
@@ -3163,6 +3189,11 @@ def main():
                 visionInterval = setInterval(() => {
                     if (!visionPaused) captureFrame(false);
                 }, visionFrameIntervalMs);
+                // 1 Hz refresh of the "last X s ago" status pill so the
+                // user sees a live counter, not a frozen value.
+                if (visionStatusTickTimer) clearInterval(visionStatusTickTimer);
+                visionStatusTickTimer = setInterval(updateVisionStatus, 1000);
+                updateVisionStatus();
             } catch (err) {
                 console.error('Vision access denied:', err);
                 showError('Could not start vision: ' + err.message);
@@ -3191,6 +3222,11 @@ def main():
             const meta = document.getElementById('visionMeta');
             if (meta) meta.classList.remove('visible');
             visionPaused = false;
+            if (visionStatusTickTimer) {
+                clearInterval(visionStatusTickTimer);
+                visionStatusTickTimer = null;
+            }
+            visionLastSentAt = 0;
         }
 
         // Track the last sent frame so we can skip ones that haven't
@@ -3240,7 +3276,22 @@ def main():
                 detail: !!detail,
             }));
             visionFramesSent += 1;
+            visionLastSentAt = performance.now();
             updateVisionCost();
+            updateVisionStatus();
+        }
+
+        // Live status pill at the bottom of the vision preview. Replaces
+        // the static "Idle" so users moving around with no audio still see
+        // confirmation that frames are flowing.
+        function updateVisionStatus() {
+            const el = document.getElementById('visionStatus');
+            if (!el) return;
+            if (visionPaused) { el.textContent = 'Paused'; return; }
+            if (!visionLastSentAt) { el.textContent = 'Idle'; return; }
+            const age = Math.max(0, Math.round((performance.now() - visionLastSentAt) / 1000));
+            el.textContent = visionFramesSent + ' frame' + (visionFramesSent === 1 ? '' : 's') +
+                             ' · last ' + age + ' s ago';
         }
 
         function forceCapture() {
@@ -3331,9 +3382,8 @@ def main():
         function toggleVisionPause() {
             visionPaused = !visionPaused;
             const btn = document.getElementById('visionPauseBtn');
-            const status = document.getElementById('visionStatus');
             if (btn) btn.textContent = visionPaused ? 'Resume Vision' : 'Pause Vision';
-            if (status) status.textContent = visionPaused ? 'Paused' : 'Idle';
+            updateVisionStatus();
         }
 
         function sendRewind() {
