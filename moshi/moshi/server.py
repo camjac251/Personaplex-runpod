@@ -528,9 +528,11 @@ class ServerState:
         Uses flattening to produce a state dict that can be restored in-place
         to preserve CUDA graph memory addresses.
 
-        The infer lock is released before the deep clone so the GPU thread
-        can resume audio frames while the copy runs. A held lock during the
-        full clone backs up the inbound PCM queue and drops audio.
+        Clone happens inside the lock. An earlier optimization tried to
+        detach inside the lock and clone outside, but tensor.detach()
+        shares storage with the original; the clone then copies whatever
+        the executor thread is computing at clone time, producing a torn
+        snapshot. Rewinds from such a snapshot restore corrupted state.
         """
         from .modules.streaming import _flatten_streaming_state
         with self._infer_lock:
@@ -538,10 +540,7 @@ class ServerState:
             state_dict: dict = {}
             metadata: dict = {}
             _flatten_streaming_state(state_dict, metadata, state, prefix="")
-            # Detach inside the lock (no copy); clone outside so the GPU
-            # thread can resume audio frames while the deep copy runs.
-            detached = {k: v.detach() for k, v in state_dict.items()}
-        snapshot = {k: v.clone() for k, v in detached.items()}
+            snapshot = {k: v.detach().clone() for k, v in state_dict.items()}
         snapshot.update(metadata)
         return snapshot
 
@@ -679,6 +678,16 @@ class ServerState:
 
                         def _set_vision_context() -> None:
                             with self._infer_lock:
+                                # asyncio.create_task can't cancel executor
+                                # work mid-flight, so the per-session drain
+                                # in _run_rtc_session.finally may return
+                                # before this function runs. Gate the
+                                # mutation on the active session id so a
+                                # late Gemini response from a closed
+                                # session can't clobber the next session's
+                                # pending queue.
+                                if session_id != self._active_session_id:
+                                    return
                                 # Replace pending queue: latest scene wins.
                                 # An in-flight inject finishes its already-
                                 # popped tokens; the next window picks up
