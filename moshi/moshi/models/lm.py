@@ -1078,13 +1078,13 @@ class LMGen(StreamingModule[_LMGenState]):
         
         if exists(state_path) and exists(meta_path):
             logger.info("loading full streaming state from %s", state_path)
-            full_state = load_streaming_state(state_path, meta_path, device=self.device)
+            full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
             self.set_streaming_state_inplace(full_state)
             # Mark that we have loaded the full state so _step_voice_prompt_core can skip replay
             self.voice_prompt_embeddings = [] # Non-None but empty to signal "loaded"
             # Clone the cache so a subsequent reset_streaming() doesn't
             # zero out our reference. The legacy .pt path (below) builds
-            # a fresh tensor via .to(self.device), so it doesn't need this.
+            # a fresh tensor via .to(self.lm_model.device), so it doesn't need this.
             self.voice_prompt_cache = self._streaming_state.cache.clone()
             self.voice_prompt = path
             return
@@ -1093,8 +1093,8 @@ class LMGen(StreamingModule[_LMGenState]):
         logger.info("loading legacy voice prompt embeddings from %s", path)
         data = torch.load(path, map_location="cpu", weights_only=True)
         self.voice_prompt_audio = None
-        self.voice_prompt_embeddings = data["embeddings"].to(self.device)
-        self.voice_prompt_cache = data["cache"].to(self.device)
+        self.voice_prompt_embeddings = data["embeddings"].to(self.lm_model.device)
+        self.voice_prompt_cache = data["cache"].to(self.lm_model.device)
         self.voice_prompt = path
 
     def _encode_zero_frame(self) -> torch.Tensor:
