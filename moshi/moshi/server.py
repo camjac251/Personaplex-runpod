@@ -205,6 +205,12 @@ class ServerState:
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._interaction_ids: dict[str, str] = {}
         self._vision_in_flight: set[str] = set()
+        # Per-session vision dispatch tasks. Each handle_vision_frame call
+        # is fire-and-forget from on_message; we hold strong refs here so
+        # session teardown can cancel + drain stragglers before another
+        # session opens. Otherwise a late Gemini response from session A
+        # can overwrite session B's _vision_pending under _infer_lock.
+        self._vision_tasks: dict[str, set[asyncio.Task]] = {}
         # Vision-context inject state. _vision_pending holds tokens waiting
         # to be drip-fed into the model's text channel during pad streaks.
         # _vision_pad_streak counts how many recent natural text emissions
@@ -612,7 +618,17 @@ class ServerState:
                     data = await resp.json()
                     new_id = data.get("id")
                     if new_id:
-                        self._interaction_ids[session_id] = new_id
+                        # Drop the write if the session rolled over while
+                        # we were awaiting Gemini. Otherwise teardown's
+                        # _interaction_ids.pop already ran (no-op then)
+                        # and this would resurrect a dead entry.
+                        if session_id == self._active_session_id:
+                            self._interaction_ids[session_id] = new_id
+                        else:
+                            clog.log(
+                                "warning",
+                                "vision: late response after session close; dropping chain id",
+                            )
                     else:
                         # Missing id means the Interactions chain is
                         # effectively reset; drop the prior id so the
@@ -947,6 +963,7 @@ class ServerState:
         # construction, leaves the lock permanently held and every future
         # offer wedged on HTTP 409 until restart.
         session: Optional[RTCSession] = None
+        session_id: Optional[str] = None
         owns_lock = True
         try:
             clog = ColorizedLog.randomize()
@@ -1043,6 +1060,12 @@ class ServerState:
                     await session.close()
                 except Exception:
                     pass
+            # If we'd already registered the session for ICE trickle but
+            # never handed ownership to the runner (create_task raised),
+            # the runner's finally will never run; drop the entry here so
+            # the candidate endpoints don't point at a closed session.
+            if session_id is not None:
+                self._candidate_sessions.pop(session_id, None)
             if owns_lock:
                 try:
                     self.lock.release()
@@ -1158,6 +1181,8 @@ class ServerState:
             t_sp = time.monotonic()
             loop = asyncio.get_event_loop()
 
+            self._vision_tasks[session_id] = set()
+
             async def on_message(msg: dict):
                 mtype = msg.get("type")
                 if mtype == "rewind":
@@ -1200,23 +1225,42 @@ class ServerState:
                             )
                             return
                         detail = bool(msg.get("detail", False))
-                        asyncio.create_task(
+                        task = asyncio.create_task(
                             self.handle_vision_frame(
                                 session_id, base64_data, clog, detail=detail
                             )
                         )
+                        tasks = self._vision_tasks.get(session_id)
+                        if tasks is not None:
+                            tasks.add(task)
+                            task.add_done_callback(tasks.discard)
 
             session.set_message_handler(on_message)
 
+            # Block the first snapshot until warmup completes. Warmup runs
+            # in an executor without holding _infer_lock; snapshot_task
+            # acquires the lock, so without this gate the first +30 s
+            # snapshot can race a long voice-prompt load and read a torn
+            # _streaming_state.
+            warmup_done = asyncio.Event()
+
             async def snapshot_task():
                 try:
+                    await warmup_done.wait()
                     while session.is_alive():
                         await asyncio.sleep(30.0)
                         if not session.is_alive():
                             break
                         clog.log("info", "taking session snapshot")
                         snap = await loop.run_in_executor(None, self._take_snapshot)
-                        history = self._session_snapshots.setdefault(session_id, [])
+                        # Teardown can pop the bucket while the executor is
+                        # cloning. setdefault here would resurrect a stale
+                        # entry that lives forever.
+                        if not session.is_alive():
+                            break
+                        history = self._session_snapshots.get(session_id)
+                        if history is None:
+                            break
                         history.append((time.monotonic(), snap))
                         # Keep only last 5 snapshots
                         if len(history) > 5:
@@ -1224,7 +1268,9 @@ class ServerState:
                 except asyncio.CancelledError:
                     pass
 
-            self._session_tasks.add(asyncio.create_task(snapshot_task()))
+            _snap_t = asyncio.create_task(snapshot_task())
+            self._session_tasks.add(_snap_t)
+            _snap_t.add_done_callback(self._session_tasks.discard)
 
             async def cadence_task():
                 """Drain _vision_request_pending and ping the client.
@@ -1248,7 +1294,9 @@ class ServerState:
                 except asyncio.CancelledError:
                     pass
 
-            self._session_tasks.add(asyncio.create_task(cadence_task()))
+            _cad_t = asyncio.create_task(cadence_task())
+            self._session_tasks.add(_cad_t)
+            _cad_t.add_done_callback(self._session_tasks.discard)
             phases = (
                 ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
                 ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
@@ -1282,6 +1330,7 @@ class ServerState:
                 "info",
                 f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
             )
+            warmup_done.set()
 
             if not session.is_alive():
                 clog.log("info", "client disconnected during warmup")
@@ -1330,6 +1379,21 @@ class ServerState:
                 self._interaction_ids.pop(session_id, None)
                 self._session_snapshots.pop(session_id, None)
                 self._vision_in_flight.discard(session_id)
+                # Drain in-flight Gemini calls before the next session can
+                # acquire the lock. A stale handle_vision_frame still
+                # awaiting a response would otherwise overwrite the next
+                # session's _vision_pending under _infer_lock.
+                pending_vision = self._vision_tasks.pop(session_id, set())
+                for vt in pending_vision:
+                    vt.cancel()
+                if pending_vision:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending_vision, return_exceptions=True),
+                            timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        clog.log("warning", "vision tasks did not drain within 2 s")
             self._active_session = None
             self._active_session_id = None
             self._main_loop = None
