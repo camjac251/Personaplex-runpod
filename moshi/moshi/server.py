@@ -651,6 +651,8 @@ class ServerState:
         # short-circuit until the next session starts.
         if self._vision_force_disabled:
             return
+        if session_id != self._active_session_id:
+            return
 
         # In-flight guard to prevent overlapping calls from corrupting the chain
         if session_id in self._vision_in_flight:
@@ -659,6 +661,26 @@ class ServerState:
 
         if self._http_session is None or self._http_session.closed:
             self._http_session = aiohttp.ClientSession()
+
+        def _disable_vision(notice: str) -> None:
+            if session_id != self._active_session_id:
+                return
+            self._vision_force_disabled = True
+            clog.log(
+                "warning",
+                f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
+            )
+            try:
+                sess = self._active_session
+                if sess is not None:
+                    sess.send_vision_status(False)
+                    sess.send_notice(notice)
+            except Exception as exc:
+                logger.warning(
+                    "auto-disable notify failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         try:
             prev_id = self._interaction_ids.get(session_id)
@@ -712,31 +734,15 @@ class ServerState:
 
             headers = {"Api-Revision": "2026-05-20"}
             async with self._http_session.post(url, json=payload, headers=headers) as resp:
+                if session_id != self._active_session_id:
+                    clog.log(
+                        "warning",
+                        "vision: late response after session close; dropping",
+                    )
+                    return
                 if resp.status == 200:
-                    self._gemini_consecutive_errors = 0
                     data = await resp.json()
                     new_id = data.get("id")
-                    if new_id:
-                        # Drop the write if the session rolled over while
-                        # we were awaiting Gemini. Otherwise teardown's
-                        # _interaction_ids.pop already ran (no-op then)
-                        # and this would resurrect a dead entry.
-                        if session_id == self._active_session_id:
-                            self._interaction_ids[session_id] = new_id
-                        else:
-                            clog.log(
-                                "warning",
-                                "vision: late response after session close; dropping chain id",
-                            )
-                    else:
-                        # Missing id means the Interactions chain is
-                        # effectively reset; drop the prior id so the
-                        # next call starts fresh with the system prompt.
-                        clog.log(
-                            "warning",
-                            "Gemini response missing 'id'; dropping chain",
-                        )
-                        self._interaction_ids.pop(session_id, None)
                     
                     # Interactions API "new schema" (opt-in today via
                     # Api-Revision: 2026-05-20, default 2026-05-26).
@@ -761,103 +767,98 @@ class ServerState:
                             "warning",
                             f"Gemini returned no text (steps={len(steps)})",
                         )
-                    else:
-                        clog.log("info", f"vision: {text}")
-                        # Surface the description to the client UI.
-                        # Non-blocking; failure is non-fatal but log it.
-                        try:
-                            sess = self._active_session
-                            if sess is not None:
-                                sess.send_vision_caption(text)
-                                # Optional: echo the description into the
-                                # main transcript with a [vision] prefix
-                                # so the user can see what context the
-                                # model is getting fed.
-                                if self._vision_in_transcript:
-                                    sess.send_text(f" [vision] {text} ")
-                        except Exception as exc:
-                            clog.log(
-                                "warning",
-                                f"send_vision_caption failed: {type(exc).__name__}: {exc}",
+                        self._interaction_ids.pop(session_id, None)
+                        self._gemini_consecutive_errors += 1
+                        if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
+                            _disable_vision(
+                                "Vision auto-disabled after repeated empty Gemini responses"
                             )
-                        # Inject the raw description. No `<system>` wrap:
-                        # PersonaPlex was trained with `<system>` only at
-                        # t=0, so embedding it mid-stream is the most
-                        # off-distribution part of the path. The empirical
-                        # community recipe (VAOS gist, jmanhype 2026-02)
-                        # drip-feeds the bare text at Mimi cadence and the
-                        # state machine in _process_audio_frame gates the
-                        # outbound audio while it does.
-                        tokens = self.text_tokenizer.encode(f" {text}")
+                        return
 
-                        def _set_vision_context() -> None:
-                            with self._infer_lock:
-                                # asyncio.create_task can't cancel executor
-                                # work mid-flight, so the per-session drain
-                                # in _run_rtc_session.finally may return
-                                # before this function runs. Gate the
-                                # mutation on the active session id so a
-                                # late Gemini response from a closed
-                                # session can't clobber the next session's
-                                # pending queue.
-                                if session_id != self._active_session_id:
-                                    return
-                                # Replace pending queue: latest scene wins.
-                                # An in-flight inject finishes its already-
-                                # popped tokens; the next window picks up
-                                # the fresh context.
-                                self._vision_pending.clear()
-                                self._vision_pending.extend(
-                                    tokens[:VISION_QUEUE_MAX]
-                                )
+                    self._gemini_consecutive_errors = 0
+                    if new_id:
+                        self._interaction_ids[session_id] = new_id
+                    else:
+                        # Missing id means the Interactions chain is
+                        # effectively reset; drop the prior id so the
+                        # next call starts fresh with the system prompt.
+                        clog.log(
+                            "warning",
+                            "Gemini response missing 'id'; dropping chain",
+                        )
+                        self._interaction_ids.pop(session_id, None)
 
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, _set_vision_context)
+                    clog.log("info", f"vision: {text}")
+                    # Surface the description to the client UI.
+                    # Non-blocking; failure is non-fatal but log it.
+                    try:
+                        sess = self._active_session
+                        if sess is not None:
+                            sess.send_vision_caption(text)
+                            # Optional: echo the description into the
+                            # main transcript with a [vision] prefix
+                            # so the user can see what context the
+                            # model is getting fed.
+                            if self._vision_in_transcript:
+                                sess.send_text(f" [vision] {text} ")
+                    except Exception as exc:
+                        clog.log(
+                            "warning",
+                            f"send_vision_caption failed: {type(exc).__name__}: {exc}",
+                        )
+                    # Inject the raw description. No `<system>` wrap:
+                    # PersonaPlex was trained with `<system>` only at
+                    # t=0, so embedding it mid-stream is the most
+                    # off-distribution part of the path. The empirical
+                    # community recipe (VAOS gist, jmanhype 2026-02)
+                    # drip-feeds the bare text at Mimi cadence and the
+                    # state machine in _process_audio_frame gates the
+                    # outbound audio while it does.
+                    tokens = self.text_tokenizer.encode(f" {text}")
+
+                    def _set_vision_context() -> None:
+                        with self._infer_lock:
+                            # asyncio.create_task can't cancel executor
+                            # work mid-flight, so the per-session drain
+                            # in _run_rtc_session.finally may return
+                            # before this function runs. Gate the
+                            # mutation on the active session id so a
+                            # late Gemini response from a closed
+                            # session can't clobber the next session's
+                            # pending queue.
+                            if session_id != self._active_session_id:
+                                return
+                            # Replace pending queue: latest scene wins.
+                            # An in-flight inject finishes its already-
+                            # popped tokens; the next window picks up
+                            # the fresh context.
+                            self._vision_pending.clear()
+                            self._vision_pending.extend(
+                                tokens[:VISION_QUEUE_MAX]
+                            )
+
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, _set_vision_context)
                 else:
                     err_text = await resp.text()
                     clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
                     self._interaction_ids.pop(session_id, None)
                     self._gemini_consecutive_errors += 1
                     if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
-                        self._vision_force_disabled = True
-                        clog.log(
-                            "warning",
-                            f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
+                        _disable_vision(
+                            f"Vision auto-disabled after {VISION_AUTO_DISABLE_THRESHOLD} consecutive errors: {err_text[:120]}"
                         )
-                        try:
-                            sess = self._active_session
-                            if sess is not None:
-                                sess.send_vision_status(False)
-                                sess.send_notice(
-                                    f"Vision auto-disabled after {VISION_AUTO_DISABLE_THRESHOLD} consecutive errors: {err_text[:120]}"
-                                )
-                        except Exception as exc:
-                            logger.warning(
-                                "auto-disable notify failed: %s: %s",
-                                type(exc).__name__,
-                                exc,
-                            )
         except aiohttp.ClientError as exc:
+            if session_id != self._active_session_id:
+                clog.log(
+                    "warning",
+                    "vision: late transport error after session close; dropping",
+                )
+                return
             clog.log("warning", f"vision transport error: {type(exc).__name__}: {exc}")
             self._gemini_consecutive_errors += 1
             if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
-                self._vision_force_disabled = True
-                clog.log(
-                    "warning",
-                    f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
-                )
-                # mirror the existing client-notify pattern from the 4xx branch
-                try:
-                    sess = self._active_session
-                    if sess is not None:
-                        sess.send_vision_status(False)
-                        sess.send_notice("Vision auto-disabled after repeated transport errors")
-                except Exception as notify_exc:
-                    logger.warning(
-                        "auto-disable notify failed: %s: %s",
-                        type(notify_exc).__name__,
-                        notify_exc,
-                    )
+                _disable_vision("Vision auto-disabled after repeated transport errors")
         except Exception as exc:
             logger.exception(
                 "vision processing failed (code error, not transport): %s: %s",
@@ -1412,15 +1413,20 @@ class ServerState:
                             )
                             return
                         detail = bool(msg.get("detail", False))
+                        tasks = self._vision_tasks.get(session_id)
+                        if (
+                            tasks is None
+                            or not session.is_alive()
+                            or session_id != self._active_session_id
+                        ):
+                            return
                         task = asyncio.create_task(
                             self.handle_vision_frame(
                                 session_id, base64_data, clog, detail=detail
                             )
                         )
-                        tasks = self._vision_tasks.get(session_id)
-                        if tasks is not None:
-                            tasks.add(task)
-                            task.add_done_callback(tasks.discard)
+                        tasks.add(task)
+                        task.add_done_callback(tasks.discard)
 
             session.set_message_handler(on_message)
 
