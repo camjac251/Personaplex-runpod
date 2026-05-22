@@ -155,6 +155,10 @@ AUTO_REWIND_MIN_INTERVAL_SEC = 60.0
 # silently retrying a broken schema for the full session lifetime.
 VISION_AUTO_DISABLE_THRESHOLD = 3
 
+# Bound each Gemini request so one stuck HTTP call cannot hold the
+# per-session _vision_in_flight guard and silently stop future captures.
+GEMINI_REQUEST_TIMEOUT_SEC = 12.0
+
 
 class ServerState:
     """Per-process state: models, locks, vision pipeline, session bookkeeping.
@@ -733,7 +737,10 @@ class ServerState:
                 payload["previous_interaction_id"] = prev_id
 
             headers = {"Api-Revision": "2026-05-20"}
-            async with self._http_session.post(url, json=payload, headers=headers) as resp:
+            timeout = aiohttp.ClientTimeout(total=GEMINI_REQUEST_TIMEOUT_SEC)
+            async with self._http_session.post(
+                url, json=payload, headers=headers, timeout=timeout
+            ) as resp:
                 if session_id != self._active_session_id:
                     clog.log(
                         "warning",
@@ -848,7 +855,7 @@ class ServerState:
                         _disable_vision(
                             f"Vision auto-disabled after {VISION_AUTO_DISABLE_THRESHOLD} consecutive errors: {err_text[:120]}"
                         )
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if session_id != self._active_session_id:
                 clog.log(
                     "warning",
