@@ -1445,6 +1445,7 @@ class ServerState:
             warmup_done = asyncio.Event()
 
             async def snapshot_task():
+                snapshot_future = None
                 try:
                     await warmup_done.wait()
                     while session.is_alive():
@@ -1456,7 +1457,11 @@ class ServerState:
                         if not session.is_alive():
                             break
                         clog.log("info", "taking session snapshot")
-                        snap = await loop.run_in_executor(None, self._take_snapshot)
+                        snapshot_future = asyncio.ensure_future(
+                            loop.run_in_executor(None, self._take_snapshot)
+                        )
+                        snap = await asyncio.shield(snapshot_future)
+                        snapshot_future = None
                         # Teardown can pop the bucket while the executor is
                         # cloning. setdefault here would resurrect a stale
                         # entry that lives forever.
@@ -1470,7 +1475,12 @@ class ServerState:
                         if len(history) > 5:
                             history.pop(0)
                 except asyncio.CancelledError:
-                    pass
+                    if snapshot_future is not None and not snapshot_future.done():
+                        try:
+                            await snapshot_future
+                        except BaseException:
+                            pass
+                    raise
 
             _snap_t = asyncio.create_task(snapshot_task())
             self._session_tasks.add(_snap_t)
