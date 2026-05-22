@@ -71,7 +71,7 @@ Pick a GPU with at least 12 GB VRAM (RTX 4090 / A6000 / L40S all work). Start th
 
 First boot downloads ~14 GB of weights and voice prompts. Expect 30-60 minutes depending on the data centre. The volume disk caches them, so subsequent boots reach "ready" in under a minute.
 
-When the server log prints `Serving embedded web client (no build required)`, open the proxy URL from the pod (looks like `https://<pod-id>-8998.proxy.runpod.net/`). Click **Connect**, allow microphone access, and speak.
+When the server log prints `serving static content from`, open the proxy URL from the pod (looks like `https://<pod-id>-8998.proxy.runpod.net/`). Click **Start**, allow microphone access, and speak.
 
 To confirm TURN is doing its job: open `chrome://webrtc-internals` in another tab while a session is live. The active candidate pair under `selectedCandidatePairId` should have `relayProtocol: tcp` or `udp` and a remote address pointing at `turn.cloudflare.com`. If it shows `host` or `srflx` and you see no audio, TURN didn't engage.
 
@@ -141,7 +141,9 @@ If you want to run outside RunPod (LAN only, no TURN required since both peers c
 
 ```bash
 uv sync --frozen
-uv run moshi-server --host 127.0.0.1 --port 8998 --static none --voice-prompt-dir voices
+bun install --frozen-lockfile
+bun run frontend:build
+uv run moshi-server --host 127.0.0.1 --port 8998 --voice-prompt-dir voices
 ```
 
 Voice prompts need to be downloaded manually (see `start.sh` for the HuggingFace pull recipe) or symlinked from a previous RunPod volume.

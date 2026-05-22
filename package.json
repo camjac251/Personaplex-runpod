@@ -8,6 +8,10 @@
     "build": "bun run --cwd frontend build",
     "frontend:build": "bun run --cwd frontend build",
     "frontend:dev": "bun run --cwd frontend dev",
-    "frontend:preview": "bun run --cwd frontend preview"
+    "frontend:preview": "bun run --cwd frontend preview",
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "lefthook": "^2.1.8"
   }
 }

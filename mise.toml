@@ -1,0 +1,6 @@
+[tools]
+bun = "1.3.14"
+
+[tasks.frontend-build]
+description = "Build the committed React dashboard bundle"
+run = "bun run frontend:build"

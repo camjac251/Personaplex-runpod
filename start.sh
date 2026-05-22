@@ -106,5 +106,4 @@ log "starting moshi-server on :8998"
 exec uv run --frozen moshi-server \
     --host 0.0.0.0 \
     --port 8998 \
-    --static none \
     --voice-prompt-dir voices

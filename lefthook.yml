@@ -1,5 +1,4 @@
 pre-commit:
   commands:
     frontend-build:
-      glob: "frontend/**/*.{js,jsx,css,html,json}"
       run: bun run frontend:build && git add moshi/moshi/web_client
