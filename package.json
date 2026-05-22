@@ -1,0 +1,13 @@
+{
+  "name": "personaplex-runpod-workspace",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "build": "bun run --cwd frontend build",
+    "frontend:build": "bun run --cwd frontend build",
+    "frontend:dev": "bun run --cwd frontend dev",
+    "frontend:preview": "bun run --cwd frontend preview"
+  }
+}
