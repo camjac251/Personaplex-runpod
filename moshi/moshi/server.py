@@ -3064,9 +3064,10 @@ def main():
                 }
             } else if (msg.type === 'request_vision_frame') {
                 // Server is asking for a fresh frame (model just went
-                // quiet). Honor the request via the normal automatic
-                // capture path; motion gate still applies.
-                if (visionStream && !visionPaused) captureFrame(false);
+                // quiet). The model is bored; honor the request even if
+                // the scene barely changed. Motion-gate would otherwise
+                // suppress every server-driven capture for static views.
+                if (visionStream && !visionPaused) captureFrame(false, true);
             } else if (msg.type === 'vision_inject') {
                 // Server has begun (or finished) drip-feeding a Gemini
                 // description into the model's text channel. Surface it
@@ -3459,6 +3460,11 @@ def main():
                 visionStream.getTracks().forEach(t => t.stop());
                 visionStream = null;
             }
+            // Drop the motion-gate baseline so the next session starts
+            // from scratch. Without this, the first auto-capture after
+            // a reconnect is compared against the previous session's
+            // last frame and gets dropped when the scene looks similar.
+            visionLastFrameData = null;
             if (visionContainer) visionContainer.classList.remove('active');
             if (visionBtn) {
                 visionBtn.classList.remove('active');
@@ -3490,12 +3496,15 @@ def main():
         const VISION_MOTION_THRESHOLD = 0.04; // mean abs delta on 0..1 scale
 
         // Two-tier capture settings.
-        //   Automatic frames: /2 downscale, JPEG 0.55. Small HUD text
-        //     stays legible at typical FOV; payload stays small.
+        //   Automatic frames: /2 downscale, JPEG 0.55. Keeps the payload
+        //     small for cheap Gemini calls.
         //   Detail frames (user-requested via Capture Now): native
-        //     resolution, JPEG 0.8. For when you specifically want
-        //     nametags / fine HUD readouts to be readable.
-        async function captureFrame(detail) {
+        //     resolution, JPEG 0.8. For when text or fine detail needs
+        //     to be readable.
+        // `force` bypasses the motion gate. Server-driven captures and
+        // Capture Now both set it; the fallback interval does not, so
+        // an idle observer doesn't burn Gemini calls on a frozen scene.
+        async function captureFrame(detail, force) {
             if (!visionStream || !controlChannel || controlChannel.readyState !== 'open') return;
 
             const divisor = detail ? 1 : 2;
@@ -3507,9 +3516,9 @@ def main():
             const ctx = canvas.getContext('2d');
             ctx.drawImage(visionVideo, 0, 0, canvas.width, canvas.height);
 
-            // Motion gate: subsampled mean abs pixel delta. Detail frames
-            // bypass the gate since the user explicitly asked for one.
-            if (!detail) {
+            // Motion gate: subsampled mean abs pixel delta. Skipped when
+            // `detail` or `force` is set (user/server explicitly asked).
+            if (!detail && !force) {
                 const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
                 if (visionLastFrameData && visionLastFrameData.length === frame.data.length) {
                     let diff = 0;
@@ -3517,7 +3526,10 @@ def main():
                         diff += Math.abs(frame.data[i] - visionLastFrameData[i]);
                     }
                     const meanDelta = diff / (frame.data.length / 16) / 255;
-                    if (meanDelta < VISION_MOTION_THRESHOLD) return;
+                    if (meanDelta < VISION_MOTION_THRESHOLD) {
+                        console.debug('vision: motion gate suppressed frame (delta=' + meanDelta.toFixed(4) + ')');
+                        return;
+                    }
                 }
                 visionLastFrameData = new Uint8ClampedArray(frame.data);
             }
