@@ -206,7 +206,7 @@ class SessionConfig:
     audio_topk: int = 250
     repetition_penalty: float = 1.15
     repetition_penalty_context: int = 64
-    # zero defaults mean a partial client payload silently disables collapse protection
+    # Keep these aligned with the embedded client's advanced slider defaults.
     padding_bonus: float = 1.0
     max_turn_text_tokens: int = 120
 
@@ -545,24 +545,42 @@ class RTCSession:
         kind = payload.get("type")
         if kind == "config":
             try:
+                defaults = SessionConfig()
                 seed_raw = payload.get("seed")
                 seed = None if seed_raw is None else int(seed_raw)
                 cfg = SessionConfig(
-                    voice_prompt=str(payload.get("voice_prompt", "")),
-                    text_prompt=str(payload.get("text_prompt", "")),
-                    vision_prompt=str(payload.get("vision_prompt", "")),
-                    vision_in_transcript=bool(payload.get("vision_in_transcript", False)),
-                    seed=seed,
-                    audio_temperature=float(payload.get("audio_temperature", 0.7)),
-                    text_temperature=float(payload.get("text_temperature", 0.7)),
-                    text_topk=int(payload.get("text_topk", 25)),
-                    audio_topk=int(payload.get("audio_topk", 250)),
-                    repetition_penalty=float(payload.get("repetition_penalty", 1.2)),
-                    repetition_penalty_context=int(
-                        payload.get("repetition_penalty_context", 64)
+                    voice_prompt=str(payload.get("voice_prompt", defaults.voice_prompt)),
+                    text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
+                    vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
+                    vision_in_transcript=bool(
+                        payload.get("vision_in_transcript", defaults.vision_in_transcript)
                     ),
-                    padding_bonus=float(payload.get("padding_bonus", 0.0)),
-                    max_turn_text_tokens=int(payload.get("max_turn_text_tokens", 0)),
+                    seed=seed,
+                    audio_temperature=float(
+                        payload.get("audio_temperature", defaults.audio_temperature)
+                    ),
+                    text_temperature=float(
+                        payload.get("text_temperature", defaults.text_temperature)
+                    ),
+                    text_topk=int(payload.get("text_topk", defaults.text_topk)),
+                    audio_topk=int(payload.get("audio_topk", defaults.audio_topk)),
+                    repetition_penalty=float(
+                        payload.get("repetition_penalty", defaults.repetition_penalty)
+                    ),
+                    repetition_penalty_context=int(
+                        payload.get(
+                            "repetition_penalty_context",
+                            defaults.repetition_penalty_context,
+                        )
+                    ),
+                    padding_bonus=float(
+                        payload.get("padding_bonus", defaults.padding_bonus)
+                    ),
+                    max_turn_text_tokens=int(
+                        payload.get(
+                            "max_turn_text_tokens", defaults.max_turn_text_tokens
+                        )
+                    ),
                 )
             except (TypeError, ValueError) as exc:
                 self._log("warning", f"control: bad config: {exc}")

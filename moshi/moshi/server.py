@@ -2275,9 +2275,9 @@ def main():
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Repetition penalty</span>
-                                <span class="slider-value" id="repPenaltyValue">1.20</span>
+                                <span class="slider-value" id="repPenaltyValue">1.15</span>
                             </div>
-                            <input type="range" id="repPenaltySlider" min="1.0" max="2.0" step="0.05" value="1.2">
+                            <input type="range" id="repPenaltySlider" min="1.0" max="2.0" step="0.05" value="1.15">
                             <div class="slider-hint">1.0 = off. 1.1-1.3 = gentle. 1.5+ = aggressive. Stops the model from looping.</div>
                         </div>
                         <div class="slider-row">
@@ -2291,18 +2291,18 @@ def main():
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Padding bonus</span>
-                                <span class="slider-value" id="padBonusValue">0.0</span>
+                                <span class="slider-value" id="padBonusValue">1.0</span>
                             </div>
-                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="0">
+                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="1.0">
                             <div class="slider-hint">Biases the model toward silence tokens. 0 = off. 2-4 stops rambling by making it yield the turn sooner.</div>
                         </div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Max turn length (tokens)</span>
-                                <span class="slider-value" id="maxTurnValue">0</span>
+                                <span class="slider-value" id="maxTurnValue">120</span>
                             </div>
-                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="0">
-                            <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 500 ≈ 40 s sustained talk. Safety net under padding_bonus.</div>
+                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="10" value="120">
+                            <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 120 ≈ 10 s sustained talk. Safety net under padding_bonus.</div>
                         </div>
                         <div class="slider-group-title">Microphone input</div>
                         <div class="toggle-row">
@@ -2624,9 +2624,9 @@ def main():
         const ADVANCED_DEFAULTS = {
             textTemp: 0.7, textTopk: 25,
             audioTemp: 0.7, audioTopk: 250,
-            repPenalty: 1.2, repContext: 64,
-            padBonus: 0.0,
-            maxTurn: 0,
+            repPenalty: 1.15, repContext: 64,
+            padBonus: 1.0,
+            maxTurn: 120,
         };
         const advancedToggle = document.getElementById('advancedToggle');
         const advancedBody = document.getElementById('advancedBody');
