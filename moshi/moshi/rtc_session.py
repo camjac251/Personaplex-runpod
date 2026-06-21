@@ -157,6 +157,14 @@ class MimiOutputTrack(MediaStreamTrack):
             if self._buffer.size > OUTBOUND_BUFFER_CAP_SAMPLES:
                 self._buffer = self._buffer[-OUTBOUND_BUFFER_CAP_SAMPLES:]
 
+    async def clear_buffer(self) -> None:
+        """Drop queued assistant audio immediately."""
+        async with self._buffer_lock:
+            self._buffer = np.empty(0, dtype=np.float32)
+            self._resampler = AudioResampler(
+                format="s16", layout="mono", rate=WEBRTC_SAMPLE_RATE
+            )
+
     async def _pop_chunk(self) -> np.ndarray:
         async with self._buffer_lock:
             if self._buffer.size >= OUTBOUND_FRAME_SAMPLES:
@@ -196,9 +204,30 @@ class SessionConfig:
     """
 
     voice_prompt: str = ""
+    # Optional second voice and the secondary mix share in 0.0..1.0 for a
+    # blended voice prefix. Blend is active only when voice_prompt_b is set,
+    # differs from voice_prompt, and voice_blend_mix > 0.0; otherwise the
+    # server loads the single primary voice. Connect-time only, like the rest
+    # of the voice prefix: a blended prompt re-primes the stream, so it is
+    # fixed for the session and never updated live.
+    voice_prompt_b: str = ""
+    voice_blend_mix: float = 0.0
+    # How strongly an uploaded clip conditions the timbre, in 0.0..1.0:
+    # the fraction of the clip's prefix replayed during priming, taken from
+    # the tail. 1.0 replays the whole clip (current behavior); lower values
+    # condition less; 0.0 leaves the model's own voice. Only the raw-audio
+    # upload path uses it; preset and blend prompts ignore it. Re-priming the
+    # stream is reset-required, so this is connect-only like the rest of the
+    # voice prefix and never updated live.
+    clone_strength: float = 1.0
     text_prompt: str = ""
     vision_prompt: str = ""
     vision_in_transcript: bool = False
+    # Connect-time toggle: when set, the server periodically re-asserts the
+    # persona body into the model's text channel during pad/silence windows
+    # to counter long-session drift. Conditioning-adjacent, so it is fixed
+    # for the session like the rest of the persona block.
+    reinforce_in_silences: bool = False
     seed: Optional[int] = None
     audio_temperature: float = 0.7
     text_temperature: float = 0.7
@@ -209,6 +238,18 @@ class SessionConfig:
     # Keep these aligned with the embedded client's advanced slider defaults.
     padding_bonus: float = 1.0
     max_turn_text_tokens: int = 120
+    # Session length cap in seconds; 0 disables the watchdog (no time bound).
+    # The client sends minutes converted to seconds, so the server stores and
+    # compares seconds directly. Named for duration, not idle, so a future
+    # reset-on-activity timer can reuse the field without a wire change.
+    session_timeout_sec: int = 0
+    # Per-session external-vision spend guard. 0 (or absent) means no
+    # server-side ceiling; the browser may still enforce its own cutoff.
+    vision_cost_limit_usd: float = 0.0
+    # Per-frame cost estimate used to convert dispatched frames into an
+    # estimated dollar spend. Kept in sync with the client's estimate so the
+    # two ceilings agree. 0 disables the dollar conversion.
+    vision_cost_per_call_usd: float = 0.0
 
 
 class RTCSession:
@@ -262,6 +303,10 @@ class RTCSession:
         self._closed = asyncio.Event()
         self._on_config: Optional[Callable[[SessionConfig], Awaitable[None]]] = None
         self._on_message: Optional[Callable[[dict], Awaitable[None]]] = None
+        # Optional synchronous observer for each assistant PCM frame as it is
+        # pushed to the outbound track. Kept generic: the session has no
+        # knowledge of what consumes the audio. None means no observer.
+        self._on_pcm: Optional[Callable[[np.ndarray], None]] = None
         self._ready_sent = False
 
         @self._pc.on("track")
@@ -303,6 +348,17 @@ class RTCSession:
     ) -> None:
         self._on_message = handler
 
+    def set_pcm_observer(
+        self, observer: Optional[Callable[[np.ndarray], None]]
+    ) -> None:
+        """Register a synchronous per-frame observer for outbound PCM.
+
+        Called on the event loop with each assistant frame as it is pushed
+        to the track. The observer must be cheap and non-blocking; it sees
+        the same post-gate PCM the listener hears.
+        """
+        self._on_pcm = observer
+
     async def negotiate(self, offer: RTCSessionDescription) -> RTCSessionDescription:
         """Set remote offer, build answer, return immediately.
 
@@ -316,6 +372,24 @@ class RTCSession:
         frames will be received and queued (with the same 200 ms
         drop-newest cap as the old WS path), but no model inference
         runs until ``start_processing()`` is called.
+        """
+        await self._pc.setRemoteDescription(offer)
+        answer = await self._pc.createAnswer()
+        await self._pc.setLocalDescription(answer)
+        return self._pc.localDescription
+
+    async def renegotiate(
+        self, offer: RTCSessionDescription
+    ) -> RTCSessionDescription:
+        """Answer a fresh offer on the existing peer connection.
+
+        Used for an ICE restart: the client re-offers with a fresh ICE
+        ufrag/pwd, and this answers it on the live ``_pc`` without
+        rebuilding the connection. The inbound audio task, the outbound
+        track, and the control channel ride the same peer connection, so
+        no media or data state is recreated. Fresh server candidates from
+        this round flow out through the already-consuming
+        ``iter_local_candidates`` generator.
         """
         await self._pc.setRemoteDescription(offer)
         answer = await self._pc.createAnswer()
@@ -456,16 +530,34 @@ class RTCSession:
         except Exception as exc:
             self._log("warning", f"pc.close raised: {type(exc).__name__}: {exc}")
 
+    async def clear_output_audio(self) -> None:
+        await self._output_track.clear_buffer()
+
     def send_text(self, text: str) -> None:
         if self._control and self._control.readyState == "open":
             self._control.send(json.dumps({"type": "text", "v": text}))
 
-    def send_vision_caption(self, text: str) -> None:
-        """Push the latest vision-side scene description to the client UI."""
+    def send_user_text(self, text: str, final: bool = False) -> None:
+        """Push recognized user-side speech to the client transcript.
+
+        Optional feature: only the server's ASR path calls this. Mirrors
+        send_text's shape with an added `final` flag so the client can tell
+        a growing partial from a closed turn. Like every send helper it is a
+        plain method; the ASR worker runs off the event loop, so callers
+        there marshal it back via loop.call_soon_threadsafe (DataChannel.send
+        is not thread-safe)."""
         if self._control and self._control.readyState == "open":
             self._control.send(
-                json.dumps({"type": "vision_caption", "text": text})
+                json.dumps({"type": "user_text", "v": text, "final": bool(final)})
             )
+
+    def send_vision_caption(self, text: str, frame_id: str = "") -> None:
+        """Push the latest vision-side scene description to the client UI."""
+        if self._control and self._control.readyState == "open":
+            payload = {"type": "vision_caption", "text": text}
+            if frame_id:
+                payload["frame_id"] = frame_id
+            self._control.send(json.dumps(payload))
 
     def send_vision_status(self, enabled: bool) -> None:
         """Tell the client whether vision is available server-side."""
@@ -496,16 +588,84 @@ class RTCSession:
                 json.dumps({"type": "notice", "text": text})
             )
 
-    def send_ready(self) -> None:
+    def send_event(
+        self,
+        kind: str,
+        text: str,
+        level: str = "info",
+        data: Optional[dict] = None,
+    ) -> None:
+        """Structured event for the dashboard diagnostics rail."""
+        if self._control and self._control.readyState == "open":
+            payload = {"type": "event", "kind": kind, "text": text, "level": level}
+            if data is not None:
+                payload["data"] = data
+            self._control.send(json.dumps(payload))
+
+    def send_interrupted(self, reason: str) -> None:
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "interrupted", "reason": reason})
+            )
+
+    def send_ready(self, identity: Optional[dict] = None) -> None:
+        """Signal the client that warmup is done and the session is live.
+
+        Optional accelerator/build identity is folded into the one-shot
+        payload; absent fields are simply not sent so an older client keeps
+        working.
+        """
         if self._ready_sent:
             return
         if self._control and self._control.readyState == "open":
-            self._control.send(json.dumps({"type": "ready"}))
+            payload = {"type": "ready"}
+            if identity:
+                payload.update(identity)
+            self._control.send(json.dumps(payload))
             self._ready_sent = True
+
+    def send_stat(
+        self,
+        vram_used: Optional[int] = None,
+        gpu_util: Optional[int] = None,
+        rtf: Optional[float] = None,
+    ) -> None:
+        """Periodic accelerator-memory / utilization / inference-health readout.
+
+        Fields that could not be sampled are omitted; sending an empty stat
+        is a no-op so the timer never floods the channel with bare frames.
+        ``rtf`` is the server-measured real-time factor (compute time per
+        audio frame / that frame's audio duration); the client reads only
+        the fields it knows, so consumers compose without ordering.
+        """
+        if not (self._control and self._control.readyState == "open"):
+            return
+        payload = {"type": "stat"}
+        if vram_used is not None:
+            payload["vram_used"] = int(vram_used)
+        if gpu_util is not None:
+            payload["gpu_util"] = int(gpu_util)
+        if rtf is not None:
+            payload["rtf"] = round(float(rtf), 3)
+        if len(payload) == 1:
+            return
+        self._control.send(json.dumps(payload))
 
     def send_error(self, reason: str) -> None:
         if self._control and self._control.readyState == "open":
             self._control.send(json.dumps({"type": "error", "reason": reason}))
+
+    def send_pong(self, t: object, seq: Optional[int] = None) -> None:
+        """Echo a heartbeat ping so the client can measure app-level RTT.
+
+        `t` is the client's opaque send timestamp, returned verbatim; `seq`
+        lets the client match replies to sends and count drops.
+        """
+        if self._control and self._control.readyState == "open":
+            payload = {"type": "pong", "t": t}
+            if seq is not None:
+                payload["seq"] = seq
+            self._control.send(json.dumps(payload))
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -543,17 +703,60 @@ class RTCSession:
             )
             return
         kind = payload.get("type")
-        if kind == "config":
+        if kind == "ping":
+            t = payload.get("t")
+            if not isinstance(t, (int, float)) or isinstance(t, bool):
+                self._log("warning", f"control: ping missing/bad 't': {t!r}")
+                return
+            seq_raw = payload.get("seq")
+            seq = None
+            if seq_raw is not None:
+                if isinstance(seq_raw, int) and not isinstance(seq_raw, bool):
+                    seq = seq_raw
+                else:
+                    self._log("warning", f"control: ping bad 'seq': {seq_raw!r}")
+            self.send_pong(t, seq)
+        elif kind == "config":
             try:
                 defaults = SessionConfig()
                 seed_raw = payload.get("seed")
                 seed = None if seed_raw is None else int(seed_raw)
                 cfg = SessionConfig(
                     voice_prompt=str(payload.get("voice_prompt", defaults.voice_prompt)),
+                    voice_prompt_b=str(
+                        payload.get("voice_prompt_b", defaults.voice_prompt_b)
+                    ),
+                    voice_blend_mix=max(
+                        0.0,
+                        min(
+                            1.0,
+                            float(
+                                payload.get(
+                                    "voice_blend_mix", defaults.voice_blend_mix
+                                )
+                            ),
+                        ),
+                    ),
+                    clone_strength=max(
+                        0.0,
+                        min(
+                            1.0,
+                            float(
+                                payload.get(
+                                    "clone_strength", defaults.clone_strength
+                                )
+                            ),
+                        ),
+                    ),
                     text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
                     vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
                     vision_in_transcript=bool(
                         payload.get("vision_in_transcript", defaults.vision_in_transcript)
+                    ),
+                    reinforce_in_silences=bool(
+                        payload.get(
+                            "reinforce_in_silences", defaults.reinforce_in_silences
+                        )
                     ),
                     seed=seed,
                     audio_temperature=float(
@@ -580,6 +783,33 @@ class RTCSession:
                         payload.get(
                             "max_turn_text_tokens", defaults.max_turn_text_tokens
                         )
+                    ),
+                    session_timeout_sec=max(
+                        0,
+                        int(
+                            payload.get(
+                                "session_timeout_sec",
+                                defaults.session_timeout_sec,
+                            )
+                        ),
+                    ),
+                    vision_cost_limit_usd=max(
+                        0.0,
+                        float(
+                            payload.get(
+                                "vision_cost_limit_usd",
+                                defaults.vision_cost_limit_usd,
+                            )
+                        ),
+                    ),
+                    vision_cost_per_call_usd=max(
+                        0.0,
+                        float(
+                            payload.get(
+                                "vision_cost_per_call_usd",
+                                defaults.vision_cost_per_call_usd,
+                            )
+                        ),
                     ),
                 )
             except (TypeError, ValueError) as exc:
@@ -661,9 +891,10 @@ class RTCSession:
                             pass
                         raise
                     for pcm_data, text in results:
-                        await self._output_track.push_24k_f32(
-                            pcm_data.astype(np.float32)
-                        )
+                        frame_f32 = pcm_data.astype(np.float32)
+                        await self._output_track.push_24k_f32(frame_f32)
+                        if self._on_pcm is not None:
+                            self._on_pcm(frame_f32)
                         if text is not None:
                             self.send_text(text)
         except asyncio.CancelledError:

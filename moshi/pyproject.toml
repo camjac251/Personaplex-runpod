@@ -23,6 +23,14 @@ license = {text = "MIT"}
 dynamic = ["version"]
 readme = "README.md"
 
+[project.optional-dependencies]
+# Optional second model for transcribing the user's microphone audio,
+# enabled at runtime with --enable-asr. Kept out of the default
+# dependencies so `uv sync --frozen` installs are unaffected; install
+# with `uv pip install faster-whisper` (or `pip install moshi-personaplex[asr]`)
+# only on hosts with the GPU headroom for a second model.
+asr = ["faster-whisper>=1.0"]
+
 [project.scripts]
 moshi-server = "moshi.server:main"
 moshi-offline = "moshi.offline:main"

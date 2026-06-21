@@ -733,6 +733,13 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        # Fraction of an uploaded clip's prefix replayed during priming, in
+        # 0.0..1.0. 1.0 replays the whole clip; lower values replay only the
+        # tail (most recent audio), which conditions less strongly; 0.0
+        # replays nothing, leaving the model's own voice. Only the raw-audio
+        # upload path reads this; the embeddings-replay and blend paths ignore
+        # it. Set at connect time before priming, never live.
+        self.voice_prompt_strength: float = 1.0
         # Missing: Mimi encoder streaming state is not captured alongside the LM
         # state. When a saved voice prompt is loaded mid-session the LM cache
         # resumes mid-stream but the Mimi encoder restarts at t=0, so the
@@ -1013,7 +1020,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
         state.cache[:, 0, target_position] = torch.where(
             ~state.provided[:, 0, target_position],
-            sampled_text_token,
+            next_text_token,
             state.cache[:, 0, target_position],
         )
         state.cache[:, 1 : lm_model.dep_q + 1, target_position] = torch.where(
@@ -1107,6 +1114,36 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache = data["cache"].to(self.lm_model.device)
         self.voice_prompt = path
 
+    def _load_voice_prompt_embedding_sequence(self, path: str) -> torch.Tensor:
+        """Load a voice's stacked per-frame embeddings from a legacy .pt file.
+
+        Returns the (T, ...) embedding sequence on the model device, matching
+        the device placement of the legacy load path in
+        load_voice_prompt_embeddings. Blending operates on this per-frame
+        replay representation, not the full streaming-state (.safetensors)
+        form, which is a wholesale state overwrite and cannot be mixed.
+        """
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        return data["embeddings"].to(self.lm_model.device)
+
+    def load_voice_prompt_blend(self, path_a: str, path_b: str, mix: float):
+        """Condition on a frame-aligned mix of two voices' per-frame embeddings.
+
+        `mix` is the secondary share in 0..1: 0.0 is all primary, 1.0 is all
+        secondary. The two sequences are aligned to the shorter length and
+        combined elementwise as (1 - mix) * a + mix * b, then replayed through
+        the LM by the existing voice-prompt replay path. The final cache is
+        left unset so the replay rebuilds it for the blended trajectory.
+        """
+        seq_a = self._load_voice_prompt_embedding_sequence(path_a)
+        seq_b = self._load_voice_prompt_embedding_sequence(path_b)
+        n = min(seq_a.shape[0], seq_b.shape[0])
+        blended = (1.0 - mix) * seq_a[:n] + mix * seq_b[:n]
+        self.voice_prompt_audio = None
+        self.voice_prompt_embeddings = blended
+        self.voice_prompt_cache = None
+        self.voice_prompt = f"{path_a}+{path_b}@{mix:.2f}"
+
     def _encode_zero_frame(self) -> torch.Tensor:
         return torch.as_tensor(
             SILENCE_TOKENS,
@@ -1121,11 +1158,33 @@ class LMGen(StreamingModule[_LMGenState]):
             device=self.lm_model.device,
         ).view(1, 8, 1)
 
+    def _strength_sliced_voice_prompt_audio(self):
+        """Tail slice of the uploaded clip selected by voice_prompt_strength.
+
+        The clip primes the cache frame by frame; replaying fewer frames
+        conditions less strongly. Keeping the tail makes the most recent
+        audio the last thing the cache sees, so the kept slice dominates.
+        Strength 1.0 keeps the whole clip (current behavior), 0.0 keeps
+        nothing (the model's own voice). Returns the slice as a (C, T')
+        array on the same axis layout the encoder iterator expects.
+        """
+        audio = self.voice_prompt_audio
+        strength = max(0.0, min(1.0, self.voice_prompt_strength))
+        if strength >= 1.0:
+            return audio
+        total_samples = audio.shape[-1]
+        total_frames = -(-total_samples // self._frame_size)  # ceil
+        keep_frames = round(total_frames * strength)
+        if keep_frames <= 0:
+            return audio[:, :0]
+        keep_samples = min(total_samples, keep_frames * self._frame_size)
+        return audio[:, -keep_samples:]
+
     def _encode_voice_prompt_frames(self, mimi):
         return encode_from_sphn(
             mimi,
             _iterate_audio(
-                self.voice_prompt_audio,
+                self._strength_sliced_voice_prompt_audio(),
                 sample_interval_size=self._frame_size,
                 pad=True,
             ),
@@ -1159,8 +1218,13 @@ class LMGen(StreamingModule[_LMGenState]):
                 yield
                 self.step_embeddings(next_embed)
 
-            state = self._streaming_state
-            state.cache.copy_(self.voice_prompt_cache)
+            # A blended prompt has no stored final cache: the cache it would
+            # restore belongs to neither source voice, so replaying the
+            # blended sequence is what builds the correct cache. Only the
+            # single-voice .pt path carries a saved final cache to copy in.
+            if self.voice_prompt_cache is not None:
+                state = self._streaming_state
+                state.cache.copy_(self.voice_prompt_cache)
             return
 
         elif self.voice_prompt_audio is not None:
@@ -1308,4 +1372,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-
