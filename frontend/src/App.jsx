@@ -101,12 +101,12 @@ function App() {
   const [levels, setLevels] = useState({ mic: 0, ai: 0 });
   const [speaking, setSpeaking] = useState(null);
   const [interrupting, setInterrupting] = useState(false);
-  const [transcriptText, setTranscriptText] = useState("");
+  const [_transcriptText, setTranscriptText] = useState("");
   // AI transcript split into per-turn segments for chronological rendering.
   // Each entry is { id, at, text }; a new segment opens on the same
   // turn-boundary signal that drives the session timeline (a >1600 ms gap
-  // between text chunks). transcriptText stays as the flat accumulator that
-  // token and rate accounting read from.
+  // between text chunks). The flat accumulator is only read inside its own
+  // setter, where per-turn word and rate accounting slices it.
   const [aiTurns, setAiTurns] = useState([]);
   // User-side transcript turns. Each entry is { id, audioOnly, text }. A
   // turn is created from the local speaking-state transition (mic spoke,
@@ -278,6 +278,11 @@ function App() {
   // recorded when the assistant next resumes. Cleared after the turn is
   // pushed. Drives the audio-only transcript marker.
   const userSpokeRef = useRef(false);
+  // performance.now() at the tick the latched speech first registered; used
+  // as the user turn's timestamp so it sorts ahead of the assistant reply
+  // that answers it (whose segment opens before the meter detects resumed
+  // assistant audio).
+  const userSpokeAtRef = useRef(0);
 
   stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer };
 
@@ -1318,8 +1323,18 @@ function App() {
           openId == null
             ? `${Date.now()}-you-${Math.random().toString(36).slice(2, 7)}`
             : null;
+        // Stamp a fresh turn with the time the mic registered the speech
+        // (when the latch has one) so it sorts ahead of the reply.
+        const freshAt = userSpokeAtRef.current || performance.now();
         if (freshId !== null) userTurnOpenRef.current = userFinal ? null : freshId;
         else if (userFinal) userTurnOpenRef.current = null;
+        if (userFinal) {
+          // The recognizer closed this utterance; drop the local latch so
+          // the speaking-transition effect does not append a duplicate
+          // audio-only row for the same speech.
+          userSpokeRef.current = false;
+          userSpokeAtRef.current = 0;
+        }
         setUserTurns((turns) => {
           if (openId != null) {
             const idx = turns.findIndex((t) => t.id === openId);
@@ -1336,7 +1351,7 @@ function App() {
           // transition): record a fresh turn so the words are not dropped.
           return [
             ...turns,
-            { id: freshId, audioOnly: userText.length === 0, text: userText, at: performance.now() },
+            { id: freshId, audioOnly: userText.length === 0, text: userText, at: freshAt },
           ].slice(-40);
         });
       } else if (message.type === "vision_caption") {
@@ -1554,6 +1569,7 @@ function App() {
     setUserTurns([]);
     userTurnOpenRef.current = null;
     userSpokeRef.current = false;
+    userSpokeAtRef.current = 0;
     setNotices([]);
     setSessionTimeline([]);
     setServerRecording(null);
@@ -1798,6 +1814,7 @@ function App() {
     setUserTurns([]);
     userTurnOpenRef.current = null;
     userSpokeRef.current = false;
+    userSpokeAtRef.current = 0;
     setCaptionEntries([]);
     setCurrentCaption("");
     pendingVisionFramesRef.current.clear();
@@ -2351,17 +2368,22 @@ function App() {
   useEffect(() => {
     if (phase !== "live") {
       userSpokeRef.current = false;
+      userSpokeAtRef.current = 0;
       userTurnOpenRef.current = null;
       return;
     }
     if (speaking === "you" || speaking === "both") {
+      if (!userSpokeRef.current) userSpokeAtRef.current = performance.now();
       userSpokeRef.current = true;
     } else if (speaking === "ai" && userSpokeRef.current) {
-      // Assistant resumed after the user spoke: close the user turn.
+      // Assistant resumed after the user spoke: close the user turn,
+      // stamped with the time the speech started.
       userSpokeRef.current = false;
+      const at = userSpokeAtRef.current || performance.now();
+      userSpokeAtRef.current = 0;
       const id = `${Date.now()}-you-${Math.random().toString(36).slice(2, 7)}`;
       userTurnOpenRef.current = id;
-      setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "", at: performance.now() }].slice(-40));
+      setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "", at }].slice(-40));
     }
   }, [speaking, phase]);
 
@@ -2522,7 +2544,6 @@ function App() {
 
   const phaseIdx = { idle: 0, connecting: 1, warmup: 2, live: 3, ended: 4 }[phase] ?? 0;
   const phaseProgress = { idle: 0, connecting: 25, warmup: 55, live: 82, ended: 100 }[phase] ?? 0;
-  const turnTokens = Math.max(0, transcriptText.trim().split(/\s+/).filter(Boolean).length);
   // Interleave assistant segments and user turns into one chronological list
   // so the transcript reads as a back-and-forth instead of one AI blob.
   const transcriptTurns = [
@@ -3270,7 +3291,7 @@ function App() {
           <div className="telem">
             <TelemetryCell label="Latency" value={latencyMs || "·"} unit="ms" fill={Math.min(100, (latencyMs / 300) * 100)} warn={latencyMs > 220} err={latencyMs > 280} />
             <TelemetryCell label="Tail · p95" value={tailLatencyMs || "·"} unit="ms" fill={Math.min(100, (tailLatencyMs / 380) * 100)} warn={tailLatencyMs > 260} err={tailLatencyMs > 340} />
-            <TelemetryCell label="Turn buffer" value={turnTokens} unit={`/${maxTurn} tok`} fill={Math.min(100, (turnTokens / Math.max(1, maxTurn)) * 100)} warn={turnTokens > maxTurn * 0.75} err={turnTokens > maxTurn * 0.9} />
+            <TelemetryCell label="Turn buffer" value={assistantRate.words} unit={`/${maxTurn} ≈tok`} fill={Math.min(100, (assistantRate.words / Math.max(1, maxTurn)) * 100)} warn={assistantRate.words > maxTurn * 0.75} err={assistantRate.words > maxTurn * 0.9} />
             <TelemetryCell label="Response rate" value={assistantRate.wpm || "·"} unit="wpm" fill={Math.min(100, (assistantRate.wpm / 220) * 100)} warn={assistantRate.wpm > 170} err={assistantRate.wpm > 220} />
             <TelemetryCell label="Vision sent / gated" value={visionFramesSent} unit={`/${visionFramesSent + visionFramesGated || "·"}`} fill={(visionFramesSent / Math.max(1, visionFramesSent + visionFramesGated)) * 100} violet />
           </div>
