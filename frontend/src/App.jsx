@@ -761,29 +761,43 @@ function App() {
     setSeedRandom(!Number.isFinite(nextSeed) || nextSeed === -1);
     if (Number.isFinite(nextSeed) && nextSeed !== -1) setSeed(nextSeed);
 
+    // Validate voices against the live server catalog (operators can add
+    // voices beyond the built-ins); fall back to the built-in list until
+    // the catalog has loaded.
+    const knownVoices = voiceList.length ? voiceList : VOICES;
     const voicePrompt = typeof config.voice_prompt === "string" ? config.voice_prompt : "";
     if (voicePrompt.startsWith("upload:")) {
       clearUploadedVoice();
       setUploadStatus("Config references an uploaded clip. Re-upload the audio to use it.");
       setUploadKind("error");
+      // Repopulate the strength slider so a re-uploaded clip resumes at
+      // the saved value; the clip itself can't be restored from the config
+      // alone. Only an upload-voice config encodes a real choice: preset
+      // exports carry the constant 1.0.
+      const cloneStrengthFloat = readNumber(config.clone_strength, cloneStrength / 100);
+      setCloneStrength(Math.max(0, Math.min(100, Math.round(cloneStrengthFloat * 100))));
     } else if (voicePrompt.endsWith(".pt")) {
       const voiceName = voicePrompt.slice(0, -3);
-      if (VOICES.includes(voiceName)) setVoice(voiceName);
+      if (knownVoices.includes(voiceName)) {
+        setVoice(voiceName);
+      } else {
+        addNotice("warn", `Voice ${voiceName} not in the server catalog; kept the current voice`);
+      }
       clearUploadedVoice();
     }
-
-    // Repopulate the strength slider so a re-uploaded clip resumes at the
-    // saved value. The clip itself can't be restored from the config alone.
-    const cloneStrengthFloat = readNumber(config.clone_strength, cloneStrength / 100);
-    setCloneStrength(Math.max(0, Math.min(100, Math.round(cloneStrengthFloat * 100))));
 
     const voicePromptB = typeof config.voice_prompt_b === "string" ? config.voice_prompt_b : "";
     const blendMixFloat = readNumber(config.voice_blend_mix, 0);
     if (voicePromptB.endsWith(".pt") && blendMixFloat > 0) {
       const voiceBName = voicePromptB.slice(0, -3);
-      if (VOICES.includes(voiceBName)) setVoiceB(voiceBName);
-      setBlendMix(Math.max(0, Math.min(100, Math.round(blendMixFloat * 100))));
-      setVoiceBlend(true);
+      if (knownVoices.includes(voiceBName)) {
+        setVoiceB(voiceBName);
+        setBlendMix(Math.max(0, Math.min(100, Math.round(blendMixFloat * 100))));
+        setVoiceBlend(true);
+      } else {
+        setVoiceBlend(false);
+        addNotice("warn", `Blend voice ${voiceBName} not in the server catalog; blend disabled`);
+      }
     } else {
       setVoiceBlend(false);
     }
@@ -798,7 +812,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
