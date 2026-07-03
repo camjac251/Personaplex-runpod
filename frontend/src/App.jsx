@@ -227,6 +227,10 @@ function App() {
   const visionIntervalRef = useRef(null);
   const visionStatusTickRef = useRef(null);
   const visionLastFrameDataRef = useRef(null);
+  // performance.now() of the last frame actually sent, mirrored from the
+  // visionLastSentAt state so the capture interval can read it without a
+  // stale closure.
+  const visionLastSentAtRef = useRef(0);
   const lastFramePreviewRef = useRef(null);
   const lastFrameMetaRef = useRef(null);
   const pendingVisionFramesRef = useRef(new Map());
@@ -1096,6 +1100,7 @@ function App() {
     setVisionPaused(false);
     setVisionInjecting(false);
     setCurrentCaption("");
+    visionLastSentAtRef.current = 0;
     setVisionLastSentAt(0);
   }, []);
 
@@ -1857,6 +1862,7 @@ function App() {
     );
     setVisionFramesSent((count) => count + 1);
     const now = performance.now();
+    visionLastSentAtRef.current = now;
     setVisionLastSentAt(now);
     setVisionClockMs(now);
     return frameId;
@@ -1931,6 +1937,17 @@ function App() {
         ? await navigator.mediaDevices.getUserMedia({ video: true })
         : await navigator.mediaDevices.getDisplayMedia({ video: true });
       visionStreamRef.current = stream;
+      // The browser can end the tracks outside the app UI (the floating
+      // "Stop sharing" bar, a camera unplug); tear vision down and say so
+      // instead of keeping a frozen "Cam · Live" badge capturing stale
+      // frames.
+      stream.getTracks().forEach((track) => {
+        track.addEventListener("ended", () => {
+          if (visionStreamRef.current !== stream) return;
+          stopVision();
+          addNotice("warn", "Vision source ended by the browser or device", "vision");
+        });
+      });
       setVisionOn(true);
       setVisionPaused(false);
       setVisionFramesSent(0);
@@ -1947,6 +1964,7 @@ function App() {
   }, [
     addNotice,
     isLive,
+    stopVision,
     toast,
     visionEnabledFromServer,
   ]);
@@ -1992,7 +2010,12 @@ function App() {
       Math.max(1000, Number(visionIntervalMs) || DEFAULTS.visionIntervalMs),
     );
     const intervalId = setInterval(() => {
-      if (!stateRef.current.visionPaused) captureFrame(false, false);
+      if (stateRef.current.visionPaused) return;
+      // Fallback only: server-requested and forced captures cover an
+      // active scene, so skip the tick when a frame already went out
+      // within the current period.
+      if (performance.now() - visionLastSentAtRef.current < periodMs) return;
+      captureFrame(false, false);
     }, periodMs);
     visionIntervalRef.current = intervalId;
     return () => {

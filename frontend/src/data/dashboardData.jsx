@@ -331,8 +331,8 @@ export const PARAM_INFO = {
     body: (
       <>
         Safety timer for quiet sessions. Most frames are server-requested when
-        the model goes silent; this only fires if nothing else has requested a
-        frame.
+        the model goes silent; this fires only when no frame has been sent
+        within the interval.
       </>
     ),
   },
