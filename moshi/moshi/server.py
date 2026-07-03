@@ -2632,20 +2632,32 @@ class ServerState:
 
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+
             # Reset the vision-inject state machine and the transcript
             # buffer. Leftover state from a previous session would
-            # otherwise leak into this one.
-            with self._infer_lock:
-                self._vision_pending.clear()
-                self._vision_pad_streak = 0
-                self._vision_inject_steps = 0
-                self._reinforce_pending.clear()
-                self._reinforce_inject_steps = 0
-                self._last_reinforce_at = 0.0
-                self._transcript_recent.clear()
-                # Drop the prior session's smoothed RTF so a fresh session
-                # does not start by reporting a stale ratio.
-                self._rtf_ema = 0.0
+            # otherwise leak into this one. _infer_lock is a threading.Lock
+            # and a straggler from the prior session's teardown can still
+            # hold it, so acquire it on an executor thread like every
+            # other site instead of blocking the event loop.
+            def _reset_session_state():
+                with self._infer_lock:
+                    self._vision_pending.clear()
+                    self._vision_pad_streak = 0
+                    self._vision_inject_steps = 0
+                    self._reinforce_pending.clear()
+                    self._reinforce_inject_steps = 0
+                    # Baseline the reinforce cooldown at session start:
+                    # time.monotonic() is host uptime, so a 0.0 baseline
+                    # would satisfy REINFORCE_MIN_INTERVAL_SEC immediately
+                    # and let the first pad streak arm the window.
+                    self._last_reinforce_at = time.monotonic()
+                    self._transcript_recent.clear()
+                    # Drop the prior session's smoothed RTF so a fresh
+                    # session does not start by reporting a stale ratio.
+                    self._rtf_ema = 0.0
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _reset_session_state)
             # Apply the per-session vision system prompt. Falls back to
             # the generic default when the client didn't supply one.
             self._vision_system_prompt = (
@@ -2752,6 +2764,8 @@ class ServerState:
 
                         def _do_rewind_to():
                             with self._infer_lock:
+                                if session_id != self._active_session_id:
+                                    return
                                 # set_streaming_state_inplace consumes the dict
                                 # it's given. Pass a shallow copy so the stored
                                 # bookmark survives repeated jumps to it.
@@ -2824,6 +2838,8 @@ class ServerState:
 
                     def _do_rewind():
                         with self._infer_lock:
+                            if session_id != self._active_session_id:
+                                return
                             # set_streaming_state_inplace consumes the dict it's given.
                             # Pass a shallow copy so the snapshot stays reusable on the
                             # next rewind.
@@ -2865,6 +2881,20 @@ class ServerState:
                             exc,
                         )
                 elif mtype == "bookmark":
+                    if not warmup_done.is_set():
+                        try:
+                            session.send_event(
+                                "bookmark",
+                                "Bookmark unavailable during warmup",
+                                "warn",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "bookmark warmup notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
                     # Capture a user-pinned labelled snapshot of the live state.
                     if session_id != self._active_session_id:
                         try:
@@ -2923,11 +2953,27 @@ class ServerState:
                             exc,
                         )
                 elif mtype == "interrupt":
+                    if not warmup_done.is_set():
+                        try:
+                            session.send_event(
+                                "interrupt",
+                                "Interrupt unavailable during warmup",
+                                "warn",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "interrupt warmup notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
                     reason_raw = str(msg.get("reason") or "manual")
                     reason = reason_raw[:64]
 
                     def _do_interrupt():
                         with self._infer_lock:
+                            if session_id != self._active_session_id:
+                                return
                             self.lm_gen._pad_force_remaining = max(
                                 self.lm_gen._pad_force_remaining,
                                 INTERRUPT_YIELD_FRAMES,
@@ -2972,6 +3018,20 @@ class ServerState:
                             exc,
                         )
                 elif mtype == "update_config":
+                    if not warmup_done.is_set():
+                        try:
+                            session.send_event(
+                                "config_update",
+                                "Live tuning unavailable during warmup",
+                                "warn",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "update_config warmup notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
                     # Sampling and anti-collapse scalars that step() re-reads
                     # every frame, so reassigning them takes effect on the
                     # next step with no re-priming. voice_prompt / text_prompt
@@ -3088,14 +3148,16 @@ class ServerState:
                         tasks.add(task)
                         task.add_done_callback(tasks.discard)
 
-            session.set_message_handler(on_message)
-
-            # Block the first snapshot until warmup completes. Warmup runs
-            # in an executor without holding _infer_lock; snapshot_task
-            # acquires the lock, so without this gate the first +30 s
-            # snapshot can race a long voice-prompt load and read a torn
+            # Warmup runs in an executor without holding _infer_lock;
+            # snapshot_task and the bookmark/interrupt/update_config
+            # handlers acquire the lock and read or mutate lm_gen state,
+            # so each of them waits for (or rejects before) this event.
+            # Without the gate a control message during a long
+            # voice-prompt load can clone or mutate a torn
             # _streaming_state.
             warmup_done = asyncio.Event()
+
+            session.set_message_handler(on_message)
 
             async def snapshot_task():
                 snapshot_future = None
