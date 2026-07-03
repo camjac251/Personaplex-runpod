@@ -1717,6 +1717,16 @@ function App() {
           console.warn("bad control JSON:", error);
         }
       };
+      control.onclose = () => {
+        // cleanup() nulls the ref before this event can fire, so only an
+        // unexpected close (transport drop, SCTP-level error) gets past
+        // this guard. Route it into the same recovery path a failed peer
+        // connection takes; its catch runs the terminal teardown.
+        if (controlRef.current !== control) return;
+        if (stateRef.current.phase !== "live") return;
+        addNotice("err", "Control channel closed");
+        reconnectRef.current?.();
+      };
 
       pc.onicecandidate = (event) => {
         if (sessionIdRef.current) postCandidate(event.candidate);
