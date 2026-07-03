@@ -231,7 +231,7 @@ def _flatten_streaming_state(state_dict: dict[str, torch.Tensor],
 
 def load_streaming_state(path: str,
                          metadata_path: str,
-                         device: Union[str, int] = 'cpu',
+                         device: Union[str, int, torch.device] = 'cpu',
                          ) -> StreamingStateDict:
     """
     load_streaming_state(path, metadata_path)
@@ -244,7 +244,7 @@ def load_streaming_state(path: str,
         Path to the safetensors file.
     str : metadata_path
         Path to the metadata json file.
-    device : Union[str, int], optional
+    device : Union[str, int, torch.device], optional
         Device to load the tensors onto, by default 'cpu'.
 
     Returns
@@ -252,6 +252,9 @@ def load_streaming_state(path: str,
     dict
         The loaded streaming state flattened as a dictionary.
     """
+    # safetensors' load_file only accepts str or int devices.
+    if isinstance(device, torch.device):
+        device = str(device)
     state_dict = load_file(path, device=device)
     with open(metadata_path, "rt", encoding="utf-8") as fin:
         state_dict_metadata = json.load(fin)

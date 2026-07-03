@@ -733,6 +733,11 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        # Flattened streaming state loaded from a voice's .safetensors
+        # sidecar. Kept as a dict and applied during priming rather than at
+        # load time, because callers reset_streaming() between load and
+        # priming, which would wipe an immediately-applied state.
+        self.voice_prompt_full_state: Optional[dict] = None
         # Fraction of an uploaded clip's prefix replayed during priming, in
         # 0.0..1.0. 1.0 replays the whole clip; lower values replay only the
         # tail (most recent audio), which conditions less strongly; 0.0
@@ -1094,6 +1099,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio = raw_audio
         self.voice_prompt_cache = None
         self.voice_prompt_embeddings = None
+        self.voice_prompt_full_state = None
 
     def load_voice_prompt_embeddings(self, path: str):
         # First try to load full streaming state if available
@@ -1104,13 +1110,15 @@ class LMGen(StreamingModule[_LMGenState]):
         if exists(state_path) and exists(meta_path):
             logger.info("loading full streaming state from %s", state_path)
             full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
-            self.set_streaming_state_inplace(full_state)
+            # Stash the dict; _step_voice_prompt_core applies it during
+            # priming, after the callers' reset_streaming().
+            self.voice_prompt_full_state = full_state
             # Mark that we have loaded the full state so _step_voice_prompt_core can skip replay
             self.voice_prompt_embeddings = [] # Non-None but empty to signal "loaded"
-            # Clone the cache so a subsequent reset_streaming() doesn't
-            # zero out our reference. The legacy .pt path (below) builds
-            # a fresh tensor via .to(self.lm_model.device), so it doesn't need this.
-            self.voice_prompt_cache = self._streaming_state.cache.clone()
+            self.voice_prompt_audio = None
+            # The full state carries the token cache, so no separate copy is
+            # needed. The legacy .pt path (below) restores the cache itself.
+            self.voice_prompt_cache = None
             self.voice_prompt = path
             return
 
@@ -1120,6 +1128,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = data["embeddings"].to(self.lm_model.device)
         self.voice_prompt_cache = data["cache"].to(self.lm_model.device)
+        self.voice_prompt_full_state = None
         self.voice_prompt = path
 
     def _load_voice_prompt_embedding_sequence(self, path: str) -> torch.Tensor:
@@ -1150,6 +1159,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = blended
         self.voice_prompt_cache = None
+        self.voice_prompt_full_state = None
         self.voice_prompt = f"{path_a}+{path_b}@{mix:.2f}"
 
     def _encode_zero_frame(self) -> torch.Tensor:
@@ -1221,6 +1231,13 @@ class LMGen(StreamingModule[_LMGenState]):
         consult `is_alive`. The core itself is intentionally unaware of connection state.
         """
         if self.voice_prompt_embeddings is not None:
+            if self.voice_prompt_full_state is not None:
+                # set_streaming_state_inplace pops entries from the dict it
+                # is given; pass a fresh shallow copy so the next priming
+                # can apply the same state again.
+                self.set_streaming_state_inplace(dict(self.voice_prompt_full_state))
+                return
+
             # Replay stored voice prompt embeddings
             for next_embed in self.voice_prompt_embeddings:
                 yield
