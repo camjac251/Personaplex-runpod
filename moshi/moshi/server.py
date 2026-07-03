@@ -315,6 +315,13 @@ RTF_EMA_ALPHA = 0.2
 # assistant audio is cleared immediately by RTCSession.
 INTERRUPT_YIELD_FRAMES = 12
 
+# How long after an unexpected transport death a client may reclaim the
+# resident model state by re-offering with resume_session_id. Long enough
+# to ride out a wifi handover plus the client's retry backoff, short
+# enough that a stale grant cannot pin the per-session tensor clones
+# (snapshot ring, bookmarks) long after the user walked away.
+RESUME_GRANT_WINDOW_SEC = 25.0
+
 # If Gemini returns N consecutive non-2xx responses, auto-disable vision
 # for the rest of the session and tell the client. Stops the server from
 # silently retrying a broken schema for the full session lifetime.
@@ -875,6 +882,15 @@ class ServerState:
         # opaque session_id returned in the offer response. Entries are
         # cleared in _run_rtc_session's finally block.
         self._candidate_sessions: dict[str, "RTCSession"] = {}
+        # Bounded resume window. When a live session's transport dies
+        # unexpectedly, the runner's teardown leaves the model state
+        # resident and records a grant here: the dead session's id, a
+        # monotonic deadline, the applied config, and the per-session
+        # stores (snapshot ring, bookmarks, Gemini chain) to re-key onto
+        # the resumed session. Consumed by the next offer that presents a
+        # matching resume_session_id, discarded by any fresh session
+        # start, ignored after the deadline.
+        self._resume_grant: Optional[dict] = None
         # Rewind history: session_id -> [(monotonic_ts, flattened_state_dict)].
         # State dicts hold tensor clones so the snapshot doesn't follow the
         # live model.
@@ -1668,6 +1684,32 @@ class ServerState:
         snapshot.update(metadata)
         return snapshot
 
+    def _schedule_resume_grant_expiry(self, grant: dict) -> None:
+        """Drop the grant once its window lapses unused.
+
+        The grant pins the dead session's snapshot and bookmark tensor
+        clones; without a timer a client that never returns would leave
+        them resident until the next connect discards the grant.
+        """
+
+        def _expire() -> None:
+            if self._resume_grant is not grant:
+                return
+            self._resume_grant = None
+            logger.info("resume window expired unused; dropping grant")
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as exc:
+                    logger.warning(
+                        "cuda empty_cache failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        delay = max(0.0, grant["deadline"] - time.monotonic()) + 1.0
+        asyncio.get_event_loop().call_later(delay, _expire)
+
     async def handle_vision_frame(
         self,
         session_id: str,
@@ -2284,47 +2326,28 @@ class ServerState:
             logger.warning(f"candidate stream error: {exc}")
         return resp
 
-    async def handle_rtc_renegotiate(self, request):
-        """Answer an ICE-restart re-offer on the live peer connection.
+    async def handle_rtc_renegotiate(self, _request):
+        """Refuse in-place renegotiation.
 
-        Body: ``{"session_id": str, "sdp": str, "type": "offer"}``.
-        Response: ``{"sdp": str, "type": "answer"}``.
-
-        This is an in-session operation: the live runner already holds
-        ``self.lock`` for the peer connection's lifetime, so this handler
-        must NOT acquire it (doing so would deadlock against the runner).
-        It reuses the existing ``RTCSession`` and ``session_id``, so the
-        inbound audio task, the output track, the control channel, and all
-        ``lm_gen`` / ``mimi`` streaming state are untouched. Fresh server
-        candidates flow out on the already-open candidate stream.
+        aiortc cannot ICE-restart a live transport: ``RTCIceTransport.start``
+        early-returns once started, the remote ufrag/pwd stay frozen (aioice
+        answers post-restart checks with 400 Wrong username), and the
+        gatherer never re-gathers, so answering a restart offer here would
+        produce a dead transport while reporting success. Clients recover by
+        posting a fresh offer with ``resume_session_id`` instead; this stub
+        keeps the route so a stale client gets an honest failure rather than
+        a silent one.
         """
-        try:
-            body = await request.json()
-            offer = RTCSessionDescription(sdp=body["sdp"], type=body["type"])
-        except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            return web.json_response({"error": f"invalid offer: {exc}"}, status=400)
-
-        session_id = body.get("session_id")
-        if not session_id or session_id not in self._candidate_sessions:
-            return web.json_response({"error": "unknown session_id"}, status=404)
-
-        # Only the active session may renegotiate. A stale or spoofed id,
-        # or an id whose runner has begun teardown (which clears
-        # _active_session_id before releasing the lock), is rejected so the
-        # client falls back to the terminal path instead of answering on a
-        # dying peer connection.
-        if session_id != self._active_session_id:
-            return web.json_response({"error": "session_inactive"}, status=409)
-
-        session = self._candidate_sessions[session_id]
-        try:
-            answer = await session.renegotiate(offer)
-        except Exception as exc:
-            logger.warning(f"renegotiate failed: {type(exc).__name__}: {exc}")
-            # Leave the peer connection and its transient-drop tolerance in
-            # place; the client falls back to terminal teardown on its end.
-            return web.json_response({"error": "renegotiate_failed"}, status=500)
-        return web.json_response({"sdp": answer.sdp, "type": answer.type})
+        return web.json_response(
+            {
+                "error": "renegotiate_unsupported",
+                "detail": (
+                    "in-place ICE restart is not supported; reconnect with "
+                    "a fresh offer carrying resume_session_id"
+                ),
+            },
+            status=410,
+        )
 
     async def _try_acquire_session_lock(self, timeout: float) -> bool:
         """Acquire ``self.lock`` with a timeout, safe against the known
@@ -2387,6 +2410,12 @@ class ServerState:
              message, applies it, runs system prompts under the lock,
              sends ``ready``, then starts the GPU process loop and
              holds the lock until the peer connection closes.
+
+        An optional ``resume_session_id`` in the body asks to continue a
+        session whose transport just died. When it matches an unexpired
+        resume grant, the new session skips reset and warmup and continues
+        from the resident model state; the response carries ``resumed`` so
+        the client knows which kind of session it got.
         """
         try:
             body = await request.json()
@@ -2394,8 +2423,40 @@ class ServerState:
         except (ValueError, KeyError) as exc:
             return web.json_response({"error": f"invalid offer: {exc}"}, status=400)
 
-        if not await self._try_acquire_session_lock(timeout=0.25):
+        resume_session_id = body.get("resume_session_id")
+        if not isinstance(resume_session_id, str) or not resume_session_id:
+            resume_session_id = None
+
+        # A resume offer proves possession of the live session's secret id,
+        # and the client only sends one when its transport is broken. The
+        # server may not have noticed the breakage yet (ICE consent takes
+        # ~30 s to expire), so close the dying session now; its runner
+        # records the resume grant on the way out and releases the lock.
+        if resume_session_id and resume_session_id == self._active_session_id:
+            stale = self._candidate_sessions.get(resume_session_id)
+            if stale is not None:
+                await stale.close()
+
+        # A preempted or already-tearing-down runner still has to finalize
+        # its recording and drain vision tasks before releasing the lock,
+        # so give a resume offer a longer window than the fast-fail fresh
+        # path.
+        lock_timeout = 5.0 if resume_session_id else 0.25
+        if not await self._try_acquire_session_lock(timeout=lock_timeout):
             return web.json_response({"error": "session_busy"}, status=409)
+
+        # Match the resume grant while holding the lock. The grant is only
+        # discarded once a runner actually starts (below), so a failed
+        # negotiation leaves the window open for another attempt.
+        resume_state: Optional[dict] = None
+        grant = self._resume_grant
+        if (
+            grant is not None
+            and resume_session_id is not None
+            and grant["session_id"] == resume_session_id
+            and time.monotonic() < grant["deadline"]
+        ):
+            resume_state = grant
 
         # Once the lock is acquired, every failure path below MUST release
         # it. asyncio.CancelledError does not inherit from Exception in
@@ -2478,9 +2539,19 @@ class ServerState:
             # that removes session_id from _candidate_sessions on close,
             # so the trickle endpoints stay live for the full negotiation
             # window and a tick beyond.
+            #
+            # Any session start supersedes the resume window: a matching
+            # resume consumes the grant, and a fresh session is about to
+            # reset the model state the grant was protecting.
+            self._resume_grant = None
             task = asyncio.create_task(
                 self._run_rtc_session(
-                    session, config_event, config_holder, clog, session_id
+                    session,
+                    config_event,
+                    config_holder,
+                    clog,
+                    session_id,
+                    resume_state=resume_state,
                 )
             )
             self._session_tasks.add(task)
@@ -2491,6 +2562,7 @@ class ServerState:
                     "sdp": answer.sdp,
                     "type": answer.type,
                     "session_id": session_id,
+                    "resumed": resume_state is not None,
                 }
             )
         except BaseException:
@@ -2522,176 +2594,261 @@ class ServerState:
         config_holder: dict,
         clog: ColorizedLog,
         session_id: Optional[str] = None,
+        resume_state: Optional[dict] = None,
     ) -> None:
         _snap_t: Optional[asyncio.Task] = None
         _cad_t: Optional[asyncio.Task] = None
         _stat_t: Optional[asyncio.Task] = None
         _wd_t: Optional[asyncio.Task] = None
+        resuming = resume_state is not None
+        cfg: Optional[SessionConfig] = None
+        # Teardown bookkeeping for the resume grant: whether this session
+        # reached the live phase with primed model state, whether the
+        # server itself decided to end it, and the wall-clock the watchdog
+        # budget math needs.
+        went_live = False
+        server_ended = False
+        effective_timeout_sec = 0
+        session_started_at: Optional[float] = None
         try:
-            try:
-                await asyncio.wait_for(config_event.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                clog.log("error", "no config received within 30 s, closing")
-                session.send_error("config_timeout")
-                return
-
-            cfg: SessionConfig = config_holder["cfg"]
-            clog.log("info", f"config: voice_prompt={cfg.voice_prompt!r}")
-
-            try:
-                voice_prompt_path, requested = self._resolve_voice_prompt_path(
-                    cfg.voice_prompt
-                )
-            except FileNotFoundError as exc:
-                clog.log("error", str(exc))
-                session.send_error(f"voice_prompt_not_found: {exc}")
-                return
-
-            # Blend mixes two saved-embedding (.pt) voices into one prefix.
-            # It is only meaningful for two distinct built-in voices with a
-            # nonzero secondary share; an uploaded raw-audio primary has no
-            # per-frame embedding sequence to align, so blend is skipped and
-            # the single primary voice loads as usual.
-            blend_active = (
-                bool(cfg.voice_prompt_b)
-                and cfg.voice_prompt_b != cfg.voice_prompt
-                and cfg.voice_blend_mix > 0.0
-                and voice_prompt_path is not None
-                and voice_prompt_path.endswith(".pt")
+            # The config message doubles as the channel-open signal. Race
+            # it against session close so a peer that never connects (e.g.
+            # a resume whose transport stays down) releases the lock
+            # promptly instead of pinning it for the full timeout.
+            config_task = asyncio.create_task(config_event.wait())
+            close_task = asyncio.create_task(session.wait_for_close())
+            done, pending = await asyncio.wait(
+                {config_task, close_task},
+                timeout=30.0,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            voice_prompt_b_path = None
-            if blend_active:
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if config_task not in done:
+                if close_task in done:
+                    clog.log("info", "peer closed before sending config")
+                else:
+                    clog.log("error", "no config received within 30 s, closing")
+                    session.send_error("config_timeout")
+                return
+
+            if resuming:
+                # Fresh-pc resume: the previous transport died but the
+                # model state is still resident, so skip the resets, the
+                # voice/text priming, and the warmup phases, and continue
+                # the conversation under the original session's applied
+                # config. The config message just received is ignored:
+                # connect-time conditioning cannot change mid-conversation,
+                # and the live-tunable keys resync through update_config
+                # once the client is live again.
+                cfg = resume_state["cfg"]
+                clog.log(
+                    "info",
+                    f"resume grant matched (was {resume_state['session_id']}); "
+                    "continuing with resident model state",
+                )
+                # Re-key the carried per-session stores to the new session
+                # id so rewind, bookmarks, and the Gemini interaction chain
+                # continue seamlessly.
+                self._session_snapshots[session_id] = resume_state["snapshots"]
+                self._session_bookmarks[session_id] = resume_state["bookmarks"]
+                if resume_state.get("interaction_id"):
+                    self._interaction_ids[session_id] = resume_state[
+                        "interaction_id"
+                    ]
+                # Fall through to the shared live-path setup below; every
+                # step between here and there is fresh-session priming.
+            if not resuming:
+                cfg = config_holder["cfg"]
+                clog.log("info", f"config: voice_prompt={cfg.voice_prompt!r}")
+
                 try:
-                    voice_prompt_b_path, _ = self._resolve_voice_prompt_path(
-                        cfg.voice_prompt_b
+                    voice_prompt_path, requested = self._resolve_voice_prompt_path(
+                        cfg.voice_prompt
                     )
                 except FileNotFoundError as exc:
                     clog.log("error", str(exc))
-                    session.send_error(f"voice_prompt_b_not_found: {exc}")
+                    session.send_error(f"voice_prompt_not_found: {exc}")
                     return
-                if voice_prompt_b_path is None or not voice_prompt_b_path.endswith(".pt"):
-                    blend_active = False
 
-            if blend_active:
-                blend_id = (
-                    f"{voice_prompt_path}+{voice_prompt_b_path}@{cfg.voice_blend_mix:.2f}"
+                # Blend mixes two saved-embedding (.pt) voices into one prefix.
+                # It is only meaningful for two distinct built-in voices with a
+                # nonzero secondary share; an uploaded raw-audio primary has no
+                # per-frame embedding sequence to align, so blend is skipped and
+                # the single primary voice loads as usual.
+                blend_active = (
+                    bool(cfg.voice_prompt_b)
+                    and cfg.voice_prompt_b != cfg.voice_prompt
+                    and cfg.voice_blend_mix > 0.0
+                    and voice_prompt_path is not None
+                    and voice_prompt_path.endswith(".pt")
                 )
-                if self.lm_gen.voice_prompt != blend_id:
-                    t_vp = time.monotonic()
-                    self.lm_gen.load_voice_prompt_blend(
-                        voice_prompt_path, voice_prompt_b_path, cfg.voice_blend_mix
+                voice_prompt_b_path = None
+                if blend_active:
+                    try:
+                        voice_prompt_b_path, _ = self._resolve_voice_prompt_path(
+                            cfg.voice_prompt_b
+                        )
+                    except FileNotFoundError as exc:
+                        clog.log("error", str(exc))
+                        session.send_error(f"voice_prompt_b_not_found: {exc}")
+                        return
+                    if voice_prompt_b_path is None or not voice_prompt_b_path.endswith(".pt"):
+                        blend_active = False
+
+                if blend_active:
+                    blend_id = (
+                        f"{voice_prompt_path}+{voice_prompt_b_path}@{cfg.voice_blend_mix:.2f}"
                     )
+                    if self.lm_gen.voice_prompt != blend_id:
+                        t_vp = time.monotonic()
+                        self.lm_gen.load_voice_prompt_blend(
+                            voice_prompt_path, voice_prompt_b_path, cfg.voice_blend_mix
+                        )
+                        clog.log(
+                            "info",
+                            f"timing: voice prompt blend load {(time.monotonic() - t_vp) * 1000:.0f} ms ({blend_id})",
+                        )
+                elif voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
+                    t_vp = time.monotonic()
+                    if voice_prompt_path.endswith(".pt"):
+                        self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                    else:
+                        self.lm_gen.load_voice_prompt(voice_prompt_path)
                     clog.log(
                         "info",
-                        f"timing: voice prompt blend load {(time.monotonic() - t_vp) * 1000:.0f} ms ({blend_id})",
+                        f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
                     )
-            elif voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
-                t_vp = time.monotonic()
-                if voice_prompt_path.endswith(".pt"):
-                    self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-                else:
-                    self.lm_gen.load_voice_prompt(voice_prompt_path)
-                clog.log(
-                    "info",
-                    f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
+                elif not voice_prompt_path:
+                    # lm_gen.voice_prompt persists across sessions; without an explicit reset, a no-prompt session inherits the prior session's loaded voice cache
+                    self.lm_gen.voice_prompt = None
+                    self.lm_gen.voice_prompt_audio = None
+                    self.lm_gen.voice_prompt_cache = None
+                    self.lm_gen.voice_prompt_embeddings = None
+
+                # Clone strength scales how much of an uploaded clip primes the
+                # cache. Only the raw-audio upload path honors it; preset (.pt)
+                # and blended prompts keep full conditioning, so reset to 1.0 for
+                # them. Applied even when the same clip is already cached above,
+                # because the strength can differ from the prior session. Read by
+                # _step_voice_prompt during the off-loop warmup; set here on the
+                # event loop before that executor work starts.
+                self.lm_gen.voice_prompt_strength = (
+                    cfg.clone_strength
+                    if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
+                    else 1.0
                 )
-            elif not voice_prompt_path:
-                # lm_gen.voice_prompt persists across sessions; without an explicit reset, a no-prompt session inherits the prior session's loaded voice cache
-                self.lm_gen.voice_prompt = None
-                self.lm_gen.voice_prompt_audio = None
-                self.lm_gen.voice_prompt_cache = None
-                self.lm_gen.voice_prompt_embeddings = None
 
-            # Clone strength scales how much of an uploaded clip primes the
-            # cache. Only the raw-audio upload path honors it; preset (.pt)
-            # and blended prompts keep full conditioning, so reset to 1.0 for
-            # them. Applied even when the same clip is already cached above,
-            # because the strength can differ from the prior session. Read by
-            # _step_voice_prompt during the off-loop warmup; set here on the
-            # event loop before that executor work starts.
-            self.lm_gen.voice_prompt_strength = (
-                cfg.clone_strength
-                if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
-                else 1.0
-            )
+                # Empty list (not None) so _step_text_prompt_core iterates as a
+                # no-op when the user clears the textarea. Iterating None raises
+                # TypeError inside the executor and tears the session down.
+                self.lm_gen.text_prompt_tokens = (
+                    self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
+                    if cfg.text_prompt else []
+                )
+                # Mid-stream reinforcement re-injects the persona WITHOUT
+                # <system> tags: the model is trained with <system> only at
+                # t=0, so the wrap is off-distribution mid-stream (same reason
+                # the vision drip injects bare text). Strip any <system> the
+                # startup path or the user added, then encode with the same
+                # leading-space + VISION_QUEUE_MAX slice convention as the
+                # proven vision path.
+                self._reinforce_enabled = bool(cfg.reinforce_in_silences)
+                bare_persona = _strip_system_tags(cfg.text_prompt)
+                self._reinforce_prompt_tokens = (
+                    self.text_tokenizer.encode(f" {bare_persona}")[:VISION_QUEUE_MAX]
+                    if (self._reinforce_enabled and bare_persona)
+                    else []
+                )
+                if cfg.seed is not None and cfg.seed != -1:
+                    seed_all(cfg.seed)
 
-            # Empty list (not None) so _step_text_prompt_core iterates as a
-            # no-op when the user clears the textarea. Iterating None raises
-            # TypeError inside the executor and tears the session down.
-            self.lm_gen.text_prompt_tokens = (
-                self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
-                if cfg.text_prompt else []
-            )
-            # Mid-stream reinforcement re-injects the persona WITHOUT
-            # <system> tags: the model is trained with <system> only at
-            # t=0, so the wrap is off-distribution mid-stream (same reason
-            # the vision drip injects bare text). Strip any <system> the
-            # startup path or the user added, then encode with the same
-            # leading-space + VISION_QUEUE_MAX slice convention as the
-            # proven vision path.
-            self._reinforce_enabled = bool(cfg.reinforce_in_silences)
-            bare_persona = _strip_system_tags(cfg.text_prompt)
-            self._reinforce_prompt_tokens = (
-                self.text_tokenizer.encode(f" {bare_persona}")[:VISION_QUEUE_MAX]
-                if (self._reinforce_enabled and bare_persona)
-                else []
-            )
-            if cfg.seed is not None and cfg.seed != -1:
-                seed_all(cfg.seed)
+                self.lm_gen.temp = cfg.audio_temperature
+                self.lm_gen.temp_text = cfg.text_temperature
+                # torch.topk raises for k larger than the sampled vocabulary,
+                # so cap top-k at the model's real cardinalities.
+                self.lm_gen.top_k_text = min(
+                    max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
+                )
+                self.lm_gen.top_k = min(
+                    max(1, cfg.audio_topk), self.lm_gen.lm_model.card
+                )
+                self.lm_gen.repetition_penalty = max(1.0, cfg.repetition_penalty)
+                self.lm_gen.repetition_penalty_context = max(
+                    0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)
+                )
+                self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
+                self.lm_gen.max_turn_text_tokens = max(0, cfg.max_turn_text_tokens)
+                self.lm_gen._non_pad_streak = 0
+                self.lm_gen._pad_force_remaining = 0
 
-            self.lm_gen.temp = cfg.audio_temperature
-            self.lm_gen.temp_text = cfg.text_temperature
-            # torch.topk raises for k larger than the sampled vocabulary,
-            # so cap top-k at the model's real cardinalities.
-            self.lm_gen.top_k_text = min(
-                max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
-            )
-            self.lm_gen.top_k = min(
-                max(1, cfg.audio_topk), self.lm_gen.lm_model.card
-            )
-            self.lm_gen.repetition_penalty = max(1.0, cfg.repetition_penalty)
-            self.lm_gen.repetition_penalty_context = max(
-                0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)
-            )
-            self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
-            self.lm_gen.max_turn_text_tokens = max(0, cfg.max_turn_text_tokens)
-            self.lm_gen._non_pad_streak = 0
-            self.lm_gen._pad_force_remaining = 0
+                self.mimi.reset_streaming()
+                self.lm_gen.reset_streaming()
 
-            self.mimi.reset_streaming()
-            self.lm_gen.reset_streaming()
+                # Reset the vision-inject state machine and the transcript
+                # buffer. Leftover state from a previous session would
+                # otherwise leak into this one. _infer_lock is a threading.Lock
+                # and a straggler from the prior session's teardown can still
+                # hold it, so acquire it on an executor thread like every
+                # other site instead of blocking the event loop.
+                def _reset_session_state():
+                    with self._infer_lock:
+                        self._vision_pending.clear()
+                        self._vision_pad_streak = 0
+                        self._vision_inject_steps = 0
+                        self._reinforce_pending.clear()
+                        self._reinforce_inject_steps = 0
+                        # Baseline the reinforce cooldown at session start:
+                        # time.monotonic() is host uptime, so a 0.0 baseline
+                        # would satisfy REINFORCE_MIN_INTERVAL_SEC immediately
+                        # and let the first pad streak arm the window.
+                        self._last_reinforce_at = time.monotonic()
+                        self._transcript_recent.clear()
+                        # Drop the prior session's smoothed RTF so a fresh
+                        # session does not start by reporting a stale ratio.
+                        self._rtf_ema = 0.0
 
-            # Reset the vision-inject state machine and the transcript
-            # buffer. Leftover state from a previous session would
-            # otherwise leak into this one. _infer_lock is a threading.Lock
-            # and a straggler from the prior session's teardown can still
-            # hold it, so acquire it on an executor thread like every
-            # other site instead of blocking the event loop.
-            def _reset_session_state():
-                with self._infer_lock:
-                    self._vision_pending.clear()
-                    self._vision_pad_streak = 0
-                    self._vision_inject_steps = 0
-                    self._reinforce_pending.clear()
-                    self._reinforce_inject_steps = 0
-                    # Baseline the reinforce cooldown at session start:
-                    # time.monotonic() is host uptime, so a 0.0 baseline
-                    # would satisfy REINFORCE_MIN_INTERVAL_SEC immediately
-                    # and let the first pad streak arm the window.
-                    self._last_reinforce_at = time.monotonic()
-                    self._transcript_recent.clear()
-                    # Drop the prior session's smoothed RTF so a fresh
-                    # session does not start by reporting a stale ratio.
-                    self._rtf_ema = 0.0
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _reset_session_state)
+                # Apply the per-session vision system prompt. Falls back to
+                # the generic default when the client didn't supply one.
+                self._vision_system_prompt = (
+                    cfg.vision_prompt.strip() or DEFAULT_VISION_SYSTEM_PROMPT
+                )
+                self._vision_in_transcript = bool(cfg.vision_in_transcript)
+                # Reset collapse-detection state for the new session.
+                self._collapse_triggers.clear()
+                self._prev_pad_force_remaining = 0
+                self._vision_request_pending = False
+                self._inject_active = False
+                self._last_rewind_at = None
+                self._interrupt_gate_remaining = 0
+                # Start this session's labelled-snapshot store empty so pins from
+                # a prior session can never be jumped to in this one.
+                self._session_bookmarks[session_id] = []
+                # Reset user-speech recognition turn state and drop any audio a
+                # prior session left buffered. No-op when ASR is disabled.
+                self._asr_assistant_silent = False
+                self._asr_user_active = False
+                if self.asr is not None:
+                    self.asr.reset()
+                # Reset auto-disable so a previous session's vision failures
+                # don't carry over and silently block this session's calls.
+                self._gemini_consecutive_errors = 0
+                self._vision_force_disabled = False
+                # Reset the spend guard and adopt this session's ceiling. getattr
+                # keeps it resilient if config is ever built without the fields.
+                self._vision_frames_dispatched = 0
+                self._vision_cost_limit_usd = max(
+                    0.0, float(getattr(cfg, "vision_cost_limit_usd", 0.0))
+                )
+                self._vision_cost_per_call_usd = max(
+                    0.0, float(getattr(cfg, "vision_cost_per_call_usd", 0.0))
+                )
+                self._vision_spend_tripped = False
 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _reset_session_state)
-            # Apply the per-session vision system prompt. Falls back to
-            # the generic default when the client didn't supply one.
-            self._vision_system_prompt = (
-                cfg.vision_prompt.strip() or DEFAULT_VISION_SYSTEM_PROMPT
-            )
-            self._vision_in_transcript = bool(cfg.vision_in_transcript)
             # Expose the session and id so vision-side coroutines can push
             # captions back to the client, and so the executor-side
             # collapse detector can find the right snapshot list.
@@ -2699,36 +2856,6 @@ class ServerState:
             self._active_session_id = session_id
             # Stash the loop so the executor thread can schedule sends.
             self._main_loop = asyncio.get_event_loop()
-            # Reset collapse-detection state for the new session.
-            self._collapse_triggers.clear()
-            self._prev_pad_force_remaining = 0
-            self._vision_request_pending = False
-            self._inject_active = False
-            self._last_rewind_at = None
-            self._interrupt_gate_remaining = 0
-            # Start this session's labelled-snapshot store empty so pins from
-            # a prior session can never be jumped to in this one.
-            self._session_bookmarks[session_id] = []
-            # Reset user-speech recognition turn state and drop any audio a
-            # prior session left buffered. No-op when ASR is disabled.
-            self._asr_assistant_silent = False
-            self._asr_user_active = False
-            if self.asr is not None:
-                self.asr.reset()
-            # Reset auto-disable so a previous session's vision failures
-            # don't carry over and silently block this session's calls.
-            self._gemini_consecutive_errors = 0
-            self._vision_force_disabled = False
-            # Reset the spend guard and adopt this session's ceiling. getattr
-            # keeps it resilient if config is ever built without the fields.
-            self._vision_frames_dispatched = 0
-            self._vision_cost_limit_usd = max(
-                0.0, float(getattr(cfg, "vision_cost_limit_usd", 0.0))
-            )
-            self._vision_cost_per_call_usd = max(
-                0.0, float(getattr(cfg, "vision_cost_per_call_usd", 0.0))
-            )
-            self._vision_spend_tripped = False
 
             # System prompts are 10-25 s of synchronous Mimi+LM steps
             # (longer for raw-audio voice prompts because every prompt
@@ -3434,40 +3561,49 @@ class ServerState:
             _stat_t = asyncio.create_task(stat_task())
             self._session_tasks.add(_stat_t)
             _stat_t.add_done_callback(self._session_tasks.discard)
-            phases = (
-                ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
-                ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
-                ("text_prompt", self.lm_gen._step_text_prompt, ()),
-                ("audio_silence_b", self.lm_gen._step_audio_silence, ()),
-            )
-            warmup_aborted = False
-            for phase_name, phase_fn, phase_args in phases:
-                if not session.is_alive():
-                    clog.log(
-                        "info",
-                        f"client disconnected during warmup before {phase_name}; aborting",
-                    )
-                    warmup_aborted = True
-                    break
-                in_flight = asyncio.ensure_future(
-                    loop.run_in_executor(None, phase_fn, *phase_args)
+            if resuming:
+                # The model state is already primed with the conversation
+                # this resume exists to continue; the priming phases below
+                # would wipe it.
+                warmup_done.set()
+            else:
+                phases = (
+                    ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
+                    ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
+                    ("text_prompt", self.lm_gen._step_text_prompt, ()),
+                    ("audio_silence_b", self.lm_gen._step_audio_silence, ()),
                 )
-                try:
-                    await asyncio.shield(in_flight)
-                except asyncio.CancelledError:
+                warmup_aborted = False
+                for phase_name, phase_fn, phase_args in phases:
+                    if not session.is_alive():
+                        clog.log(
+                            "info",
+                            f"client disconnected during warmup before {phase_name}; aborting",
+                        )
+                        warmup_aborted = True
+                        break
+                    in_flight = asyncio.ensure_future(
+                        loop.run_in_executor(None, phase_fn, *phase_args)
+                    )
                     try:
-                        await in_flight
-                    except BaseException:
-                        pass
-                    raise
-            if warmup_aborted:
-                return
-            self.mimi.reset_streaming()
-            clog.log(
-                "info",
-                f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
-            )
-            warmup_done.set()
+                        await asyncio.shield(in_flight)
+                    except asyncio.CancelledError:
+                        try:
+                            await in_flight
+                        except BaseException:
+                            pass
+                        raise
+                if warmup_aborted:
+                    return
+                self.mimi.reset_streaming()
+                clog.log(
+                    "info",
+                    f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
+                )
+                warmup_done.set()
+            # The model state is primed from here on: an unexpected
+            # transport death past this point is worth a resume grant.
+            went_live = True
 
             if not session.is_alive():
                 clog.log("info", "client disconnected during warmup")
@@ -3553,18 +3689,27 @@ class ServerState:
                             f"recording-active notify failed: {type(exc).__name__}: {exc}",
                         )
 
-            session.send_ready(
-                {
-                    "gpu_name": self.gpu_name,
-                    "vram_total": self.vram_total,
-                    "server_build": self.server_build,
-                }
-            )
+            identity = {
+                "gpu_name": self.gpu_name,
+                "vram_total": self.vram_total,
+                "server_build": self.server_build,
+            }
+            if resuming:
+                # Tells the client its session state survived, so it keeps
+                # the transcript, bookmarks, and clock instead of treating
+                # this as a brand-new session. A fresh fallback simply
+                # omits the flag.
+                identity["resumed"] = True
+            session.send_ready(identity)
             # Tell the client whether the vision pipeline is reachable so
             # it can disable the Add Vision button (or warn the user) when
-            # the server has no GEMINI_API_KEY configured.
+            # the server has no GEMINI_API_KEY configured. A resumed
+            # session carries _vision_force_disabled across, so a spend or
+            # error disable from the previous leg stays disabled.
             try:
-                session.send_vision_status(bool(self._gemini_api_key))
+                session.send_vision_status(
+                    bool(self._gemini_api_key) and not self._vision_force_disabled
+                )
             except Exception as exc:
                 clog.log(
                     "warning",
@@ -3574,8 +3719,15 @@ class ServerState:
             # stalled client can't hold the single-session lock until the
             # process restarts. The timer starts now (post-warmup), so it
             # measures conversation time, not connect/warmup time. A limit
-            # of 0 leaves the session unbounded.
-            timeout_sec = cfg.session_timeout_sec
+            # of 0 leaves the session unbounded. A resumed session runs on
+            # the previous leg's remaining budget so a transport blip
+            # cannot extend the cap.
+            timeout_sec = (
+                int(resume_state["timeout_remaining_sec"])
+                if resuming
+                else cfg.session_timeout_sec
+            )
+            effective_timeout_sec = timeout_sec
             if timeout_sec > 0:
                 session_started_at = time.monotonic()
 
@@ -3587,6 +3739,7 @@ class ServerState:
                     neither lock: it ends the session and lets the runner's
                     finally release the lock.
                     """
+                    nonlocal server_ended
                     try:
                         while session.is_alive():
                             # Coarse poll: a few seconds of slop on a
@@ -3599,6 +3752,8 @@ class ServerState:
                                 time.monotonic() - session_started_at
                                 >= timeout_sec
                             ):
+                                # Server-initiated end: no resume grant.
+                                server_ended = True
                                 elapsed_min = round(
                                     (time.monotonic() - session_started_at)
                                     / 60.0
@@ -3652,6 +3807,9 @@ class ServerState:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # A runner failure means the model state cannot be trusted, so
+            # this counts as a server-initiated end: no resume grant.
+            server_ended = True
             clog.log("error", f"_run_rtc_session: {type(exc).__name__}: {exc}")
             try:
                 session.send_error(f"server_error: {exc}")
@@ -3659,6 +3817,48 @@ class ServerState:
                 pass
         finally:
             if session_id is not None:
+                # Bounded resume window: an unexpected transport death (not
+                # a server-initiated end, not an internal error) leaves the
+                # model state resident, so record a grant the same client
+                # can redeem by re-offering with resume_session_id. A fresh
+                # session start discards it; redemption consumes it.
+                if (
+                    went_live
+                    and not server_ended
+                    and session.close_reason is None
+                    and cfg is not None
+                ):
+                    remaining_sec = 0
+                    if effective_timeout_sec > 0 and session_started_at is not None:
+                        remaining_sec = max(
+                            1,
+                            int(
+                                effective_timeout_sec
+                                - (time.monotonic() - session_started_at)
+                            ),
+                        )
+                    self._resume_grant = {
+                        "session_id": session_id,
+                        "deadline": time.monotonic() + RESUME_GRANT_WINDOW_SEC,
+                        "cfg": cfg,
+                        "timeout_remaining_sec": remaining_sec,
+                        "snapshots": self._session_snapshots.get(session_id, []),
+                        "bookmarks": self._session_bookmarks.get(session_id, []),
+                        "interaction_id": self._interaction_ids.get(session_id),
+                    }
+                    self._schedule_resume_grant_expiry(self._resume_grant)
+                    clog.log(
+                        "info",
+                        "transport lost with model state intact; resume "
+                        f"window open for {RESUME_GRANT_WINDOW_SEC:.0f} s",
+                    )
+                elif resuming and not went_live:
+                    # The resume leg never came up (transport stayed down),
+                    # so nothing touched the model state: put the grant
+                    # back, re-keyed to the id this client now knows, for
+                    # another attempt within the original deadline.
+                    self._resume_grant = {**resume_state, "session_id": session_id}
+                    self._schedule_resume_grant_expiry(self._resume_grant)
                 self._candidate_sessions.pop(session_id, None)
                 self._session_snapshots.pop(session_id, None)
                 # Release the labelled snapshots' tensor clones on session end,

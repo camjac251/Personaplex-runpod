@@ -331,6 +331,11 @@ class RTCSession:
         # knowledge of what consumes the audio. None means no observer.
         self._on_pcm: Optional[Callable[[np.ndarray], None]] = None
         self._ready_sent = False
+        # Why the session closed, when known. "error" marks an internal
+        # failure (inbound or process loop raised), which callers use to
+        # distinguish a broken transport (model state still trustworthy)
+        # from broken state.
+        self.close_reason: Optional[str] = None
 
         @self._pc.on("track")
         def _on_track(track: MediaStreamTrack) -> None:
@@ -395,24 +400,6 @@ class RTCSession:
         frames will be received and queued (with the same 200 ms
         drop-newest cap as the old WS path), but no model inference
         runs until ``start_processing()`` is called.
-        """
-        await self._pc.setRemoteDescription(offer)
-        answer = await self._pc.createAnswer()
-        await self._pc.setLocalDescription(answer)
-        return self._pc.localDescription
-
-    async def renegotiate(
-        self, offer: RTCSessionDescription
-    ) -> RTCSessionDescription:
-        """Answer a fresh offer on the existing peer connection.
-
-        Used for an ICE restart: the client re-offers with a fresh ICE
-        ufrag/pwd, and this answers it on the live ``_pc`` without
-        rebuilding the connection. The inbound audio task, the outbound
-        track, and the control channel ride the same peer connection, so
-        no media or data state is recreated. Fresh server candidates from
-        this round flow out through the already-consuming
-        ``iter_local_candidates`` generator.
         """
         await self._pc.setRemoteDescription(offer)
         answer = await self._pc.createAnswer()
@@ -888,6 +875,7 @@ class RTCSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self.close_reason = "error"
             self._log("error", f"inbound_loop: {type(exc).__name__}: {exc}")
         finally:
             self._closed.set()
@@ -933,6 +921,7 @@ class RTCSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self.close_reason = "error"
             self._log("error", f"process_loop: {type(exc).__name__}: {exc}")
         finally:
             self._closed.set()
