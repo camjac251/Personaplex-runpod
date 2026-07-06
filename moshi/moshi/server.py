@@ -241,10 +241,27 @@ TRANSCRIPT_BUFFER_MAX = 80
 # context lag arbitrarily far behind reality.
 VISION_QUEUE_MAX = 64
 
-# Wait for N consecutive PAD text tokens before starting a vision
-# inject. Ensures we interrupt during natural silence, not mid-word.
-# Pulled from NVIDIA/personaplex PR #69's `LIVE_PROMPT_BOUNDARY_STREAK`.
+# Necessary (not sufficient) condition for a context inject: at least this
+# many consecutive PAD text tokens. Pulled from NVIDIA/personaplex PR #69's
+# `LIVE_PROMPT_BOUNDARY_STREAK`. A PAD streak alone does NOT mean the model
+# has stopped talking: the inner-monologue text channel emits PAD between
+# and within words while the audio for the current word is still decoding,
+# so a short streak is reached mid-utterance. The audio-silence gate below
+# is what actually confirms the thought has finished; both must hold.
 LIVE_PROMPT_BOUNDARY_STREAK = 2
+
+# End-of-thought audio gate. A caption is only injected once the model's
+# own decoded output has been below INJECT_SILENCE_RMS for
+# INJECT_SILENCE_STREAK consecutive frames, i.e. the current thought has
+# finished speaking (including the text->audio decoder lag draining out),
+# so the context lands in the following silence and conditions the next
+# thought instead of cutting the current one. Tune these on-device: raise
+# the streak or lower the RMS if injects still clip speech; lower the
+# streak or raise the RMS if captions never inject on a talkative model.
+# The RMS floor is 2x the proven ASR speech/silence threshold
+# (ASR_SILENCE_RMS = 0.005) on the same float PCM scale.
+INJECT_SILENCE_RMS = 0.01
+INJECT_SILENCE_STREAK = 6
 
 # Hard cap on how many tokens we'll inject in one window before forcing
 # a return to normal generation. ~4 s at 12.5 Hz.
@@ -803,6 +820,12 @@ class ServerState:
         # new session in _run_rtc_session.
         self._vision_pending: deque[int] = deque()
         self._vision_pad_streak: int = 0
+        # Consecutive frames the model's own decoded audio has been below
+        # INJECT_SILENCE_RMS. The end-of-thought gate reads this so a
+        # caption only injects once the current utterance has actually
+        # finished speaking, not merely paused between words on the text
+        # channel. Reset on each new session and on rewind.
+        self._audio_silence_streak: int = 0
         self._vision_inject_steps: int = 0
         # Persona-reinforce state, sharing the vision drip machinery.
         # _reinforce_enabled is the connect-time flag.
@@ -1313,12 +1336,21 @@ class ServerState:
         with self._infer_lock:
             _rtf_t0 = time.perf_counter()
             prev_pad_streak = self._vision_pad_streak
+            # End-of-thought gate: the model has finished its current
+            # utterance when the text channel is padding AND its decoded
+            # audio has been silent for a sustained window. The audio part
+            # is what a bare pad streak misses, since PAD also fills the
+            # gaps between and within words while speech is still playing.
+            # Injecting only then drips the context into the trailing
+            # silence, so it conditions the model's next thought instead of
+            # cutting the current one.
+            model_silent = (
+                self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+                and self._audio_silence_streak >= INJECT_SILENCE_STREAK
+            )
             # Decide once per outer call whether to inject this frame.
             inject_token: Optional[int] = None
-            if (
-                self._vision_pending
-                and self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
-            ):
+            if self._vision_pending and model_silent:
                 if self._vision_inject_steps < LIVE_PROMPT_MAX_STEPS:
                     inject_token = self._vision_pending.popleft()
                     self._vision_inject_steps += 1
@@ -1336,7 +1368,7 @@ class ServerState:
             # slow, and the two must not interleave token-by-token (that
             # would scramble both messages). A reinforce window arms only on
             # a frame vision isn't using, then drains its own queue one
-            # token per frame under the same boundary-streak + cap gate.
+            # token per frame under the same end-of-thought + cap gate.
             if (
                 inject_token is None
                 and self._reinforce_enabled
@@ -1345,7 +1377,7 @@ class ServerState:
                 now = time.monotonic()
                 if not self._reinforce_pending:
                     if (
-                        self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+                        model_silent
                         and (now - self._last_reinforce_at)
                         >= REINFORCE_MIN_INTERVAL_SEC
                     ):
@@ -1356,7 +1388,7 @@ class ServerState:
                         self._last_reinforce_at = now
                 if self._reinforce_pending:
                     if (
-                        self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+                        model_silent
                         and self._reinforce_inject_steps < LIVE_PROMPT_MAX_STEPS
                     ):
                         inject_token = self._reinforce_pending.popleft()
@@ -1395,6 +1427,25 @@ class ServerState:
                 pcm_np = main_pcm[0, 0].numpy()
 
                 interrupt_gate = self._interrupt_gate_remaining > 0
+
+                # Track how long the model's own audio has been silent so an
+                # inject only arms once the current thought has finished
+                # speaking (the pad streak alone reaches its threshold
+                # mid-word; the decoded audio for the last word is still
+                # draining). Measured on the natural output before the gate.
+                # Frozen on forced (drip) frames like the pad streak, and
+                # also on interrupt frames, whose gated audio is not real
+                # model output to measure.
+                if forced_text is None and not interrupt_gate:
+                    frame_rms = (
+                        float(np.sqrt(np.mean(np.square(pcm_np))))
+                        if pcm_np.size
+                        else 0.0
+                    )
+                    if frame_rms < INJECT_SILENCE_RMS:
+                        self._audio_silence_streak += 1
+                    else:
+                        self._audio_silence_streak = 0
 
                 # Audio gate: silence outbound PCM while we're injecting
                 # or while a user interrupt is forcing the model to yield.
@@ -1487,6 +1538,7 @@ class ServerState:
                                 self._reinforce_pending.clear()
                                 self._reinforce_inject_steps = 0
                                 self._vision_pad_streak = 0
+                                self._audio_silence_streak = 0
                                 self._last_rewind_at = now
                                 # Drop buffered user audio so the turn that
                                 # straddled the wobble is not re-finalized
@@ -2808,6 +2860,7 @@ class ServerState:
                     with self._infer_lock:
                         self._vision_pending.clear()
                         self._vision_pad_streak = 0
+                        self._audio_silence_streak = 0
                         self._vision_inject_steps = 0
                         self._reinforce_pending.clear()
                         self._reinforce_inject_steps = 0
@@ -2957,6 +3010,7 @@ class ServerState:
                                 self._reinforce_pending.clear()
                                 self._reinforce_inject_steps = 0
                                 self._vision_pad_streak = 0
+                                self._audio_silence_streak = 0
                                 self._collapse_triggers.clear()
                                 self._prev_pad_force_remaining = 0
                                 # Share the auto-rewind cooldown clock so a jump
@@ -3027,6 +3081,7 @@ class ServerState:
                             self._reinforce_pending.clear()
                             self._reinforce_inject_steps = 0
                             self._vision_pad_streak = 0
+                            self._audio_silence_streak = 0
                             self._collapse_triggers.clear()
                             self._prev_pad_force_remaining = 0
                             self._last_rewind_at = time.monotonic()
