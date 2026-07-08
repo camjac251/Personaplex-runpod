@@ -158,8 +158,8 @@ function App() {
   // Holds at most one at a time, so starting a new preview supersedes any
   // in-flight one. Drives the row's play/stop glyph and waveform recolor.
   const [previewing, setPreviewing] = useState(null);
-  const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "balanced");
-  const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "natural");
+  const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "none");
+  const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "none");
   const [uploadedVoiceFilename, setUploadedVoiceFilename] = useState("");
   const [uploadedVoiceLabel, setUploadedVoiceLabel] = useState("");
   const [uploadedVoiceMeta, setUploadedVoiceMeta] = useState(null);
@@ -532,11 +532,17 @@ function App() {
     [customProfiles, sessionProfileId],
   );
   const selectedAdherence = useMemo(
-    () => ADHERENCE_MODES.find((item) => item.id === adherenceMode) || ADHERENCE_MODES[0],
+    () =>
+      ADHERENCE_MODES.find((item) => item.id === adherenceMode)
+      || ADHERENCE_MODES.find((item) => item.id === "none")
+      || ADHERENCE_MODES[0],
     [adherenceMode],
   );
   const selectedExpression = useMemo(
-    () => EXPRESSION_MODES.find((item) => item.id === expressionMode) || EXPRESSION_MODES[0],
+    () =>
+      EXPRESSION_MODES.find((item) => item.id === expressionMode)
+      || EXPRESSION_MODES.find((item) => item.id === "none")
+      || EXPRESSION_MODES[0],
     [expressionMode],
   );
   const currentProfileSnapshot = useMemo(() => {
@@ -627,8 +633,8 @@ function App() {
     setVoiceGender("all");
     setVoiceBlend(false);
     clearUploadedVoice();
-    setAdherenceMode(profile.adherenceMode || "balanced");
-    setExpressionMode(profile.expressionMode || "natural");
+    setAdherenceMode(profile.adherenceMode || "none");
+    setExpressionMode(profile.expressionMode || "none");
     setTextTemp(Number.isFinite(Number(profile.textTemp)) ? Number(profile.textTemp) : DEFAULTS.textTemp);
     setTextTopk(Number.isFinite(Number(profile.textTopk)) ? Number(profile.textTopk) : DEFAULTS.textTopk);
     setAudioTemp(Number.isFinite(Number(profile.audioTemp)) ? Number(profile.audioTemp) : DEFAULTS.audioTemp);
@@ -851,12 +857,16 @@ function App() {
     setSessionProfileId(allSessionProfiles.some((item) => item.id === profile?.session_profile_id) ? profile.session_profile_id : "custom");
     setPresetId(preset ? preset.id : "custom");
     setTextPrompt(text);
-    if (ADHERENCE_MODES.some((item) => item.id === profile?.adherence_mode)) {
-      setAdherenceMode(profile.adherence_mode);
-    }
-    if (EXPRESSION_MODES.some((item) => item.id === profile?.expression_mode)) {
-      setExpressionMode(profile.expression_mode);
-    }
+    setAdherenceMode(
+      ADHERENCE_MODES.some((item) => item.id === profile?.adherence_mode)
+        ? profile.adherence_mode
+        : "none",
+    );
+    setExpressionMode(
+      EXPRESSION_MODES.some((item) => item.id === profile?.expression_mode)
+        ? profile.expression_mode
+        : "none",
+    );
     if (typeof config.vision_prompt === "string") setVisionPrompt(config.vision_prompt);
     setVisionInTranscript(!!config.vision_in_transcript);
     setVisionFeedModel(
