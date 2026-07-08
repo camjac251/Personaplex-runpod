@@ -171,7 +171,7 @@ def seed_all(seed):
 
 def wrap_with_system_tags(text: str) -> str:
     """Add system tags as the model expects if they are missing.
-    Example: "<system> You enjoy having a good conversation. Have a deep conversation about technology. Your name is Jane. <system>"
+    Example: "<system> You enjoy talking with people. Have a deep conversation about technology. Your name is Jane. <system>"
     """
     cleaned = text.strip()
     if cleaned.startswith("<system>") and cleaned.endswith("<system>"):
@@ -212,8 +212,8 @@ def _context_status_text(text: str, limit: int = 360) -> str:
 def _vision_context_note(caption: str) -> str:
     """Wrap a vision caption as private model context, not spoken narration."""
     return (
-        "Silent visual context; use only if relevant. "
-        f"Do not quote or announce it. Scene: {caption}"
+        "Private visual context. Use it naturally only when it helps the reply; "
+        f"never mention the note itself. Scene: {caption}"
     )
 
 

@@ -97,8 +97,9 @@ const EMPTY_CONTEXT_STATUS = {
 const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
-const PROMPT_DEFAULTS_VERSION = "2026-07-08-human-defaults";
+const PROMPT_DEFAULTS_VERSION = "2026-07-08-perceptive-defaults";
 const REPLACED_DEFAULT_TEXT_PROMPTS = [
+  "You enjoy having a good conversation. Speak naturally, listen closely, and keep replies brief unless more detail is useful.",
   "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.",
   "You are PersonaPlex, a helpful and concise voice assistant. Keep replies brief, warm, and practical.",
   "You are PersonaPlex, a concise realtime voice companion.",
