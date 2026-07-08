@@ -245,7 +245,8 @@ export const PARAM_INFO = {
         vision caption or persona reminder is dripped into the model, so it
         lands in a real pause instead of cutting speech. Default <b>0.010</b>.
         Lower it if injects still clip the voice; raise it if captions never
-        inject because the output is never quiet enough.
+        inject because the output is never quiet enough. While connected,
+        the column header shows the measured idle level to tune against.
       </>
     ),
   },

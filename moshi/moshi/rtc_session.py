@@ -782,14 +782,19 @@ class RTCSession:
         vram_used: Optional[int] = None,
         gpu_util: Optional[int] = None,
         rtf: Optional[float] = None,
+        idle_rms: Optional[float] = None,
+        silence_streak: Optional[int] = None,
     ) -> None:
         """Periodic accelerator-memory / utilization / inference-health readout.
 
         Fields that could not be sampled are omitted; sending an empty stat
         is a no-op so the timer never floods the channel with bare frames.
         ``rtf`` is the server-measured real-time factor (compute time per
-        audio frame / that frame's audio duration); the client reads only
-        the fields it knows, so consumers compose without ordering.
+        audio frame / that frame's audio duration); ``idle_rms`` and
+        ``silence_streak`` expose the inject gate's observed decoded idle
+        floor and its current silent-frame count so the Silence floor
+        slider can be tuned against reality. The client reads only the
+        fields it knows, so consumers compose without ordering.
         """
         if not (self._control and self._control.readyState == "open"):
             return
@@ -800,6 +805,10 @@ class RTCSession:
             payload["gpu_util"] = int(gpu_util)
         if rtf is not None:
             payload["rtf"] = round(float(rtf), 3)
+        if idle_rms is not None:
+            payload["idle_rms"] = round(float(idle_rms), 4)
+        if silence_streak is not None:
+            payload["silence_streak"] = int(silence_streak)
         if len(payload) == 1:
             return
         self._control.send(json.dumps(payload))

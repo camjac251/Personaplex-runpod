@@ -321,6 +321,12 @@ BOOKMARK_LABEL_MAX_LEN = 64
 # readout stable without lagging a real load change for long.
 RTF_EMA_ALPHA = 0.2
 
+# Smoothing for the observed idle decoded-output RMS, sampled only during
+# pad streaks so active speech doesn't inflate it. The stat channel reports
+# it so the Silence floor slider can be tuned against the model's real
+# quiet level instead of a guess.
+IDLE_RMS_EMA_ALPHA = 0.2
+
 # Stop-current-response / barge-in gate. Mimi runs around 12.5 text frames
 # per second, so this is roughly one second of forced yielding while queued
 # assistant audio is cleared immediately by RTCSession.
@@ -831,6 +837,10 @@ class ServerState:
         # finished speaking, not merely paused between words on the text
         # channel. Reset on each new session and on rewind.
         self._audio_silence_streak: int = 0
+        # Smoothed RMS of the model's decoded output while it is padding:
+        # the observed idle floor the silence gate compares against.
+        # Reported on the stat channel; reset per session.
+        self._observed_idle_rms_ema: float = 0.0
         # Active end-of-thought gate thresholds for this session. Defaults
         # until the config message applies cfg values; live-tunable via
         # update_config. Read in _process_audio_frame under _infer_lock;
@@ -1460,6 +1470,16 @@ class ServerState:
                         self._audio_silence_streak += 1
                     else:
                         self._audio_silence_streak = 0
+                    # Sample the idle floor on pad frames only (the streak
+                    # still holds last frame's value here; one frame of lag
+                    # is immaterial to a smoothed readout).
+                    if self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK:
+                        if self._observed_idle_rms_ema <= 0.0:
+                            self._observed_idle_rms_ema = frame_rms
+                        else:
+                            self._observed_idle_rms_ema += IDLE_RMS_EMA_ALPHA * (
+                                frame_rms - self._observed_idle_rms_ema
+                            )
 
                 # Audio gate: silence outbound PCM while we're injecting
                 # or while a user interrupt is forcing the model to yield.
@@ -2555,6 +2575,17 @@ class ServerState:
         # negotiation leaves the window open for another attempt.
         resume_state: Optional[dict] = None
         grant = self._resume_grant
+        if resume_session_id is not None and (
+            grant is None
+            or grant["session_id"] != resume_session_id
+            or time.monotonic() >= grant["deadline"]
+        ):
+            # The id is a secret proving session ownership; log a prefix.
+            logger.info(
+                "resume requested for %s… but no grant matched "
+                "(expired, superseded, or never recorded); starting fresh",
+                resume_session_id[:8],
+            )
         if (
             grant is not None
             and resume_session_id is not None
@@ -2913,9 +2944,11 @@ class ServerState:
                         # and let the first pad streak arm the window.
                         self._last_reinforce_at = time.monotonic()
                         self._transcript_recent.clear()
-                        # Drop the prior session's smoothed RTF so a fresh
-                        # session does not start by reporting a stale ratio.
+                        # Drop the prior session's smoothed RTF and idle-RMS
+                        # so a fresh session does not start by reporting
+                        # stale readouts.
                         self._rtf_ema = 0.0
+                        self._observed_idle_rms_ema = 0.0
 
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, _reset_session_state)
@@ -3625,8 +3658,19 @@ class ServerState:
                         if not session.is_alive():
                             break
                         rtf = self._rtf_ema if self._rtf_ema > 0.0 else None
+                        idle_rms = (
+                            self._observed_idle_rms_ema
+                            if self._observed_idle_rms_ema > 0.0
+                            else None
+                        )
                         try:
-                            session.send_stat(vram_used, gpu_util, rtf)
+                            session.send_stat(
+                                vram_used,
+                                gpu_util,
+                                rtf,
+                                idle_rms=idle_rms,
+                                silence_streak=self._audio_silence_streak,
+                            )
                         except Exception as exc:
                             clog.log(
                                 "warning",
@@ -3937,6 +3981,21 @@ class ServerState:
                     # another attempt within the original deadline.
                     self._resume_grant = {**resume_state, "session_id": session_id}
                     self._schedule_resume_grant_expiry(self._resume_grant)
+                else:
+                    # Name the reason so "why didn't resume work?" is
+                    # answerable from the log alone.
+                    reason = (
+                        "server ended it"
+                        if server_ended
+                        else "client said goodbye"
+                        if client_ended
+                        else f"close_reason={session.close_reason!r}"
+                        if session.close_reason is not None
+                        else "session never went live"
+                        if not went_live
+                        else "no config applied"
+                    )
+                    clog.log("info", f"no resume grant recorded: {reason}")
                 self._candidate_sessions.pop(session_id, None)
                 self._session_snapshots.pop(session_id, None)
                 # Release the labelled snapshots' tensor clones on session end,

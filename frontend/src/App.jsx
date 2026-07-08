@@ -189,6 +189,10 @@ function App() {
   // by that frame's audio duration. Below 1 means inference keeps up; at or
   // above 1 it is falling behind. 0 when not live (no measurement).
   const [rtf, setRtf] = useState(0);
+  // Inject-gate telemetry: the model's observed idle decoded-audio RMS and
+  // the current silent-frame streak, so the Silence floor slider can be
+  // tuned against the model's real quiet level. Nulls when not live.
+  const [injectStat, setInjectStat] = useState({ idleRms: null, streak: null });
 
   const [visionOn, setVisionOn] = useState(false);
   const [visionPaused, setVisionPaused] = useState(false);
@@ -1252,6 +1256,7 @@ function App() {
       setSpeaking(null);
       setGpuStat({ vramUsed: 0, gpuUtil: null });
       setRtf(0);
+      setInjectStat({ idleRms: null, streak: null });
       // The server's finalize event usually can't reach a closing data
       // channel, so on a real session end mark an active server recording
       // ready here; the file exists once the session has ended.
@@ -1503,6 +1508,12 @@ function App() {
         // Gate on field presence: the stat envelope is shared, so each
         // consumer reads only the fields it knows.
         if (Number.isFinite(message.rtf)) setRtf(message.rtf);
+        if (Number.isFinite(message.idle_rms) || Number.isFinite(message.silence_streak)) {
+          setInjectStat((prev) => ({
+            idleRms: Number.isFinite(message.idle_rms) ? message.idle_rms : prev.idleRms,
+            streak: Number.isFinite(message.silence_streak) ? message.silence_streak : prev.streak,
+          }));
+        }
       } else if (message.type === "pong") {
         const sentAt = typeof message.t === "number" ? message.t : null;
         if (sentAt !== null) {
@@ -3860,7 +3871,7 @@ function App() {
                   <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); sendLiveConfig({ padding_bonus: Number(value) }); }} min={0} max={6} step={0.1} format={(v) => fmt(v, 1)} />
                   <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={0} max={2000} step={10} format={(v) => (v ? `${v}` : "off")} />
                 </RailColumn>
-                <RailColumn title="INJECT" aggregate={`${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`}>
+                <RailColumn title="INJECT" aggregate={injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`}>
                   <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_rms: Number(value) }); }} min={0.001} max={0.05} step={0.001} format={(v) => fmt(v, 3)} />
                   <MiniSlider label="Silence hold" info="injStreak" value={injectSilenceStreak} onChange={(value) => { setInjectSilenceStreak(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_streak: Number.parseInt(value, 10) }); }} min={2} max={20} step={1} format={(v) => fmt(v, 0)} />
                 </RailColumn>
