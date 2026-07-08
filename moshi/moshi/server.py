@@ -192,6 +192,21 @@ def _strip_system_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header's delay-seconds form.
+
+    The HTTP-date form is rare from Gemini and not worth a date parser;
+    unparseable input falls back to the default cooldown.
+    """
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def _sanitize_vision_text(text: str) -> str:
     # Strip any <system> wrap first: the wrap is a t=0-only convention, so a
     # caption carrying it would inject an off-distribution marker mid-stream.
@@ -337,6 +352,17 @@ RESUME_GRANT_WINDOW_SEC = 25.0
 # for the rest of the session and tell the client. Stops the server from
 # silently retrying a broken schema for the full session lifetime.
 VISION_AUTO_DISABLE_THRESHOLD = 3
+
+# Statuses that mean throttling or a transient server-side blip, not a
+# broken request: these self-heal, so they must not advance the
+# consecutive-error counter (three of which permanently disable vision for
+# the session). They also create no interaction, so the chain id stays
+# valid. Instead of counting them, back off for a short cooldown; a
+# Retry-After header is honored when parseable, capped so one huge header
+# cannot mute vision for the rest of the session.
+GEMINI_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+GEMINI_TRANSIENT_COOLDOWN_SEC = 5.0
+GEMINI_TRANSIENT_COOLDOWN_MAX_SEC = 60.0
 
 # Bound each Gemini request so one stuck HTTP call cannot hold the
 # per-session _vision_in_flight guard and silently stop future captures.
@@ -884,8 +910,11 @@ class ServerState:
         self._last_rewind_at: Optional[float] = None
         self._interrupt_gate_remaining: int = 0
         # Gemini consecutive-error counter for the auto-disable path.
-        # Reset on every 2xx success and on session start.
+        # Reset on every 2xx success and on session start. Transient
+        # statuses (GEMINI_TRANSIENT_STATUSES) bypass the counter and set a
+        # cooldown deadline instead; frame dispatch skips until it passes.
         self._gemini_consecutive_errors: int = 0
+        self._vision_cooldown_until: float = 0.0
         self._vision_force_disabled: bool = False
         # Server-side external-vision spend guard. _vision_frames_dispatched
         # counts frames actually sent to the description service this session;
@@ -1798,6 +1827,11 @@ class ServerState:
             return
         if self._vision_spend_tripped:
             return
+        # Cooling down after a transient Gemini failure (throttle/5xx);
+        # dropping the frame silently matches the in-flight guard below,
+        # and the cooldown was already logged when it was set.
+        if time.monotonic() < self._vision_cooldown_until:
+            return
         if session_id != self._active_session_id:
             return
 
@@ -2080,6 +2114,30 @@ class ServerState:
                 else:
                     err_text = await resp.text()
                     clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
+                    if resp.status in GEMINI_TRANSIENT_STATUSES:
+                        # Throttling / server blip: self-heals, says nothing
+                        # about the request being malformed, and created no
+                        # interaction (the chain id stays valid). Skip the
+                        # permanent-disable counter and cool down instead.
+                        retry_after = _parse_retry_after(
+                            resp.headers.get("Retry-After")
+                        )
+                        cooldown = min(
+                            max(
+                                retry_after or GEMINI_TRANSIENT_COOLDOWN_SEC,
+                                GEMINI_TRANSIENT_COOLDOWN_SEC,
+                            ),
+                            GEMINI_TRANSIENT_COOLDOWN_MAX_SEC,
+                        )
+                        self._vision_cooldown_until = (
+                            time.monotonic() + cooldown
+                        )
+                        clog.log(
+                            "warning",
+                            f"vision: transient Gemini {resp.status}; "
+                            f"pausing captures for {cooldown:.0f}s",
+                        )
+                        return
                     if not detail:
                         self._interaction_ids.pop(session_id, None)
                     self._gemini_consecutive_errors += 1
@@ -2901,6 +2959,7 @@ class ServerState:
                 # Reset auto-disable so a previous session's vision failures
                 # don't carry over and silently block this session's calls.
                 self._gemini_consecutive_errors = 0
+                self._vision_cooldown_until = 0.0
                 self._vision_force_disabled = False
                 # Reset the spend guard and adopt this session's ceiling. getattr
                 # keeps it resilient if config is ever built without the fields.
