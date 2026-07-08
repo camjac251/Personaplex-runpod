@@ -362,6 +362,29 @@
     letter-spacing: 0.04em;
     text-transform: uppercase;
   }
+  .field-meta-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .meta-action {
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    cursor: pointer;
+  }
+  .meta-action:disabled {
+    color: var(--ink-4);
+    cursor: default;
+    opacity: 0.42;
+  }
+  .meta-action:not(:disabled):hover {
+    color: var(--ink);
+  }
   .session-profile .lb-trigger {
     background: var(--surface);
     border-color: var(--line-2);
