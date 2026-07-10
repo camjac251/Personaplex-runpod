@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM runpod/base:1.0.7-cuda1281-ubuntu2404
+FROM runpod/base:1.0.7-cuda1281-ubuntu2404@sha256:abd8ebde05b7027fb95913aefbcb9a236381633a481962877f658c2ed721fc37
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -37,11 +37,8 @@ COPY moshi/pyproject.toml ./moshi/pyproject.toml
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-dev --no-install-workspace --compile-bytecode
 
-COPY . .
-
-RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv sync --frozen --no-dev --compile-bytecode \
-    && chmod +x docker/runpod-start.sh docker/app-start.sh
+# Keep source as an independent overlay; a later RUN would materialize the 14 GB parent.
+COPY --link . .
 
 EXPOSE 8888 8998
 

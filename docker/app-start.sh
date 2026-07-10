@@ -17,6 +17,7 @@ export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/workspace/.cache/triton}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TMPDIR="${TMPDIR:-/workspace/tmp}"
+export PYTHONPATH="$APP_DIR/moshi${PYTHONPATH:+:$PYTHONPATH}"
 
 log() { printf '[personaplex] %s\n' "$*"; }
 
@@ -51,7 +52,7 @@ log "checking model assets under $HF_HOME and voices under $VOICE_DIR"
 "$APP_DIR/.venv/bin/python" "$APP_DIR/docker/prefetch_assets.py" "${asset_args[@]}"
 
 log "starting moshi-server on :$PORT"
-exec "$APP_DIR/.venv/bin/moshi-server" \
+exec "$APP_DIR/.venv/bin/python" -m moshi.server \
     --host 0.0.0.0 \
     --port "$PORT" \
     --voice-prompt-dir "$VOICE_DIR"

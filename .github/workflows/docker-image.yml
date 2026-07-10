@@ -11,6 +11,10 @@ on:
 env:
   IMAGE_NAME: ghcr.io/camjac251/personaplex-runpod
 
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build and publish
@@ -54,9 +58,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha
-            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: |
-            type=gha,mode=max
-            ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=max,oci-mediatypes=true,image-manifest=true', env.IMAGE_NAME) || '' }}
+          # The image exceeds the default Actions cache quota; use one durable registry cache.
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache,mode=min,oci-mediatypes=true,image-manifest=true', env.IMAGE_NAME) || '' }}
