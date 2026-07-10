@@ -147,18 +147,30 @@ def _restore_streaming_state_from_keys(streaming_state: State,
     for key in keys:
         full_key = f"{prefix}.{key}"
         existing_value = getattr(streaming_state, key)
-        if isinstance(existing_value, torch.Tensor):
-            _restore_streaming_state_pt(existing_value, full_key, state_dict)
-        elif isinstance(existing_value, (int, float, str, bool, type(None))):
-            if full_key in state_dict:
-                restored_value = state_dict[full_key]
-                if isinstance(restored_value, torch.Tensor):
-                    restored_value = restored_value.to(device)
+        if full_key in state_dict:
+            restored_value = state_dict.pop(full_key)
+            if restored_value is None:
+                setattr(streaming_state, key, None)
+            elif isinstance(restored_value, torch.Tensor):
+                if isinstance(existing_value, torch.Tensor):
+                    existing_value.copy_(restored_value.to(existing_value.device))
+                else:
+                    # .to(device) may return the snapshot tensor itself. Clone
+                    # so subsequent live mutations cannot corrupt a reusable
+                    # stored snapshot.
+                    setattr(
+                        streaming_state,
+                        key,
+                        restored_value.detach().clone().to(device),
+                    )
+            elif isinstance(restored_value, (int, float, str, bool)):
                 setattr(streaming_state, key, restored_value)
-                
-                state_dict.pop(full_key)
             else:
-                raise RuntimeError(f"Key {full_key} not found in state_dict.")
+                raise TypeError(
+                    f"Unsupported restored value {type(restored_value)} for {full_key}."
+                )
+        elif isinstance(existing_value, (int, float, str, bool, type(None), torch.Tensor)):
+            raise RuntimeError(f"Key {full_key} not found in state_dict.")
         else:
             _set_streaming_state_inplace(existing_value, state_dict, full_key, device)
 

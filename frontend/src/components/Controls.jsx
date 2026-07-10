@@ -214,7 +214,8 @@ export function ToggleRow({ name, desc, value, onChange, info }) {
   );
 }
 
-export function MiniSlider({ label, value, onChange, min, max, step, format = (v) => v, info }) {
+export function MiniSlider({ label, value, onChange, onCommit, min, max, step, format = (v) => v, info }) {
+  const commit = (event) => onCommit?.(Number(event.currentTarget.value));
   return (
     <div className="mini">
       <div className="mini-row">
@@ -232,6 +233,9 @@ export function MiniSlider({ label, value, onChange, min, max, step, format = (v
         value={value}
         aria-label={label}
         onChange={(event) => onChange(Number(event.target.value))}
+        onPointerUp={commit}
+        onKeyUp={commit}
+        onBlur={commit}
       />
     </div>
   );

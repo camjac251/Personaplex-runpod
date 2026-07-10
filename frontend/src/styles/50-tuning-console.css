@@ -39,11 +39,25 @@
     font-size: 10px;
     color: var(--ink-4);
   }
-  /* ─── Tuning rail (four-column slider grid inside the rack) ─── */
+  .rail-range-row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 5px 12px;
+    border-bottom: 1px solid var(--line);
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  /* ─── Tuning rail slider grid inside the rack ─── */
   .rail {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, minmax(128px, 1fr));
     min-height: 0;
+    overflow-x: auto;
   }
   .rail-col {
     border-right: 1px solid var(--line);
@@ -192,6 +206,22 @@
     color: var(--ink);
   }
   .vision-tune .mini-row .l { color: var(--ink-3); }
+  .vision-reaction-row {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding-top: 4px;
+    font-size: 10.5px;
+  }
+  .vision-reaction-row > .l { color: var(--ink-3); }
+  .vision-reaction {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .vision-reaction button {
+    min-width: 0;
+    padding-inline: 6px;
+  }
   .vision-mini-action {
     display: inline-flex;
     align-items: center;

@@ -40,7 +40,12 @@ from typing import Optional, Union, List, Tuple, Iterator
 import sphn
 import torch
 
-from ..utils.sampling import sample_token, apply_repetition_penalty
+from ..utils.sampling import (
+    apply_repetition_penalty,
+    multinomial,
+    sample_token,
+    sample_top_k,
+)
 from ..utils.compile import CUDAGraphed
 from ..modules.streaming import StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
@@ -583,12 +588,12 @@ class _LMGenState:
     graphed_embeddings: CUDAGraphed
     graphed_depth: CUDAGraphed
     recent_text_tokens: torch.Tensor  # [B, MAX_REPETITION_CONTEXT], -1 = empty
-    recent_text_offset: int = 0
+    recent_text_offset: torch.Tensor  # [B], advances only on meaningful text
     offset: int = 0
 
     def reset(self):
         self.offset = 0
-        self.recent_text_offset = 0
+        self.recent_text_offset.zero_()
         self.recent_text_tokens.fill_(-1)
         self.provided[:] = False
 
@@ -719,6 +724,23 @@ class LMGen(StreamingModule[_LMGenState]):
         duration = self._frame_size / self._sample_rate
         sine = create_sinewave(duration, self._sample_rate)
         self._sine_frame = torch.tensor(sine, device=self.lm_model.device).unsqueeze(0).unsqueeze(0)  # (1,1,T)
+        self._zero_codes = torch.as_tensor(
+            SILENCE_TOKENS,
+            dtype=torch.long,
+            device=self.lm_model.device,
+        ).view(1, 8, 1)
+        self._sine_codes = torch.as_tensor(
+            SINE_TOKENS,
+            dtype=torch.long,
+            device=self.lm_model.device,
+        ).view(1, 8, 1)
+        # Temperature is a tensor input to the CUDA-graphed depformer so live
+        # updates change the replayed computation. top-k remains a captured
+        # Python constant because it changes the topk operator's output shape;
+        # set_audio_sampling() resets that graph only when top-k changes.
+        self._audio_temperature = torch.tensor(
+            float(temp), dtype=torch.float32, device=self.lm_model.device
+        )
         self.check = check
         self.report_loss = report_loss
         if report_loss:
@@ -784,8 +806,20 @@ class LMGen(StreamingModule[_LMGenState]):
             device=lm_model.device,
             dtype=torch.long,
         )
+        recent_text_offset = torch.zeros(
+            (batch_size,), device=lm_model.device, dtype=torch.long
+        )
 
-        return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth, recent_text_tokens)
+        return _LMGenState(
+            cache,
+            provided,
+            initial,
+            graphed_main,
+            graphed_embeddings,
+            graphed_depth,
+            recent_text_tokens,
+            recent_text_offset,
+        )
     
     @torch.no_grad()
     def prepare_step_input(self,
@@ -908,6 +942,7 @@ class LMGen(StreamingModule[_LMGenState]):
             target_,
             model_input_position,
             target_position,
+            text_was_forced=text_token is not None,
         )
         if return_embeddings:
             return output, embeddings
@@ -934,26 +969,29 @@ class LMGen(StreamingModule[_LMGenState]):
             target_,
             model_input_position,
             target_position,
+            text_was_forced=True,
         )
 
     @torch.no_grad()
-    def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position):
+    def process_transformer_output(
+        self,
+        transformer_out,
+        text_logits,
+        provided_,
+        target_,
+        model_input_position,
+        target_position,
+        *,
+        text_was_forced: bool,
+    ):
         state = self._streaming_state
         lm_model = self.lm_model
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text].
-        # text_logits may alias a CUDA-graph captured output buffer (see
-        # graphed_main); any in-place write must go through a clone, matching
-        # the pattern in apply_repetition_penalty. .float() is a no-op copy
-        # when dtype is already float32, so we clone explicitly.
+        # text_logits may alias a CUDA-graph captured output buffer. Apply the
+        # repetition penalty first because it already returns a clone; only
+        # make a separate copy when padding bias is the sole mutation.
         text_logits_f = text_logits.float()
-        if text_logits_f.data_ptr() == text_logits.data_ptr():
-            text_logits_f = text_logits_f.clone()
-        # Bias the text padding token up to encourage the model to yield its
-        # turn. Moshi emits text_padding_token when it has nothing to say; a
-        # positive bonus shortens rambling. 0 = off, 2-4 typical.
-        if self.padding_bonus != 0.0:
-            text_logits_f[..., lm_model.text_padding_token_id] += self.padding_bonus
         if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
             ctx = self.repetition_penalty_context
             text_logits_f = apply_repetition_penalty(
@@ -961,6 +999,16 @@ class LMGen(StreamingModule[_LMGenState]):
                 state.recent_text_tokens[:, :ctx],
                 self.repetition_penalty,
             )
+        elif (
+            self.padding_bonus != 0.0
+            and text_logits_f.data_ptr() == text_logits.data_ptr()
+        ):
+            text_logits_f = text_logits_f.clone()
+        # Bias the text padding token up to encourage the model to yield its
+        # turn. Moshi emits text_padding_token when it has nothing to say; a
+        # positive bonus shortens rambling. 0 = off, 2-4 typical.
+        if self.padding_bonus != 0.0:
+            text_logits_f[..., lm_model.text_padding_token_id] += self.padding_bonus
         sampled_text_token = sample_token(
             text_logits_f,
             self.use_sampling,
@@ -973,29 +1021,21 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
-        # forced text tokens are externally-supplied context, not model speech; counting them toward _non_pad_streak self-triggers the safety net
-        text_was_forced = bool(provided_[0, 0, 0].item())
 
         # Hard cap on turn length. If the model emits N consecutive non-pad
         # text tokens, force pad for ~1 s of text frames (12.5 Hz) so the
         # audio decoder produces real silence and the turn actually yields.
-        # Safety net under padding_bonus; no effect when max_turn_text_tokens
-        # is 0. batch=1 is asserted above, so .item() is fine.
+        # The sampled-token accounting happens after the depformer launch to
+        # avoid synchronizing CUDA between the main and depth graphs. A newly
+        # reached cap arms padding for the following frame, preserving the
+        # same maximum number of emitted text tokens.
+        turn_pad_forced = False
         if self.max_turn_text_tokens > 0 and not text_was_forced:
             pad_id = lm_model.text_padding_token_id
             if self._pad_force_remaining > 0:
                 next_text_token = torch.full_like(next_text_token, pad_id)
                 self._pad_force_remaining -= 1
-            else:
-                tok = int(next_text_token[0].item())
-                if tok == pad_id or tok == 0:
-                    self._non_pad_streak = 0
-                else:
-                    self._non_pad_streak += 1
-                    if self._non_pad_streak > self.max_turn_text_tokens:
-                        self._pad_force_remaining = 12
-                        self._non_pad_streak = 0
-                        next_text_token = torch.full_like(next_text_token, pad_id)
+                turn_pad_forced = True
 
         # Update repetition penalty ring buffer with the chosen text token.
         # Skip pad (0) and silence (3) so they do not crowd the context. Also,
@@ -1012,21 +1052,18 @@ class LMGen(StreamingModule[_LMGenState]):
         ):
             ctx = self.repetition_penalty_context
             keep_mask = (next_text_token != 0) & (next_text_token != 3)
-            slot = state.recent_text_offset % ctx
-            # Always issue the write (no .any() to avoid a per-step CUDA sync).
-            # When keep_mask is all-False the where() rewrites the existing
-            # values back, which is a no-op but stays on the GPU.
-            state.recent_text_tokens[:, slot] = torch.where(
-                keep_mask,
-                next_text_token,
-                state.recent_text_tokens[:, slot],
+            slots = torch.remainder(state.recent_text_offset, ctx).unsqueeze(1)
+            existing = state.recent_text_tokens.gather(1, slots)
+            values = torch.where(
+                keep_mask.unsqueeze(1), next_text_token.unsqueeze(1), existing
             )
-            state.recent_text_offset = (state.recent_text_offset + 1) % ctx
+            state.recent_text_tokens.scatter_(1, slots, values)
+            state.recent_text_offset.add_(keep_mask.to(dtype=torch.long))
 
         if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0], self._audio_temperature) # [B, K_audio, Card_audio]
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0], self._audio_temperature)
 
         state.provided[:, :, model_input_position] = False
         ####
@@ -1042,6 +1079,19 @@ class LMGen(StreamingModule[_LMGenState]):
             sampled_audio_tokens,
             state.cache[:, 1 : lm_model.dep_q + 1, target_position],
         )
+
+        if self.max_turn_text_tokens > 0 and not text_was_forced:
+            if turn_pad_forced:
+                self._non_pad_streak = 0
+            else:
+                tok = int(next_text_token[0].item())
+                if tok in (0, lm_model.text_padding_token_id):
+                    self._non_pad_streak = 0
+                else:
+                    self._non_pad_streak += 1
+                    if self._non_pad_streak >= self.max_turn_text_tokens:
+                        self._pad_force_remaining = 12
+                        self._non_pad_streak = 0
 
         ####
         # Calculate loss of model logits (based on state.offset - 1) compared to target (state.offset)
@@ -1164,18 +1214,31 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt = f"{path_a}+{path_b}@{mix:.2f}"
 
     def _encode_zero_frame(self) -> torch.Tensor:
-        return torch.as_tensor(
-            SILENCE_TOKENS,
-            dtype=torch.long,
-            device=self.lm_model.device,
-        ).view(1, 8, 1)
+        return self._zero_codes
 
     def _encode_sine_frame(self) -> torch.Tensor:
-        return torch.as_tensor(
-            SINE_TOKENS,
-            dtype=torch.long,
-            device=self.lm_model.device,
-        ).view(1, 8, 1)
+        return self._sine_codes
+
+    def set_audio_sampling(self, temperature: float, top_k: int) -> bool:
+        """Apply acoustic sampling controls and invalidate shape-bound graphs.
+
+        Temperature is copied into a CUDA-graph input tensor and therefore
+        updates without recapture. top-k is a Python constant captured by the
+        graph, so changing it invalidates only the depformer graph. The caller
+        must recapture it before resuming real-time inference.
+
+        Returns whether a graph reset was required.
+        """
+        temperature = float(temperature)
+        top_k = int(top_k)
+        top_k_changed = top_k != self.top_k
+        self.temp = temperature
+        self._audio_temperature.fill_(temperature)
+        self.top_k = top_k
+        state = self._streaming_state
+        if top_k_changed and state is not None:
+            state.graphed_depth.reset(warmup_steps=0)
+        return top_k_changed
 
     def _strength_sliced_voice_prompt_audio(self):
         """Tail slice of the uploaded clip selected by voice_prompt_strength.
@@ -1355,7 +1418,8 @@ class LMGen(StreamingModule[_LMGenState]):
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
         audio_tokens: torch.Tensor,
-        audio_provided: torch.Tensor
+        audio_provided: torch.Tensor,
+        audio_temperature: torch.Tensor,
     ) -> torch.Tensor:
         (B,) = text_token.shape
         prev_token = text_token
@@ -1372,12 +1436,16 @@ class LMGen(StreamingModule[_LMGenState]):
                     ret_logits = logits.squeeze(dim=1).squeeze(dim=1)
                     assert ret_logits.shape == (B, lm_model.card), ret_logits.shape
                     depformer_logits.append(ret_logits.float())
-                next_token = sample_token(
-                    logits.float(),
-                    self.use_sampling,
-                    self.temp,
-                    self.top_k,
-                )
+                if self.use_sampling:
+                    probs = torch.softmax(
+                        logits.float() / audio_temperature, dim=-1
+                    )
+                    if self.top_k > 0:
+                        next_token = sample_top_k(probs, self.top_k)[..., 0]
+                    else:
+                        next_token = multinomial(probs, num_samples=1)[..., 0]
+                else:
+                    next_token = torch.argmax(logits, dim=-1)
                 assert next_token.shape == (B, 1, 1)
                 next_token = next_token[:, 0, 0]  # shape is B
                 prev_token = torch.where(

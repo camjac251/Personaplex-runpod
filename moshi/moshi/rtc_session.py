@@ -198,13 +198,58 @@ class MimiOutputTrack(MediaStreamTrack):
         return frame
 
 
-# Sampling-temperature bounds shared by the connect-time config parse and
-# the server's live update_config path, matching the dashboard slider
-# range. Out-of-range finite values are clamped; non-finite values are
-# rejected because they silently break sampling (inf flattens the
-# distribution, nan flips sample_token to greedy decoding).
+# Numeric config bounds are shared by connect-time parsing and the server's
+# live update path. Finite out-of-range values clamp; malformed and non-finite
+# values reject the update before they can reach sampling or accounting state.
 TEMPERATURE_MIN = 0.1
 TEMPERATURE_MAX = 1.5
+TEXT_TOPK_MIN = 1
+TEXT_TOPK_MAX = 500
+AUDIO_TOPK_MIN = 1
+AUDIO_TOPK_MAX = 2048
+REPETITION_PENALTY_MIN = 1.0
+REPETITION_PENALTY_MAX = 2.0
+REPETITION_PENALTY_CONTEXT_MIN = 0
+REPETITION_PENALTY_CONTEXT_MAX = 256
+PADDING_BONUS_MIN = 0.0
+PADDING_BONUS_MAX = 6.0
+MAX_TURN_TEXT_TOKENS_MIN = 0
+MAX_TURN_TEXT_TOKENS_MAX = 2000
+SESSION_TIMEOUT_SEC_MIN = 0
+SESSION_TIMEOUT_SEC_MAX = 3600
+VISION_COST_LIMIT_USD_MIN = 0.0
+VISION_COST_LIMIT_USD_MAX = 10.0
+VISION_COST_PER_CALL_USD_MIN = 0.0
+VISION_COST_PER_CALL_USD_MAX = 10.0
+SEED_RANDOM = -1
+SEED_MIN = 0
+SEED_MAX = 2_147_483_647
+VOICE_BLEND_MIX_MIN = 0.0
+VOICE_BLEND_MIX_MAX = 1.0
+CLONE_STRENGTH_MIN = 0.0
+CLONE_STRENGTH_MAX = 1.0
+
+
+def _coerce_finite_float(value, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be numeric, got {value!r}")
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be numeric, got {value!r}") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{field} must be finite, got {value!r}")
+    return out
+
+
+def _clamp_float(value, minimum: float, maximum: float, field: str) -> float:
+    out = _coerce_finite_float(value, field)
+    return min(maximum, max(minimum, out))
+
+
+def _clamp_int(value, minimum: int, maximum: int, field: str) -> int:
+    out = _coerce_finite_float(value, field)
+    return min(maximum, max(minimum, int(out)))
 
 
 def clamp_temperature(value) -> float:
@@ -214,10 +259,100 @@ def clamp_temperature(value) -> float:
     strings "nan"/"inf", and ``json.loads`` accepts bare NaN/Infinity
     literals, so JSON parsing alone does not keep these out.
     """
-    out = float(value)
-    if not math.isfinite(out):
-        raise ValueError(f"temperature must be finite, got {value!r}")
-    return min(TEMPERATURE_MAX, max(TEMPERATURE_MIN, out))
+    return _clamp_float(value, TEMPERATURE_MIN, TEMPERATURE_MAX, "temperature")
+
+
+def clamp_text_topk(value) -> int:
+    return _clamp_int(value, TEXT_TOPK_MIN, TEXT_TOPK_MAX, "text_topk")
+
+
+def clamp_audio_topk(value) -> int:
+    return _clamp_int(value, AUDIO_TOPK_MIN, AUDIO_TOPK_MAX, "audio_topk")
+
+
+def clamp_repetition_penalty(value) -> float:
+    return _clamp_float(
+        value,
+        REPETITION_PENALTY_MIN,
+        REPETITION_PENALTY_MAX,
+        "repetition_penalty",
+    )
+
+
+def clamp_repetition_penalty_context(value) -> int:
+    return _clamp_int(
+        value,
+        REPETITION_PENALTY_CONTEXT_MIN,
+        REPETITION_PENALTY_CONTEXT_MAX,
+        "repetition_penalty_context",
+    )
+
+
+def clamp_padding_bonus(value) -> float:
+    return _clamp_float(value, PADDING_BONUS_MIN, PADDING_BONUS_MAX, "padding_bonus")
+
+
+def clamp_max_turn_text_tokens(value) -> int:
+    return _clamp_int(
+        value,
+        MAX_TURN_TEXT_TOKENS_MIN,
+        MAX_TURN_TEXT_TOKENS_MAX,
+        "max_turn_text_tokens",
+    )
+
+
+def clamp_session_timeout_sec(value) -> int:
+    return _clamp_int(
+        value,
+        SESSION_TIMEOUT_SEC_MIN,
+        SESSION_TIMEOUT_SEC_MAX,
+        "session_timeout_sec",
+    )
+
+
+def clamp_vision_cost_limit_usd(value) -> float:
+    return _clamp_float(
+        value,
+        VISION_COST_LIMIT_USD_MIN,
+        VISION_COST_LIMIT_USD_MAX,
+        "vision_cost_limit_usd",
+    )
+
+
+def clamp_vision_cost_per_call_usd(value) -> float:
+    return _clamp_float(
+        value,
+        VISION_COST_PER_CALL_USD_MIN,
+        VISION_COST_PER_CALL_USD_MAX,
+        "vision_cost_per_call_usd",
+    )
+
+
+def clamp_seed(value) -> Optional[int]:
+    if value is None:
+        return None
+    out = _coerce_finite_float(value, "seed")
+    if out == SEED_RANDOM:
+        return SEED_RANDOM
+    return min(SEED_MAX, max(SEED_MIN, int(out)))
+
+
+def clamp_voice_blend_mix(value) -> float:
+    return _clamp_float(
+        value,
+        VOICE_BLEND_MIX_MIN,
+        VOICE_BLEND_MIX_MAX,
+        "voice_blend_mix",
+    )
+
+
+def clamp_clone_strength(value) -> float:
+    return _clamp_float(
+        value,
+        CLONE_STRENGTH_MIN,
+        CLONE_STRENGTH_MAX,
+        "clone_strength",
+    )
 
 
 # End-of-thought inject-gate bounds, shared by the connect-time parse and
@@ -244,10 +379,12 @@ def clamp_inject_silence_rms(value) -> float:
     make every frame compare as non-silent (``x < nan`` is always False),
     silently disabling the whole inject path.
     """
-    out = float(value)
-    if not math.isfinite(out):
-        raise ValueError(f"inject_silence_rms must be finite, got {value!r}")
-    return min(INJECT_SILENCE_RMS_MAX, max(INJECT_SILENCE_RMS_MIN, out))
+    return _clamp_float(
+        value,
+        INJECT_SILENCE_RMS_MIN,
+        INJECT_SILENCE_RMS_MAX,
+        "inject_silence_rms",
+    )
 
 
 def clamp_inject_silence_streak(value) -> int:
@@ -256,10 +393,12 @@ def clamp_inject_silence_streak(value) -> int:
     Parses through ``float`` first so a non-finite input raises ValueError
     rather than ``int()`` raising OverflowError on infinity.
     """
-    out = float(value)
-    if not math.isfinite(out):
-        raise ValueError(f"inject_silence_streak must be finite, got {value!r}")
-    return min(INJECT_SILENCE_STREAK_MAX, max(INJECT_SILENCE_STREAK_MIN, int(out)))
+    return _clamp_int(
+        value,
+        INJECT_SILENCE_STREAK_MIN,
+        INJECT_SILENCE_STREAK_MAX,
+        "inject_silence_streak",
+    )
 
 
 # Ceiling for one inbound vision frame, in base64 characters. Real frames
@@ -299,8 +438,14 @@ def reassemble_vision_chunk(
     try:
         seq = int(msg.get("seq"))
         total = int(msg.get("total"))
-    except (TypeError, ValueError):
-        log("warning", "vision_frame_chunk: bad seq/total; dropping")
+        source_generation = _clamp_int(
+            msg.get("source_generation", 0),
+            0,
+            SEED_MAX,
+            "source_generation",
+        )
+    except (TypeError, ValueError, OverflowError):
+        log("warning", "vision_frame_chunk: bad metadata; dropping")
         partials.pop(frame_id, None)
         return None
     if (
@@ -328,11 +473,21 @@ def reassemble_vision_chunk(
         partial = {
             "parts": [None] * total,
             "detail": bool(msg.get("detail", False)),
+            "historical_detail": bool(msg.get("historical_detail", False)),
+            "source_generation": source_generation,
             "chars": 0,
             "started": now_mono,
         }
         partials[frame_id] = partial
-    if len(partial["parts"]) != total or partial["parts"][seq] is not None:
+    if (
+        len(partial["parts"]) != total
+        or partial["parts"][seq] is not None
+        or partial["detail"] != bool(msg.get("detail", False))
+        or partial["historical_detail"]
+        != bool(msg.get("historical_detail", False))
+        or partial["source_generation"]
+        != source_generation
+    ):
         log("warning", "vision_frame_chunk: inconsistent sequence; dropping frame")
         partials.pop(frame_id, None)
         return None
@@ -355,6 +510,8 @@ def reassemble_vision_chunk(
         "frame_id": frame_id,
         "data": "".join(partial["parts"]),
         "detail": partial["detail"],
+        "historical_detail": partial["historical_detail"],
+        "source_generation": partial["source_generation"],
     }
 
 
@@ -401,14 +558,14 @@ class SessionConfig:
     # for the session like the rest of the persona block.
     reinforce_in_silences: bool = False
     seed: Optional[int] = None
-    audio_temperature: float = 0.7
+    audio_temperature: float = 0.8
     text_temperature: float = 0.7
     text_topk: int = 25
     audio_topk: int = 250
-    repetition_penalty: float = 1.15
+    repetition_penalty: float = 1.0
     repetition_penalty_context: int = 64
     # Keep these aligned with the embedded client's advanced slider defaults.
-    padding_bonus: float = 1.0
+    padding_bonus: float = 0.0
     max_turn_text_tokens: int = 120
     # Session length cap in seconds; 0 disables the watchdog (no time bound).
     # The client sends minutes converted to seconds, so the server stores and
@@ -427,6 +584,80 @@ class SessionConfig:
     # inject_silence_streak frames before a queued caption is dripped in.
     inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
     inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
+
+
+def parse_session_config(payload: dict) -> SessionConfig:
+    """Parse one wire config using the shared bounded numeric contract."""
+    defaults = SessionConfig()
+    return SessionConfig(
+        voice_prompt=str(payload.get("voice_prompt", defaults.voice_prompt)),
+        voice_prompt_b=str(payload.get("voice_prompt_b", defaults.voice_prompt_b)),
+        voice_blend_mix=clamp_voice_blend_mix(
+            payload.get("voice_blend_mix", defaults.voice_blend_mix)
+        ),
+        clone_strength=clamp_clone_strength(
+            payload.get("clone_strength", defaults.clone_strength)
+        ),
+        text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
+        vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
+        vision_in_transcript=bool(
+            payload.get("vision_in_transcript", defaults.vision_in_transcript)
+        ),
+        vision_feed_model=bool(
+            payload.get("vision_feed_model", defaults.vision_feed_model)
+        ),
+        vision_ground_user_turns=bool(
+            payload.get(
+                "vision_ground_user_turns",
+                defaults.vision_ground_user_turns,
+            )
+        ),
+        reinforce_in_silences=bool(
+            payload.get("reinforce_in_silences", defaults.reinforce_in_silences)
+        ),
+        seed=clamp_seed(payload.get("seed", defaults.seed)),
+        audio_temperature=clamp_temperature(
+            payload.get("audio_temperature", defaults.audio_temperature)
+        ),
+        text_temperature=clamp_temperature(
+            payload.get("text_temperature", defaults.text_temperature)
+        ),
+        text_topk=clamp_text_topk(payload.get("text_topk", defaults.text_topk)),
+        audio_topk=clamp_audio_topk(payload.get("audio_topk", defaults.audio_topk)),
+        repetition_penalty=clamp_repetition_penalty(
+            payload.get("repetition_penalty", defaults.repetition_penalty)
+        ),
+        repetition_penalty_context=clamp_repetition_penalty_context(
+            payload.get(
+                "repetition_penalty_context",
+                defaults.repetition_penalty_context,
+            )
+        ),
+        padding_bonus=clamp_padding_bonus(
+            payload.get("padding_bonus", defaults.padding_bonus)
+        ),
+        max_turn_text_tokens=clamp_max_turn_text_tokens(
+            payload.get("max_turn_text_tokens", defaults.max_turn_text_tokens)
+        ),
+        session_timeout_sec=clamp_session_timeout_sec(
+            payload.get("session_timeout_sec", defaults.session_timeout_sec)
+        ),
+        vision_cost_limit_usd=clamp_vision_cost_limit_usd(
+            payload.get("vision_cost_limit_usd", defaults.vision_cost_limit_usd)
+        ),
+        vision_cost_per_call_usd=clamp_vision_cost_per_call_usd(
+            payload.get(
+                "vision_cost_per_call_usd",
+                defaults.vision_cost_per_call_usd,
+            )
+        ),
+        inject_silence_rms=clamp_inject_silence_rms(
+            payload.get("inject_silence_rms", defaults.inject_silence_rms)
+        ),
+        inject_silence_streak=clamp_inject_silence_streak(
+            payload.get("inject_silence_streak", defaults.inject_silence_streak)
+        ),
+    )
 
 
 class RTCSession:
@@ -464,7 +695,9 @@ class RTCSession:
 
         # Buffered queues. Match the existing 200 ms cap on inbound PCM
         # so GPU stalls shed stale mic audio rather than ballooning latency.
-        self._pcm_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=10)
+        self._pcm_queue: asyncio.Queue[tuple[int, np.ndarray]] = asyncio.Queue(
+            maxsize=10
+        )
         # Inbound audio is dropped silently until start_processing() runs.
         # Otherwise the warmup phase (~10 s for raw-audio voice prompts)
         # spams ~50 "pcm queue full" warnings per second while the model
@@ -472,7 +705,15 @@ class RTCSession:
         # warnings are rate-limited to one per second so a sustained
         # overrun logs once, not on every dropped chunk.
         self._processing_started = False
+        self._processing_paused = False
+        self._pipeline_generation = 0
+        self._pending_pcm: Optional[np.ndarray] = None
+        self._process_idle = asyncio.Event()
+        self._process_idle.set()
         self._last_drop_warn_at = 0.0
+        self._pcm_queue_high_water = 0
+        self._pcm_drop_events = 0
+        self._pcm_dropped_ms = 0.0
         self._control: Optional[RTCDataChannel] = None
         self._inbound_task: Optional[asyncio.Task] = None
         self._process_task: Optional[asyncio.Task] = None
@@ -656,6 +897,11 @@ class RTCSession:
             except asyncio.QueueEmpty:
                 break
         self._processing_started = True
+        self._processing_paused = False
+        self._pending_pcm = None
+        self._pcm_queue_high_water = 0
+        self._pcm_drop_events = 0
+        self._pcm_dropped_ms = 0.0
         if self._process_task is None:
             self._process_task = asyncio.create_task(self._process_loop())
 
@@ -699,6 +945,31 @@ class RTCSession:
     async def clear_output_audio(self) -> None:
         await self._output_track.clear_buffer()
 
+    @staticmethod
+    def _drain_queue(queue: asyncio.Queue) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    async def pause_and_flush_audio(self) -> int:
+        """Pause inference and invalidate queued or in-flight audio."""
+        self._processing_paused = True
+        self._pipeline_generation += 1
+        generation = self._pipeline_generation
+        self._drain_queue(self._pcm_queue)
+        self._pending_pcm = None
+        await self._process_idle.wait()
+        self._drain_queue(self._pcm_queue)
+        self._pending_pcm = None
+        await self._output_track.clear_buffer()
+        return generation
+
+    def resume_audio(self, generation: int) -> None:
+        if generation == self._pipeline_generation:
+            self._processing_paused = False
+
     def send_text(self, text: str) -> None:
         if self._control and self._control.readyState == "open":
             self._control.send(json.dumps({"type": "text", "v": text}))
@@ -722,10 +993,17 @@ class RTCSession:
         text: str,
         frame_id: str = "",
         feed: Optional[dict] = None,
+        source_generation: int = 0,
+        historical_detail: bool = False,
     ) -> None:
         """Push the latest vision-side scene description to the client UI."""
         if self._control and self._control.readyState == "open":
-            payload = {"type": "vision_caption", "text": text}
+            payload = {
+                "type": "vision_caption",
+                "text": text,
+                "source_generation": int(source_generation),
+                "historical_detail": bool(historical_detail),
+            }
             if frame_id:
                 payload["frame_id"] = frame_id
             if feed is not None:
@@ -747,11 +1025,19 @@ class RTCSession:
                 json.dumps({"type": "vision_inject", "active": bool(active)})
             )
 
-    def send_request_vision_frame(self) -> None:
+    def send_request_vision_frame(
+        self, *, force: bool = False, reason: str = "cadence"
+    ) -> None:
         """Ask the client to capture and send a fresh vision frame now."""
         if self._control and self._control.readyState == "open":
             self._control.send(
-                json.dumps({"type": "request_vision_frame"})
+                json.dumps(
+                    {
+                        "type": "request_vision_frame",
+                        "force": bool(force),
+                        "reason": str(reason)[:64],
+                    }
+                )
             )
 
     def send_notice(self, text: str) -> None:
@@ -941,120 +1227,8 @@ class RTCSession:
             self.send_pong(t, seq)
         elif kind == "config":
             try:
-                defaults = SessionConfig()
-                seed_raw = payload.get("seed")
-                seed = None if seed_raw is None else int(seed_raw)
-                cfg = SessionConfig(
-                    voice_prompt=str(payload.get("voice_prompt", defaults.voice_prompt)),
-                    voice_prompt_b=str(
-                        payload.get("voice_prompt_b", defaults.voice_prompt_b)
-                    ),
-                    voice_blend_mix=max(
-                        0.0,
-                        min(
-                            1.0,
-                            float(
-                                payload.get(
-                                    "voice_blend_mix", defaults.voice_blend_mix
-                                )
-                            ),
-                        ),
-                    ),
-                    clone_strength=max(
-                        0.0,
-                        min(
-                            1.0,
-                            float(
-                                payload.get(
-                                    "clone_strength", defaults.clone_strength
-                                )
-                            ),
-                        ),
-                    ),
-                    text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
-                    vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
-                    vision_in_transcript=bool(
-                        payload.get("vision_in_transcript", defaults.vision_in_transcript)
-                    ),
-                    vision_feed_model=bool(
-                        payload.get("vision_feed_model", defaults.vision_feed_model)
-                    ),
-                    vision_ground_user_turns=bool(
-                        payload.get(
-                            "vision_ground_user_turns",
-                            defaults.vision_ground_user_turns,
-                        )
-                    ),
-                    reinforce_in_silences=bool(
-                        payload.get(
-                            "reinforce_in_silences", defaults.reinforce_in_silences
-                        )
-                    ),
-                    seed=seed,
-                    audio_temperature=clamp_temperature(
-                        payload.get("audio_temperature", defaults.audio_temperature)
-                    ),
-                    text_temperature=clamp_temperature(
-                        payload.get("text_temperature", defaults.text_temperature)
-                    ),
-                    text_topk=int(payload.get("text_topk", defaults.text_topk)),
-                    audio_topk=int(payload.get("audio_topk", defaults.audio_topk)),
-                    repetition_penalty=float(
-                        payload.get("repetition_penalty", defaults.repetition_penalty)
-                    ),
-                    repetition_penalty_context=int(
-                        payload.get(
-                            "repetition_penalty_context",
-                            defaults.repetition_penalty_context,
-                        )
-                    ),
-                    padding_bonus=float(
-                        payload.get("padding_bonus", defaults.padding_bonus)
-                    ),
-                    max_turn_text_tokens=int(
-                        payload.get(
-                            "max_turn_text_tokens", defaults.max_turn_text_tokens
-                        )
-                    ),
-                    session_timeout_sec=max(
-                        0,
-                        int(
-                            payload.get(
-                                "session_timeout_sec",
-                                defaults.session_timeout_sec,
-                            )
-                        ),
-                    ),
-                    vision_cost_limit_usd=max(
-                        0.0,
-                        float(
-                            payload.get(
-                                "vision_cost_limit_usd",
-                                defaults.vision_cost_limit_usd,
-                            )
-                        ),
-                    ),
-                    vision_cost_per_call_usd=max(
-                        0.0,
-                        float(
-                            payload.get(
-                                "vision_cost_per_call_usd",
-                                defaults.vision_cost_per_call_usd,
-                            )
-                        ),
-                    ),
-                    inject_silence_rms=clamp_inject_silence_rms(
-                        payload.get(
-                            "inject_silence_rms", defaults.inject_silence_rms
-                        )
-                    ),
-                    inject_silence_streak=clamp_inject_silence_streak(
-                        payload.get(
-                            "inject_silence_streak", defaults.inject_silence_streak
-                        )
-                    ),
-                )
-            except (TypeError, ValueError) as exc:
+                cfg = parse_session_config(payload)
+            except (TypeError, ValueError, OverflowError) as exc:
                 self._log("warning", f"control: bad config: {exc}")
                 self.send_error(f"bad_config: {exc}")
                 return
@@ -1079,19 +1253,33 @@ class RTCSession:
                 samples = _frame_to_mono_24k_f32(frame, resampler)
                 if samples.size == 0:
                     continue
-                if not self._processing_started:
+                if not self._processing_started or self._processing_paused:
                     # Warmup phase: model is not consuming yet. Dropping
                     # this chunk is the right thing; do it silently so
                     # the log is not flooded by ~10 s of warning spam.
                     continue
+                queued = (self._pipeline_generation, samples)
                 try:
-                    self._pcm_queue.put_nowait(samples)
+                    self._pcm_queue.put_nowait(queued)
+                    self._pcm_queue_high_water = max(
+                        self._pcm_queue_high_water,
+                        self._pcm_queue.qsize(),
+                    )
                 except asyncio.QueueFull:
+                    dropped_samples = samples
                     try:
-                        self._pcm_queue.get_nowait()
-                        self._pcm_queue.put_nowait(samples)
+                        _, dropped_samples = self._pcm_queue.get_nowait()
+                        self._pcm_queue.put_nowait(queued)
                     except (asyncio.QueueEmpty, asyncio.QueueFull):
                         pass
+                    self._pcm_queue_high_water = max(
+                        self._pcm_queue_high_water,
+                        self._pcm_queue.qsize(),
+                    )
+                    self._pcm_drop_events += 1
+                    self._pcm_dropped_ms += (
+                        dropped_samples.size / MIMI_SAMPLE_RATE * 1000.0
+                    )
                     now = asyncio.get_event_loop().time()
                     if now - self._last_drop_warn_at >= 1.0:
                         diagnostics = ""
@@ -1110,6 +1298,9 @@ class RTCSession:
                             "warning",
                             "pcm queue full "
                             f"q={self._pcm_queue.qsize()}/{self._pcm_queue.maxsize} "
+                            f"high_water={self._pcm_queue_high_water} "
+                            f"drop_events={self._pcm_drop_events} "
+                            f"dropped_ms_total={self._pcm_dropped_ms:.1f} "
                             f"incoming_ms={incoming_ms:.1f}, "
                             "dropping stale inbound audio"
                             f"{diagnostics_suffix}",
@@ -1125,24 +1316,35 @@ class RTCSession:
 
     async def _process_loop(self) -> None:
         loop = asyncio.get_event_loop()
-        all_pcm_data: Optional[np.ndarray] = None
         try:
             while not self._closed.is_set():
                 try:
-                    pcm = await asyncio.wait_for(
+                    pcm_generation, pcm = await asyncio.wait_for(
                         self._pcm_queue.get(), timeout=0.1
                     )
                 except asyncio.TimeoutError:
                     continue
+                if (
+                    self._processing_paused
+                    or pcm_generation != self._pipeline_generation
+                ):
+                    continue
                 if pcm.shape[-1] == 0:
                     continue
-                all_pcm_data = (
-                    pcm if all_pcm_data is None
-                    else np.concatenate((all_pcm_data, pcm))
+                self._pending_pcm = (
+                    pcm
+                    if self._pending_pcm is None
+                    else np.concatenate((self._pending_pcm, pcm))
                 )
-                while all_pcm_data.shape[-1] >= self._frame_size:
-                    chunk = all_pcm_data[: self._frame_size]
-                    all_pcm_data = all_pcm_data[self._frame_size :]
+                while (
+                    not self._processing_paused
+                    and self._pending_pcm is not None
+                    and self._pending_pcm.shape[-1] >= self._frame_size
+                ):
+                    chunk = self._pending_pcm[: self._frame_size]
+                    self._pending_pcm = self._pending_pcm[self._frame_size :]
+                    generation = self._pipeline_generation
+                    self._process_idle.clear()
                     in_flight = asyncio.ensure_future(
                         loop.run_in_executor(None, self._process_fn, chunk)
                     )
@@ -1154,6 +1356,13 @@ class RTCSession:
                         except BaseException:
                             pass
                         raise
+                    finally:
+                        self._process_idle.set()
+                    if (
+                        self._processing_paused
+                        or generation != self._pipeline_generation
+                    ):
+                        continue
                     for pcm_data, text in results:
                         frame_f32 = pcm_data.astype(np.float32)
                         await self._output_track.push_24k_f32(frame_f32)

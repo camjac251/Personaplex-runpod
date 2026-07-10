@@ -27,7 +27,15 @@ def _log_sink(entries: list) -> object:
     return log
 
 
-def chunk(frame_id: str, seq: int, total: int, data: str = "x", detail=False) -> dict:
+def chunk(
+    frame_id: str,
+    seq: int,
+    total: int,
+    data: str = "x",
+    detail: bool = False,
+    historical_detail: bool = False,
+    source_generation: int = 0,
+) -> dict:
     return {
         "type": "vision_frame_chunk",
         "frame_id": frame_id,
@@ -35,6 +43,8 @@ def chunk(frame_id: str, seq: int, total: int, data: str = "x", detail=False) ->
         "total": total,
         "data": data,
         "detail": detail,
+        "historical_detail": historical_detail,
+        "source_generation": source_generation,
     }
 
 
@@ -43,7 +53,14 @@ def test_in_order_completion() -> None:
     log = _log_sink(logs)
     assert reassemble_vision_chunk(partials, chunk("f1", 0, 2, "AB"), 0.0, log) is None
     done = reassemble_vision_chunk(partials, chunk("f1", 1, 2, "CD"), 0.1, log)
-    assert done == {"type": "vision_frame", "frame_id": "f1", "data": "ABCD", "detail": False}
+    assert done == {
+        "type": "vision_frame",
+        "frame_id": "f1",
+        "data": "ABCD",
+        "detail": False,
+        "historical_detail": False,
+        "source_generation": 0,
+    }
     assert partials == {}
     assert logs == []
 
@@ -51,12 +68,66 @@ def test_in_order_completion() -> None:
 def test_out_of_order_completion_and_detail_flag() -> None:
     partials = {}
     log = _log_sink([])
-    # detail is latched by whichever chunk creates the accumulator.
     assert reassemble_vision_chunk(partials, chunk("f1", 1, 2, "CD", detail=True), 0.0, log) is None
-    done = reassemble_vision_chunk(partials, chunk("f1", 0, 2, "AB"), 0.1, log)
+    done = reassemble_vision_chunk(
+        partials,
+        chunk("f1", 0, 2, "AB", detail=True),
+        0.1,
+        log,
+    )
     assert done is not None
     assert done["data"] == "ABCD"
     assert done["detail"] is True
+
+
+def test_generation_and_historical_detail_round_trip() -> None:
+    partials = {}
+    log = _log_sink([])
+    first = chunk(
+        "history-1",
+        0,
+        2,
+        "AB",
+        detail=True,
+        historical_detail=True,
+        source_generation=17,
+    )
+    second = chunk(
+        "history-1",
+        1,
+        2,
+        "CD",
+        detail=True,
+        historical_detail=True,
+        source_generation=17,
+    )
+    assert reassemble_vision_chunk(partials, first, 0.0, log) is None
+    done = reassemble_vision_chunk(partials, second, 0.1, log)
+    assert done is not None
+    assert done["historical_detail"] is True
+    assert done["source_generation"] == 17
+
+
+def test_inconsistent_source_metadata_drops_partial() -> None:
+    for changed in (
+        {"source_generation": 8},
+        {"historical_detail": True},
+        {"detail": True},
+    ):
+        partials = {}
+        log = _log_sink([])
+        assert reassemble_vision_chunk(
+            partials,
+            chunk("f1", 0, 2, source_generation=7),
+            0.0,
+            log,
+        ) is None
+        next_part = {
+            **chunk("f1", 1, 2, source_generation=7),
+            **changed,
+        }
+        assert reassemble_vision_chunk(partials, next_part, 0.1, log) is None
+        assert "f1" not in partials
 
 
 def test_duplicate_seq_drops_partial() -> None:
@@ -151,6 +222,8 @@ if __name__ == "__main__":
     tests = [
         test_in_order_completion,
         test_out_of_order_completion_and_detail_flag,
+        test_generation_and_historical_detail_round_trip,
+        test_inconsistent_source_metadata_drops_partial,
         test_duplicate_seq_drops_partial,
         test_inconsistent_total_drops_partial,
         test_bad_parts_rejected,
