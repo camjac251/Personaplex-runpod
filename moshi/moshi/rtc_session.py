@@ -179,12 +179,19 @@ class MimiOutputTrack(MediaStreamTrack):
         loop = asyncio.get_event_loop()
         if self._start_time is None:
             self._start_time = loop.time()
+        frame_duration = OUTBOUND_FRAME_SAMPLES / WEBRTC_SAMPLE_RATE
         # Pace real-time: target the next frame boundary based on cumulative
-        # timestamp, sleep if we're early.
+        # timestamp, sleep if we're early. If the sender was stalled for more
+        # than one frame, rebase the wall-clock origin instead of bursting all
+        # overdue RTP frames in a tight loop to catch up.
         target = self._start_time + (
             self._timestamp + OUTBOUND_FRAME_SAMPLES
         ) / WEBRTC_SAMPLE_RATE
-        delay = target - loop.time()
+        now = loop.time()
+        if now - target >= frame_duration:
+            self._start_time = now - (self._timestamp / WEBRTC_SAMPLE_RATE)
+            target = now + frame_duration
+        delay = target - now
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -558,14 +565,14 @@ class SessionConfig:
     # for the session like the rest of the persona block.
     reinforce_in_silences: bool = False
     seed: Optional[int] = None
-    audio_temperature: float = 0.8
+    audio_temperature: float = 0.7
     text_temperature: float = 0.7
     text_topk: int = 25
     audio_topk: int = 250
-    repetition_penalty: float = 1.0
+    repetition_penalty: float = 1.15
     repetition_penalty_context: int = 64
     # Keep these aligned with the embedded client's advanced slider defaults.
-    padding_bonus: float = 0.0
+    padding_bonus: float = 1.0
     max_turn_text_tokens: int = 120
     # Session length cap in seconds; 0 disables the watchdog (no time bound).
     # The client sends minutes converted to seconds, so the server stores and

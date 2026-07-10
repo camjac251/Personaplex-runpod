@@ -100,6 +100,17 @@ const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
 const PROMPT_DEFAULTS_VERSION = "2026-07-09-grounded-vision-contract";
+const TUNING_DEFAULTS_VERSION = "2026-07-10-stable-audio-sampling";
+const PREVIOUS_TUNING_DEFAULTS = {
+  textTemp: 0.7,
+  textTopk: 25,
+  audioTemp: 0.8,
+  audioTopk: 250,
+  repPenalty: 1.0,
+  repContext: 64,
+  padBonus: 0.0,
+  maxTurn: 120,
+};
 const REPLACED_DEFAULT_TEXT_PROMPTS = [
   "You enjoy talking with people. Speak as yourself: warm, perceptive, relaxed, and honest. Listen closely, say what you mean plainly, and keep turns short unless there is something worth unpacking.",
 ];
@@ -163,6 +174,10 @@ function inferenceValuesOutsideRange(values, rangeSet) {
     const range = INFERENCE_RANGES[rangeSet]?.[key];
     return range && (value < range.min || value > range.max);
   });
+}
+
+function inferenceValuesMatch(values, expected) {
+  return Object.entries(expected).every(([key, value]) => values[key] === value);
 }
 
 function canvasDimensions(width, height, maxLongEdge) {
@@ -318,6 +333,10 @@ function App() {
     "pp_tuningRangeMode",
     "safe",
     (value) => (value === "expert" ? "expert" : "safe"),
+  );
+  const [tuningDefaultsVersion, setTuningDefaultsVersion] = useStoredState(
+    "pp_tuningDefaultsVersion",
+    "",
   );
   // End-of-thought gate for vision/persona context injection: the model's
   // audio must be below injectSilenceRms for injectSilenceStreak frames
@@ -521,32 +540,24 @@ function App() {
   ]);
 
   const tuningRanges = INFERENCE_RANGES[tuningRangeMode];
-  useEffect(() => {
-    if (tuningRangeMode !== "safe") return;
-    if (inferenceValuesOutsideRange({
-      textTemp,
-      textTopk,
-      audioTemp,
-      audioTopk,
-      repPenalty,
-      repContext,
-      padBonus,
-      maxTurn,
-    }, "safe")) {
-      setTuningRangeMode("expert");
-    }
-  }, [
-    audioTemp,
-    audioTopk,
-    maxTurn,
-    padBonus,
-    repContext,
-    repPenalty,
-    setTuningRangeMode,
+  const currentTuningValues = {
     textTemp,
     textTopk,
-    tuningRangeMode,
-  ]);
+    audioTemp,
+    audioTopk,
+    repPenalty,
+    repContext,
+    padBonus,
+    maxTurn,
+  };
+  const tuningOutsideSafeRange = inferenceValuesOutsideRange(
+    currentTuningValues,
+    "safe",
+  );
+  const previousTuningDefaultsActive = inferenceValuesMatch(
+    currentTuningValues,
+    PREVIOUS_TUNING_DEFAULTS,
+  );
 
   const addNotice = useCallback((level, text, kind = "event", extra = {}) => {
     const ts = new Date().toTimeString().slice(0, 8);
@@ -2908,6 +2919,58 @@ function App() {
     textTopk,
   ]);
 
+  const resetTuningDefaults = useCallback((notify = true) => {
+    setTextTemp(DEFAULTS.textTemp);
+    setTextTopk(DEFAULTS.textTopk);
+    setAudioTemp(DEFAULTS.audioTemp);
+    setAudioTopk(DEFAULTS.audioTopk);
+    setRepPenalty(DEFAULTS.repPenalty);
+    setRepContext(DEFAULTS.repContext);
+    setPadBonus(DEFAULTS.padBonus);
+    setMaxTurn(DEFAULTS.maxTurn);
+    setTuningRangeMode("safe");
+    setSessionProfileId("custom");
+    sendLiveConfig({
+      text_temperature: DEFAULTS.textTemp,
+      text_topk: DEFAULTS.textTopk,
+      audio_temperature: DEFAULTS.audioTemp,
+      audio_topk: DEFAULTS.audioTopk,
+      repetition_penalty: DEFAULTS.repPenalty,
+      repetition_penalty_context: DEFAULTS.repContext,
+      padding_bonus: DEFAULTS.padBonus,
+      max_turn_text_tokens: DEFAULTS.maxTurn,
+    });
+    if (notify) addNotice("ok", "Inference tuning reset to stable defaults");
+  }, [
+    addNotice,
+    sendLiveConfig,
+    setAudioTemp,
+    setAudioTopk,
+    setMaxTurn,
+    setPadBonus,
+    setRepContext,
+    setRepPenalty,
+    setTextTemp,
+    setTextTopk,
+    setTuningRangeMode,
+  ]);
+
+  useEffect(() => {
+    if (tuningDefaultsVersion === TUNING_DEFAULTS_VERSION) return;
+    if (tuningOutsideSafeRange || previousTuningDefaultsActive) {
+      resetTuningDefaults(false);
+      addNotice("warn", "Stored tuning was reset after the audio sampler update");
+    }
+    setTuningDefaultsVersion(TUNING_DEFAULTS_VERSION);
+  }, [
+    addNotice,
+    resetTuningDefaults,
+    setTuningDefaultsVersion,
+    previousTuningDefaultsActive,
+    tuningDefaultsVersion,
+    tuningOutsideSafeRange,
+  ]);
+
   const interruptResponse = useCallback(
     (reason = "manual") => {
       const now = performance.now();
@@ -4516,6 +4579,9 @@ function App() {
             {railOpen && (
               <div id="tuning-rail">
                 <div className="rail-range-row">
+                  {tuningOutsideSafeRange && (
+                    <span className="rail-range-warning">Expert values active</span>
+                  )}
                   <span id="tuning-range-label">Range</span>
                   {/* biome-ignore lint/a11y/useSemanticElements: compact segmented range control matching the existing diagnostics control */}
                   <div className="seg-mini" role="group" aria-labelledby="tuning-range-label">
@@ -4534,6 +4600,13 @@ function App() {
                       </button>
                     ))}
                   </div>
+                  <button
+                    className="rail-reset"
+                    type="button"
+                    onClick={() => resetTuningDefaults(true)}
+                  >
+                    Reset defaults
+                  </button>
                 </div>
                 <div className="rail">
                   <RailColumn title="TEXT" aggregate={`t ${fmt(textTemp, 2)} · k ${textTopk}`}>
@@ -4719,7 +4792,7 @@ function App() {
               </div>
             ) : (
               <div className="cons-note">
-                The <b>Bookmark</b> control on the transport bar labels a snapshot to jump back to. Auto-rewind also restores the latest snapshot after repeated safety-net trips.
+                No bookmarks yet.
               </div>
             )}
           </div>

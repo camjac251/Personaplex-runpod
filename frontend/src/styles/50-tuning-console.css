@@ -2,7 +2,10 @@
   .rack {
     border-top: 1px solid var(--line);
     background: var(--bg-2);
+    min-width: 0;
+    width: 100%;
   }
+  #tuning-rail { min-width: 0; }
   .rack-bar {
     display: flex;
     align-items: center;
@@ -43,6 +46,7 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 8px;
     padding: 5px 12px;
     border-bottom: 1px solid var(--line);
@@ -52,11 +56,41 @@
     letter-spacing: 0.12em;
     text-transform: uppercase;
   }
+  .rail-range-warning {
+    flex: 1 1 auto;
+    margin-right: auto;
+    color: var(--amber);
+  }
+  .rail-reset {
+    border: 0;
+    background: transparent;
+    color: var(--ink-3);
+    padding: 4px 2px;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .rail-reset:hover { color: var(--ink); }
+  .rail-reset:focus-visible {
+    outline: 2px solid var(--line-3);
+    outline-offset: 2px;
+  }
+  @media (max-width: 480px) {
+    .rail-range-row { justify-content: flex-start; }
+    .rail-range-warning {
+      flex-basis: 100%;
+      margin-right: 0;
+    }
+  }
   /* ─── Tuning rail slider grid inside the rack ─── */
   .rail {
     display: grid;
     grid-template-columns: repeat(5, minmax(128px, 1fr));
     min-height: 0;
+    min-width: 0;
+    width: 100%;
     overflow-x: auto;
   }
   .rail-col {

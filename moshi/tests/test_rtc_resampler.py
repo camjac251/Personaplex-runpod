@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 
 import numpy as np
 from av.audio.frame import AudioFrame
@@ -146,6 +147,34 @@ def test_output_track_pacing_and_resample() -> None:
     )
 
 
+def test_output_track_rebases_after_scheduler_stall() -> None:
+    """A delayed sender must not burst overdue audio frames."""
+    track = MimiOutputTrack()
+
+    async def run() -> tuple[float, list[int]]:
+        await track.recv()
+        await asyncio.sleep(0.25)
+        started_at = time.perf_counter()
+        pts: list[int] = []
+        for _ in range(10):
+            frame = await track.recv()
+            assert frame.pts is not None
+            pts.append(frame.pts)
+        return time.perf_counter() - started_at, pts
+
+    elapsed, pts = asyncio.run(run())
+    print(f"  ten frames after scheduler stall: {elapsed * 1000:.1f} ms")
+    assert elapsed >= 0.16, (
+        "output track burst overdue frames instead of resuming real-time pacing: "
+        f"{elapsed * 1000:.1f} ms"
+    )
+    assert elapsed <= 0.35, f"output track resumed too slowly: {elapsed * 1000:.1f} ms"
+    assert all(
+        later - earlier == OUTBOUND_FRAME_SAMPLES
+        for earlier, later in zip(pts, pts[1:])
+    ), f"RTP timestamp spacing changed after pacing rebase: {pts}"
+
+
 if __name__ == "__main__":
     print("test_int_float_round_trip ...")
     test_int_float_round_trip()
@@ -155,5 +184,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_output_track_pacing_and_resample ...")
     test_output_track_pacing_and_resample()
+    print("  ok")
+    print("test_output_track_rebases_after_scheduler_stall ...")
+    test_output_track_rebases_after_scheduler_stall()
     print("  ok")
     print("all resampler tests passed")

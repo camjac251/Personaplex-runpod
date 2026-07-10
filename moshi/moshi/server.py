@@ -28,7 +28,9 @@ import argparse
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import datetime
+from functools import wraps
 import json
 import random
 import re
@@ -394,6 +396,7 @@ COLLAPSE_WINDOW_SEC = 30.0
 # can re-trigger pad-force right after a restore (the snapshotted state
 # is itself the wobbling state) and produce a rewind storm.
 AUTO_REWIND_MIN_INTERVAL_SEC = 60.0
+AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC = 90.0
 
 # Max user-pinned labelled snapshots per session. Each is a full
 # streaming-state clone, independent of the auto-rewind ring, so keep the
@@ -412,6 +415,7 @@ BOOKMARK_LABEL_MAX_LEN = 64
 # slow stat cadence. Lower weights the new sample more; 0.2 keeps the
 # readout stable without lagging a real load change for long.
 RTF_EMA_ALPHA = 0.2
+SLOW_INFERENCE_FRAME_MS = 250.0
 
 # Smoothing for the observed idle decoded-output RMS, sampled only during
 # pad streaks so active speech doesn't inflate it. The stat channel reports
@@ -840,6 +844,20 @@ class _AsrEngine:
             pass
 
 
+def _track_inflight_frame(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        self._inflight_frame = self._process_frame_count + 1
+        self._inflight_frame_started_at = time.perf_counter()
+        try:
+            self._set_inflight_phase("input_to_device")
+            return method(self, *args, **kwargs)
+        finally:
+            self._clear_inflight_frame()
+
+    return wrapped
+
+
 class ServerState:
     """Per-process state: models, locks, vision pipeline, session bookkeeping.
 
@@ -856,6 +874,7 @@ class ServerState:
                  recordings_dir: str | None = None,
                  preview_cache_dir: str | None = None,
                  asr: "Optional[_AsrEngine]" = None,
+                 periodic_snapshots: bool = False,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
         self.lm_gen = lm_gen
@@ -871,6 +890,7 @@ class ServerState:
         # it at launch. recordings_dir is created at startup when set.
         self.record_sessions = record_sessions
         self.recordings_dir = recordings_dir
+        self.periodic_snapshots = periodic_snapshots
         # Optional user-speech recognizer (second model). None unless the
         # operator passed --enable-asr and faster-whisper imported. When
         # None the server transcribes nothing on the user side and the
@@ -893,6 +913,10 @@ class ServerState:
         self._lm_frame_ms_last: float = 0.0
         self._lm_frame_ms_ema: float = 0.0
         self._process_frame_count: int = 0
+        self._inflight_phase: str = "idle"
+        self._inflight_phase_started_at: float = 0.0
+        self._inflight_frame_started_at: float = 0.0
+        self._inflight_frame: int = 0
         self._gpu_util_last: Optional[int] = None
         self._vram_used_last: Optional[int] = None
         # Session gate: one RTC session at a time. asyncio.Lock so
@@ -1148,7 +1172,55 @@ class ServerState:
             parts.append(f"gpu_util={self._gpu_util_last}%")
         if self._vram_used_last is not None:
             parts.append(f"vram_gb={self._vram_used_last / (1024**3):.1f}")
+        if self._inflight_phase != "idle":
+            now = time.perf_counter()
+            phase_age_ms = max(
+                0.0, (now - self._inflight_phase_started_at) * 1000.0
+            )
+            frame_age_ms = max(
+                0.0, (now - self._inflight_frame_started_at) * 1000.0
+            )
+            parts.extend(
+                [
+                    f"inflight_phase={self._inflight_phase}",
+                    f"inflight_frame={self._inflight_frame}",
+                    f"phase_age_ms={phase_age_ms:.1f}",
+                    f"frame_age_ms={frame_age_ms:.1f}",
+                ]
+            )
         return " ".join(parts)
+
+    def _recent_auto_rewind_snapshot(
+        self, session_id: str, now: Optional[float] = None
+    ) -> Optional[dict]:
+        snapshots = self._session_snapshots.get(session_id, [])
+        if not snapshots:
+            return None
+        captured_at, snapshot = snapshots[-1]
+        age_sec = max(0.0, (time.monotonic() if now is None else now) - captured_at)
+        if age_sec > AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC:
+            return None
+        return snapshot
+
+    def _set_inflight_phase(self, phase: str) -> None:
+        self._inflight_phase = phase
+        self._inflight_phase_started_at = time.perf_counter()
+
+    def _clear_inflight_frame(self) -> None:
+        self._inflight_phase = "idle"
+        self._inflight_phase_started_at = 0.0
+        self._inflight_frame_started_at = 0.0
+        self._inflight_frame = 0
+
+    @contextmanager
+    def _tracked_inference_lock(self):
+        self._set_inflight_phase("lock_wait")
+        try:
+            with self._infer_lock:
+                self._set_inflight_phase("mimi_encode")
+                yield
+        finally:
+            self._clear_inflight_frame()
     
     def warmup(self):
         # More warmup iterations for CUDA graphs to stabilize
@@ -1507,6 +1579,7 @@ class ServerState:
         )
 
     @torch.no_grad()
+    @_track_inflight_frame
     def _process_audio_frame(self, chunk_np):
         """Run GPU inference for one audio frame. Called from thread executor
         so the asyncio event loop stays responsive during GPU work.
@@ -1518,7 +1591,9 @@ class ServerState:
         Drip cadence is one token per outer call to match Mimi's 12.5 Hz.
         """
         process_t0 = time.perf_counter()
+        frame_number = self._inflight_frame
         chunk = torch.from_numpy(chunk_np).to(device=self.device)[None, None]
+        self._set_inflight_phase("preprocess")
         results = []
         pad_id = self.lm_gen.lm_model.text_padding_token_id
 
@@ -1591,11 +1666,12 @@ class ServerState:
         # RTF is recorded after finalize_user_turn so queue backpressure logs
         # cover everything that blocks the RTC process loop.
         lm_elapsed = 0.0
-        with self._infer_lock:
+        with self._tracked_inference_lock():
             _rtf_t0 = time.perf_counter()
             # Mimi and LM state must advance under the same lock so a snapshot
             # cannot capture the codec after frame N and the LM before it.
             codes = self.mimi.encode(chunk)
+            self._set_inflight_phase("control")
             prev_pad_streak = self._vision_pad_streak
             # End-of-thought gate: the model has finished its current
             # utterance when the text channel is padding AND its decoded
@@ -1713,6 +1789,7 @@ class ServerState:
 
                 interrupt_gate = self._interrupt_gate_remaining > 0
                 force_assistant_silence = forced_text is not None or interrupt_gate
+                self._set_inflight_phase("lm_step")
                 tokens = self.lm_gen.step(
                     codes[:, :, c: c + 1],
                     moshi_tokens=(
@@ -1725,9 +1802,15 @@ class ServerState:
                 if tokens is None:
                     continue
                 assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                self._set_inflight_phase("mimi_decode")
                 main_pcm = self.mimi.decode(tokens[:, 1:9])
+                # CUDA launches above are asynchronous. A slow encode, LM, or
+                # decode kernel can surface here when the host first waits for
+                # the complete queued GPU pipeline.
+                self._set_inflight_phase("gpu_sync_to_cpu")
                 main_pcm = main_pcm.cpu()
                 pcm_np = main_pcm[0, 0].numpy()
+                self._set_inflight_phase("output_postprocess")
 
                 # Track how long the model's own audio has been silent so an
                 # inject only arms once the current thought has finished
@@ -1763,7 +1846,9 @@ class ServerState:
                 if forced_text is not None or interrupt_gate:
                     pcm_np = np.zeros_like(pcm_np)
 
+                self._set_inflight_phase("text_sync")
                 text_token = tokens[0, 0, 0].item()
+                self._set_inflight_phase("output_postprocess")
 
                 # Track pad streak on natural emissions only. Forced
                 # tokens don't represent the model's intent to be silent.
@@ -1836,7 +1921,12 @@ class ServerState:
                         else:
                             sid = self._active_session_id
                             snapshots = self._session_snapshots.get(sid, []) if sid else []
-                            if snapshots:
+                            rewind_snapshot = (
+                                self._recent_auto_rewind_snapshot(sid, now)
+                                if sid
+                                else None
+                            )
+                            if rewind_snapshot is not None:
                                 trigger_count = len(self._collapse_triggers)
                                 logger.warning(
                                     "auto-rewind: %d pad-force triggers in %.0fs, "
@@ -1846,9 +1936,17 @@ class ServerState:
                                 )
                                 self._collapse_triggers.clear()
                                 self._schedule_auto_rewind(
-                                    snapshots[-1][1], trigger_count
+                                    rewind_snapshot, trigger_count
                                 )
                             else:
+                                if snapshots:
+                                    snapshot_age = max(0.0, now - snapshots[-1][0])
+                                    logger.warning(
+                                        "auto-rewind skipped: latest snapshot is "
+                                        "%.0fs old (limit %.0fs)",
+                                        snapshot_age,
+                                        AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC,
+                                    )
                                 # discarding stale pre-snapshot triggers; otherwise the first usable snapshot can be torched by a single new trigger that pulls in pre-snapshot history
                                 self._collapse_triggers.clear()
             self._prev_pad_force_remaining = pad_force
@@ -1984,6 +2082,15 @@ class ServerState:
             self._process_frame_ms_last = process_ms
             self._lm_frame_ms_last = lm_ms
             self._process_frame_count += 1
+            if process_ms >= SLOW_INFERENCE_FRAME_MS:
+                logger.warning(
+                    "slow inference frame frame=%d process_ms=%.1f lm_ms=%.1f "
+                    "target_ms=%.1f",
+                    frame_number,
+                    process_ms,
+                    lm_ms,
+                    self._frame_audio_sec * 1000.0,
+                )
             if self._rtf_ema <= 0.0:
                 self._rtf_ema = rtf_instant
                 self._process_frame_ms_ema = process_ms
@@ -2282,9 +2389,14 @@ class ServerState:
             self.lm_gen._non_pad_streak = non_pad_streak
             self.lm_gen._pad_force_remaining = pad_force_remaining
 
-    def _take_snapshot(self) -> dict:
+    def _take_snapshot(self, kind: str = "manual") -> dict:
         """Atomically clone LM, Mimi, RNG, and turn-safety state."""
+        started_at = time.perf_counter()
+        lock_acquired_at = started_at
+        clone_submitted_at = started_at
+        sync_ms = 0.0
         with self._infer_lock:
+            lock_acquired_at = time.perf_counter()
             snapshot = {
                 "version": 2,
                 "captured_at": time.monotonic(),
@@ -2297,6 +2409,33 @@ class ServerState:
                 snapshot["rng_cuda"] = torch.cuda.get_rng_state(
                     _cuda_device_index(self.device)
                 ).clone()
+            clone_submitted_at = time.perf_counter()
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                sync_started_at = time.perf_counter()
+                torch.cuda.synchronize(_cuda_device_index(self.device))
+                sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
+
+        tensor_count = 0
+        tensor_bytes = 0
+        for state in (snapshot["lm"], snapshot["mimi"]):
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    tensor_count += 1
+                    tensor_bytes += value.numel() * value.element_size()
+        finished_at = time.perf_counter()
+        logger.info(
+            "snapshot capture session=%s kind=%s lock_wait_ms=%.1f "
+            "clone_submit_ms=%.1f sync_ms=%.1f total_ms=%.1f "
+            "tensors=%d bytes=%d",
+            getattr(self, "_active_session_id", None) or "-",
+            kind,
+            (lock_acquired_at - started_at) * 1000.0,
+            (clone_submitted_at - lock_acquired_at) * 1000.0,
+            sync_ms,
+            (finished_at - started_at) * 1000.0,
+            tensor_count,
+            tensor_bytes,
+        )
         return snapshot
 
     def _restore_snapshot_locked(self, snapshot: dict) -> None:
@@ -2313,6 +2452,8 @@ class ServerState:
             torch.cuda.set_rng_state(
                 snapshot["rng_cuda"], device=_cuda_device_index(self.device)
             )
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(_cuda_device_index(self.device))
         # Turn caps and collapse detectors describe the abandoned execution
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
@@ -2342,21 +2483,39 @@ class ServerState:
         snapshot: dict,
     ) -> bool:
         """Restore at an RTC frame boundary and flush stale transport data."""
+        operation_started_at = time.perf_counter()
         generation = await session.pause_and_flush_audio()
         loop = asyncio.get_event_loop()
         try:
             restored = {"ok": False}
+            timing = {"lock_wait_ms": 0.0, "restore_ms": 0.0}
 
             def _restore() -> None:
+                lock_started_at = time.perf_counter()
                 with self._infer_lock:
+                    restore_started_at = time.perf_counter()
+                    timing["lock_wait_ms"] = (
+                        restore_started_at - lock_started_at
+                    ) * 1000.0
                     if session_id != self._active_session_id:
                         return
                     self._restore_snapshot_locked(snapshot)
+                    timing["restore_ms"] = (
+                        time.perf_counter() - restore_started_at
+                    ) * 1000.0
                     restored["ok"] = True
 
             await loop.run_in_executor(None, _restore)
             if restored["ok"]:
                 self._last_rewind_at = time.monotonic()
+                logger.info(
+                    "snapshot restore session=%s lock_wait_ms=%.1f "
+                    "restore_sync_ms=%.1f total_ms=%.1f",
+                    session_id,
+                    timing["lock_wait_ms"],
+                    timing["restore_ms"],
+                    (time.perf_counter() - operation_started_at) * 1000.0,
+                )
                 if self.asr is not None:
                     self.asr.reset()
             return restored["ok"]
@@ -3818,6 +3977,18 @@ class ServerState:
                 self.lm_gen.max_turn_text_tokens = max(0, cfg.max_turn_text_tokens)
                 self.lm_gen._non_pad_streak = 0
                 self.lm_gen._pad_force_remaining = 0
+                clog.log(
+                    "info",
+                    "inference config: "
+                    f"text_temp={self.lm_gen.temp_text:.2f} "
+                    f"text_topk={self.lm_gen.top_k_text} "
+                    f"audio_temp={cfg.audio_temperature:.2f} "
+                    f"audio_topk={audio_top_k} "
+                    f"repetition={self.lm_gen.repetition_penalty:.2f} "
+                    f"repetition_context={self.lm_gen.repetition_penalty_context} "
+                    f"padding_bonus={self.lm_gen.padding_bonus:.2f} "
+                    f"max_turn={self.lm_gen.max_turn_text_tokens}",
+                )
 
                 self.mimi.reset_streaming()
                 self.lm_gen.reset_streaming()
@@ -4116,7 +4287,9 @@ class ServerState:
                         at_sec = 0.0
                     clog.log("info", f"bookmarking snapshot {label!r}")
                     # Reuse the lock-correct clone path off the event loop.
-                    snap = await loop.run_in_executor(None, self._take_snapshot)
+                    snap = await loop.run_in_executor(
+                        None, self._take_snapshot, "bookmark"
+                    )
                     marks = self._session_bookmarks.setdefault(session_id, [])
                     marks.append(
                         {
@@ -4475,10 +4648,20 @@ class ServerState:
                                 "audio top-k changed; depformer graph "
                                 f"recaptured in {recapture_ms['value']:.0f} ms",
                             )
-                    clog.log("info", f"update_config applied: {applied}")
+                    applied_snapshot = self._applied_config_snapshot()
+                    applied_values = {
+                        key: applied_snapshot[key]
+                        for key in applied
+                        if key in applied_snapshot
+                    }
+                    clog.log(
+                        "info",
+                        f"update_config applied: {applied} "
+                        f"values={json.dumps(applied_values, sort_keys=True)}",
+                    )
                     try:
                         session.send_config_applied(
-                            self._applied_config_snapshot(),
+                            applied_snapshot,
                             source="update",
                             applied=applied,
                         )
@@ -4656,22 +4839,29 @@ class ServerState:
             warmup_done = asyncio.Event()
 
             session.set_message_handler(on_message)
+            clog.log(
+                "info",
+                f"snapshot policy: baseline={'carried' if resuming else 'enabled'} "
+                f"periodic={'enabled' if self.periodic_snapshots else 'disabled'} "
+                "bookmarks=enabled",
+            )
 
             async def snapshot_task():
                 snapshot_future = None
                 try:
                     await warmup_done.wait()
                     while session.is_alive():
-                        # Snapshots cost a brief audio-frame stall (lock
-                        # held during tensor clone). 60 s keeps that hit
-                        # to once per minute; rewinds still target a
-                        # state from within the last minute.
+                        # Full-state copies hold the inference lock and can
+                        # interrupt realtime audio. This task exists only
+                        # when the operator explicitly enables it.
                         await asyncio.sleep(60.0)
                         if not session.is_alive():
                             break
-                        clog.log("info", "taking session snapshot")
+                        clog.log("info", "scheduling periodic session snapshot")
                         snapshot_future = asyncio.ensure_future(
-                            loop.run_in_executor(None, self._take_snapshot)
+                            loop.run_in_executor(
+                                None, self._take_snapshot, "periodic"
+                            )
                         )
                         snap = await asyncio.shield(snapshot_future)
                         snapshot_future = None
@@ -4683,10 +4873,7 @@ class ServerState:
                         history = self._session_snapshots.get(session_id)
                         if history is None:
                             break
-                        history.append((time.monotonic(), snap))
-                        # Keep only last 5 snapshots
-                        if len(history) > 5:
-                            history.pop(0)
+                        history[:] = [(time.monotonic(), snap)]
                 except asyncio.CancelledError:
                     if snapshot_future is not None and not snapshot_future.done():
                         try:
@@ -4695,9 +4882,10 @@ class ServerState:
                             pass
                     raise
 
-            _snap_t = asyncio.create_task(snapshot_task())
-            self._session_tasks.add(_snap_t)
-            _snap_t.add_done_callback(self._session_tasks.discard)
+            if self.periodic_snapshots:
+                _snap_t = asyncio.create_task(snapshot_task())
+                self._session_tasks.add(_snap_t)
+                _snap_t.add_done_callback(self._session_tasks.discard)
 
             async def cadence_task():
                 """Drain _vision_request_pending and ping the client.
@@ -4833,20 +5021,22 @@ class ServerState:
                 clog.log("info", "client disconnected during warmup")
                 return
 
-            # Capture a baseline snapshot before the user can interact, so the
-            # Rewind button always has something to restore even in the first
-            # minute of the session (snapshot_task otherwise fires at +60 s).
-            try:
-                baseline = await loop.run_in_executor(None, self._take_snapshot)
-                self._session_snapshots.setdefault(session_id, []).append(
-                    (time.monotonic(), baseline)
-                )
-                clog.log("info", "baseline snapshot captured")
-            except Exception as exc:
-                clog.log(
-                    "warning",
-                    f"baseline snapshot failed: {type(exc).__name__}: {exc}",
-                )
+            # Capture one synchronized baseline before live processing so
+            # manual Rewind remains available without periodic snapshots.
+            if not resuming:
+                try:
+                    baseline = await loop.run_in_executor(
+                        None, self._take_snapshot, "baseline"
+                    )
+                    self._session_snapshots.setdefault(session_id, []).append(
+                        (time.monotonic(), baseline)
+                    )
+                    clog.log("info", "baseline snapshot captured")
+                except Exception as exc:
+                    clog.log(
+                        "warning",
+                        f"baseline snapshot failed: {type(exc).__name__}: {exc}",
+                    )
 
             # Optional server-side recording. Construction only allocates an
             # in-memory buffer; the PCM observer feeds it copies of the
@@ -5291,12 +5481,37 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
     return static
 
 
+def _environment_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "ignoring invalid %s=%r; using %s", name, raw, str(default).lower()
+    )
+    return default
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)
     parser.add_argument("--static", type=str)
+    parser.add_argument(
+        "--periodic-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", False),
+        help=(
+            "Clone live model state once per minute for automatic rewind. "
+            "Disabled by default because full GPU-state copies can interrupt "
+            "realtime inference. Explicit baseline rewind and bookmarks remain."
+        ),
+    )
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')
     parser.add_argument("--gradio-tunnel-token",
                         help='Provide a custom (secret) token here to keep getting the same URL.')
@@ -5420,6 +5635,7 @@ def main():
     logger.info(
         f"record_sessions = {args.record_sessions}, recordings_dir = {args.recordings_dir}"
     )
+    logger.info("periodic_snapshots = %s", args.periodic_snapshots)
 
     # Resolve the voice-preview cache dir. Default: <voice_prompt_dir>/previews,
     # mirroring uploads/recordings. Left None (preview route disabled) when no
@@ -5539,6 +5755,7 @@ def main():
         recordings_dir=args.recordings_dir,
         preview_cache_dir=preview_cache_dir,
         asr=asr_engine,
+        periodic_snapshots=args.periodic_snapshots,
         save_voice_prompt_embeddings=False
     )
     logger.info("warming up the model")
