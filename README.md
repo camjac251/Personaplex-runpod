@@ -174,15 +174,18 @@ Controls:
 - **Add Vision / Stop Vision**: start or end the capture stream.
 - **Pause Vision / Resume Vision**: keep the stream open but stop sending frames.
 - **Capture Now**: force a high-detail frame send immediately (bypasses motion gate and pause).
-- **Use in next reply**: explicitly queue the latest scene fact for PersonaPlex's next response.
 - **Rewind**: restore the last KV-cache snapshot if the model gets stuck. Auto-rewind also fires when the safety net trips 3+ times in 30 s.
 
-The reaction selector has three levels and defaults to **Captions only**.
-Captions only keeps descriptions outside the speech model, **After speech**
-queues one scene fact after a user turn, and **Continuous** is an experimental
-ambient feed. The last two inject text mid-stream and can alter the checkpoint's
-learned turn timing; Captions only is the cleanest mode for evaluating native
-duplex behavior.
+The reaction selector defaults to **Captions only**, which keeps descriptions
+outside the speech model. **Ambient react** is explicitly unsafe: it injects
+captions into PersonaPlex's own text stream and may speak about changing scenes
+without being asked. Ambient injections are rate-limited to one every eight
+seconds. Captions only is the cleanest mode for native duplex behavior.
+
+Real GPU/WebRTC testing confirmed that PersonaPlex has no separate visual-input
+role: injected captions enter its own text stream. Automatic after-turn and
+on-demand "next reply" grounding were therefore removed rather than presented
+as reliable features. The caption panel itself remains independent and safe.
 
 The **Vision Prompt** textarea in the config panel customizes the system prompt sent to Gemini at the start of each session. Frames are motion-gated client-side so static scenes don't waste calls. A live cost meter and a rolling caption history sit below the preview. The fallback frame interval is configurable; most frames are server-requested when the model just went silent, so the timer rarely fires in practice.
 

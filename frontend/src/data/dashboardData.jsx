@@ -199,9 +199,9 @@ export const INFERENCE_RANGES = {
     repPenalty: { min: 1, max: 2, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
     padBonus: { min: 0, max: 6, step: 0.1 },
-    maxTurn: { min: 0, max: 2000, step: 10, integer: true },
-    injectSilenceRms: { min: 0.001, max: 0.05, step: 0.001 },
-    injectSilenceStreak: { min: 2, max: 20, step: 1, integer: true },
+    maxTurn: { min: 40, max: 2000, step: 10, integer: true },
+    injectSilenceRms: { min: 0.001, max: 0.02, step: 0.001 },
+    injectSilenceStreak: { min: 4, max: 20, step: 1, integer: true },
   },
 };
 
@@ -395,7 +395,8 @@ export const PARAM_INFO = {
       <>
         Hard cap for consecutive non-silence text tokens. Default <b>120</b> is
         about ten seconds of sustained talk. Hitting it contributes to
-        auto-rewind detection.
+        auto-rewind detection, so the safety floor remains <b>40</b> even in
+        Expert mode.
       </>
     ),
   },
@@ -435,19 +436,8 @@ export const PARAM_INFO = {
     title: "Vision reaction mode",
     body: (
       <>
-        <b>Captions only</b> keeps scene notes outside the speech model unless
-        you inject one on demand. <b>After speech</b> queues a note after a user
-        turn. <b>Continuous</b> is an experimental ambient feed.
-      </>
-    ),
-  },
-  visionGround: {
-    title: "Auto after speech",
-    body: (
-      <>
-        When vision is running, the latest fresh scene fact is queued after your
-        mic input ends. Off by default because it injects text tokens directly
-        into the voice model.
+        <b>Captions only</b> keeps scene notes outside the speech model. Ambient
+        react is an unsafe experiment that may speak without a user prompt.
       </>
     ),
   },
@@ -585,9 +575,9 @@ export const PARAM_INFO = {
     body: (
       <>
         The instruction sent to Gemini with each captured frame. It shapes the
-        scene note shown in the vision panel; on-demand, after-speech, and
-        continuous actions can queue a compact factual note into the voice's
-        text context.
+        scene note shown in the vision panel. Captions-only keeps it outside
+        the voice; unsafe Ambient react can inject a compact factual note into
+        the voice's own text stream.
       </>
     ),
   },

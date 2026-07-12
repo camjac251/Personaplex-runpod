@@ -278,7 +278,10 @@ REPETITION_PENALTY_CONTEXT_MIN = 0
 REPETITION_PENALTY_CONTEXT_MAX = 256
 PADDING_BONUS_MIN = 0.0
 PADDING_BONUS_MAX = 6.0
-MAX_TURN_TEXT_TOKENS_MIN = 0
+# Keep the circuit breaker and its auto-rewind signal available for every
+# user-supplied configuration. LMGen still supports 0 internally so manual
+# interrupt force windows remain independently testable.
+MAX_TURN_TEXT_TOKENS_MIN = 40
 MAX_TURN_TEXT_TOKENS_MAX = 2000
 SESSION_TIMEOUT_SEC_MIN = 0
 SESSION_TIMEOUT_SEC_MAX = 3600
@@ -430,9 +433,9 @@ def clamp_clone_strength(value) -> float:
 # near the input-side ASR silence threshold (0.005). The streak is in
 # ~80 ms frames (12.5 Hz).
 INJECT_SILENCE_RMS_MIN = 0.001
-INJECT_SILENCE_RMS_MAX = 0.05
+INJECT_SILENCE_RMS_MAX = 0.02
 INJECT_SILENCE_RMS_DEFAULT = 0.01
-INJECT_SILENCE_STREAK_MIN = 2
+INJECT_SILENCE_STREAK_MIN = 4
 INJECT_SILENCE_STREAK_MAX = 20
 INJECT_SILENCE_STREAK_DEFAULT = 6
 

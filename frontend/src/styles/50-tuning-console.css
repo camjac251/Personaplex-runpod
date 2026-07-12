@@ -255,7 +255,7 @@
   .vision-reaction-row > .l { color: var(--ink-3); }
   .vision-reaction {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .vision-reaction button {
     min-width: 0;

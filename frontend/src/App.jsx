@@ -191,8 +191,7 @@ function matchesReplacedDefault(value, defaults) {
 
 const VISION_REACTION_MODES = [
   { id: "passive", label: "Captions only" },
-  { id: "after_speech", label: "After speech" },
-  { id: "continuous", label: "Continuous · experimental" },
+  { id: "continuous", label: "Ambient react · unsafe" },
 ];
 
 const TURN_HANDLING_MODES = [
@@ -214,8 +213,11 @@ function normalizeVisionReactionMode(value, fallback = "passive") {
 }
 
 function visionReactionModeFromFlags(feedModel, groundTurns, fallback = "passive") {
-  if (groundTurns) return "after_speech";
   if (feedModel) return "continuous";
+  // Retire legacy after-speech grounding: real GPU traces showed it queued
+  // only after the assistant's answer and could provoke an unsolicited
+  // follow-up instead of grounding that reply.
+  if (groundTurns) return "passive";
   return normalizeVisionReactionMode(fallback);
 }
 
@@ -2918,8 +2920,7 @@ function App() {
       setVisionBudgetTripped(false);
       setCaptionEntries([]);
       const startMessage = {
-        after_speech: "scene facts will attach after speech",
-        continuous: "scene facts will update continuously",
+        continuous: "unsafe ambient scene reactions are enabled",
         manual: "scene grounding is manual",
         passive: "scene captions are passive",
       }[visionReactionMode];
@@ -3064,15 +3065,6 @@ function App() {
       return !paused;
     });
   };
-
-  const useLatestScene = useCallback(() => {
-    if (controlRef.current?.readyState !== "open") {
-      addNotice("warn", "Start a session before using scene context", "vision");
-      return;
-    }
-    controlRef.current.send(JSON.stringify({ type: "use_latest_vision" }));
-    addNotice("info", "Requested latest scene context", "vision");
-  }, [addNotice]);
 
   const rewind = () => {
     const now = performance.now();
@@ -4814,24 +4806,9 @@ function App() {
                       </div>
                       <span className={cls("vision-reaction-note", visionReactionMode !== "passive" && "warn")}>
                         {visionReactionMode === "passive"
-                          ? "Descriptions stay outside the voice model unless you choose Use in next reply."
-                          : "Experimental context injection can change the model's learned turn timing."}
+                          ? "Captions stay outside the voice model and cannot disturb speech timing."
+                          : "Unsafe experiment: may speak about changing scenes without being asked."}
                       </span>
-                    </div>
-                    <div className="vision-actions">
-                      <button
-                        type="button"
-                        className="btn ghost block"
-                        disabled={!isLive || !visionOn}
-                        title={
-                          currentCaption
-                            ? "Queue the latest visual note for the next answer"
-                            : "Request a fresh visual note for the next answer"
-                        }
-                        onClick={useLatestScene}
-                      >
-                        {Icon.eye} Use in next reply
-                      </button>
                     </div>
                     <div className="mini-row" style={{ paddingTop: 4 }}>
                       <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
@@ -4945,7 +4922,7 @@ function App() {
                   </RailColumn>
                   <RailColumn title="TURN" aggregate={`${maxTurn} tok · pad ${fmt(padBonus, 1)}`}>
                     <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); sendLiveConfig({ padding_bonus: Number(value) }); }} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
-                    <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => (v ? `${v}` : "off")} />
+                    <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
                   </RailColumn>
                   <RailColumn title="CONTEXT" aggregate={visionOn || reinforceInSilences ? (injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`) : "inactive"}>
                     <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_rms: Number(value) }); }} min={INFERENCE_RANGES.expert.injectSilenceRms.min} max={INFERENCE_RANGES.expert.injectSilenceRms.max} step={INFERENCE_RANGES.expert.injectSilenceRms.step} format={(v) => fmt(v, 3)} />

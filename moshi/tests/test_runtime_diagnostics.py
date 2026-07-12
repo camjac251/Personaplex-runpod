@@ -250,6 +250,66 @@ def test_short_noise_burst_does_not_complete_user_turn() -> None:
     assert ended is True
 
 
+def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
+    class _Lm:
+        _non_pad_streak = 77
+        _pad_force_remaining = 5
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._collapse_triggers = deque([1.0, 2.0])
+    state._prev_pad_force_remaining = 0
+
+    state._reset_turn_cap_tracking_for_config_change()
+
+    assert state.lm_gen._non_pad_streak == 0
+    assert state.lm_gen._pad_force_remaining == 5
+    assert list(state._collapse_triggers) == []
+    assert state._prev_pad_force_remaining == 5
+
+
+def test_auto_recovery_replaces_extreme_tuning() -> None:
+    class _Model:
+        text_card = 32_000
+        card = 2_048
+
+    class _Lm:
+        lm_model = _Model()
+        temp_text = 1.5
+        top_k_text = 500
+        repetition_penalty = 2.0
+        repetition_penalty_context = 256
+        padding_bonus = 6.0
+        max_turn_text_tokens = 40
+        _non_pad_streak = 39
+        _pad_force_remaining = 0
+
+        def set_audio_sampling(self, temperature, top_k) -> None:
+            self.temp = temperature
+            self.top_k = top_k
+
+        def reset_repetition_state(self) -> None:
+            self.repetition_reset = True
+
+    state = ServerState.__new__(ServerState)
+    state.model_identity = {"model_variant": "rl-seamless"}
+    state.lm_gen = _Lm()
+    state._collapse_triggers = deque([1.0, 2.0])
+    state._prev_pad_force_remaining = 0
+
+    state._apply_auto_recovery_tuning_locked()
+
+    assert state.lm_gen.temp_text == 0.7
+    assert state.lm_gen.top_k_text == 25
+    assert state.lm_gen.temp == 0.8
+    assert state.lm_gen.top_k == 250
+    assert state.lm_gen.repetition_penalty == 1.0
+    assert state.lm_gen.repetition_penalty_context == 64
+    assert state.lm_gen.padding_bonus == 0.0
+    assert state.lm_gen.max_turn_text_tokens == 120
+    assert state.lm_gen.repetition_reset is True
+
+
 def test_clearing_resume_grant_cancels_snapshot_retaining_timer() -> None:
     class _Handle:
         cancelled = False
@@ -280,6 +340,8 @@ if __name__ == "__main__":
         test_snapshot_defers_mid_context_injection,
         test_restore_waits_for_cuda_copy_completion,
         test_short_noise_burst_does_not_complete_user_turn,
+        test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_auto_recovery_replaces_extreme_tuning,
         test_clearing_resume_grant_cancels_snapshot_retaining_timer,
     ]
     for test in tests:

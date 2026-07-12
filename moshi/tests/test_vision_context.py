@@ -15,8 +15,10 @@ sys.path.insert(0, "moshi")
 
 from moshi.server import (  # noqa: E402
     ServerState,
+    VISION_AMBIENT_MIN_INTERVAL_SEC,
     VISION_QUEUE_MAX,
     _clip_vision_context,
+    _gemini_caption_from_interaction,
     _sanitize_vision_text,
 )
 
@@ -72,6 +74,26 @@ def test_sanitize_removes_labels_and_extra_sentences() -> None:
     )
 
 
+def test_incomplete_interaction_keeps_valid_caption_json() -> None:
+    data = {
+        "status": "incomplete",
+        "steps": [
+            {
+                "type": "model_output",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"caption":"An orange square is visible."}',
+                    }
+                ],
+            }
+        ],
+    }
+    caption, step_count = _gemini_caption_from_interaction(data)
+    assert caption == "An orange square is visible."
+    assert step_count == 1
+
+
 def test_clipping_preserves_complete_untruncated_text() -> None:
     text = "A person stands beside the road"
     assert _clip_vision_context(text, len(text)) == text
@@ -105,6 +127,32 @@ def test_waiting_packet_never_splices_active_packet() -> None:
     assert list(state._vision_active) == [1, 2]
     assert state._vision_active_source == "manual"
     assert list(state._vision_pending) == [3, 4]
+
+
+def test_ambient_context_is_rate_limited_without_blocking_captions() -> None:
+    state = _bare_state()
+    state._last_ambient_context_queued_at = 0.0
+    first = state._queue_waiting_vision_context(
+        [1, 2],
+        "ambient",
+        {"caption": "a red square"},
+    )
+    second = state._queue_waiting_vision_context(
+        [3, 4],
+        "ambient",
+        {"caption": "a green square"},
+    )
+    state._last_ambient_context_queued_at -= VISION_AMBIENT_MIN_INTERVAL_SEC
+    third = state._queue_waiting_vision_context(
+        [5, 6],
+        "ambient",
+        {"caption": "a purple square"},
+    )
+
+    assert first == (True, "", False)
+    assert second == (False, "rate_limit", False)
+    assert third == (True, "", False)
+    assert list(state._vision_pending) == [5, 6]
 
 
 def test_source_clear_preserves_other_packet() -> None:
@@ -166,9 +214,11 @@ def test_stale_source_generation_cannot_queue_context() -> None:
 if __name__ == "__main__":
     tests = [
         test_sanitize_removes_labels_and_extra_sentences,
+        test_incomplete_interaction_keeps_valid_caption_json,
         test_clipping_preserves_complete_untruncated_text,
         test_fit_context_keeps_complete_words_within_token_window,
         test_waiting_packet_never_splices_active_packet,
+        test_ambient_context_is_rate_limited_without_blocking_captions,
         test_source_clear_preserves_other_packet,
         test_stale_source_generation_cannot_queue_context,
     ]
