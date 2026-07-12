@@ -224,20 +224,19 @@ function storedVisionReactionMode() {
     const groundTurns = localStorage.getItem("pp_visionGroundTurns") === "1";
     const feedModel = localStorage.getItem("pp_visionFeedModel") === "1";
     // The two-toggle UI labelled its both-off state "manual" and kept the
-    // Use latest scene button enabled, so a stored both-off state means the
-    // on-demand workflow, not passive captions. Fresh installs default to
-    // after-speech grounding: starting vision and having captions never
-    // reach the voice model reads as vision being broken.
+    // on-demand injection button enabled, so a stored both-off state maps to
+    // captions-only. Fresh installs also default there: enabling vision must
+    // not silently alter the speech model's learned turn timing.
     const legacyPresent =
       localStorage.getItem("pp_visionGroundTurns") !== null ||
       localStorage.getItem("pp_visionFeedModel") !== null;
     return visionReactionModeFromFlags(
       feedModel,
       groundTurns,
-      legacyPresent ? "manual" : "after_speech",
+      legacyPresent ? "manual" : "passive",
     );
   } catch {
-    return "after_speech";
+    return "passive";
   }
 }
 
@@ -264,6 +263,7 @@ function mergeServerInfo(info, message) {
     modelLabel: typeof message.model_label === "string" ? message.model_label : info.modelLabel,
     modelVariant: typeof message.model_variant === "string" ? message.model_variant : info.modelVariant,
     modelLicense: typeof message.model_license === "string" ? message.model_license : info.modelLicense,
+    visionModel: typeof message.vision_model === "string" ? message.vision_model : info.visionModel,
     nativeDuplexRecommended:
       typeof message.native_duplex_recommended === "boolean"
         ? message.native_duplex_recommended
@@ -510,6 +510,7 @@ function App() {
     modelLabel: "",
     modelVariant: "",
     modelLicense: "",
+    visionModel: "",
     nativeDuplexRecommended: null,
   });
   const modelDefaults = defaultsForModel(
@@ -4255,7 +4256,7 @@ function App() {
                     <Info k="visionPrompt" />
                   </div>
                 </div>
-                <span className="sect-sub">Gemini</span>
+                <span className="sect-sub">{serverInfo.visionModel || "Gemini"}</span>
               </div>
               <textarea
                 aria-label="Vision prompt"
@@ -4742,7 +4743,7 @@ function App() {
                     <div>
                       <div className="mini-row">
                         <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
-                          Idle heartbeat
+                          Fallback capture interval
                           <Info k="heartbeat" />
                         </span>
                         <span className="v">every {visionIntervalMs / 1000} s</span>
@@ -4753,7 +4754,7 @@ function App() {
                         max={30}
                         step={1}
                         value={visionIntervalMs / 1000}
-                        aria-label="Idle heartbeat interval"
+                        aria-label="Fallback capture interval"
                         onChange={(event) => {
                           setVisionIntervalMs(Number(event.target.value) * 1000);
                           setSessionProfileId("custom");
@@ -4813,7 +4814,7 @@ function App() {
                       </div>
                       <span className={cls("vision-reaction-note", visionReactionMode !== "passive" && "warn")}>
                         {visionReactionMode === "passive"
-                          ? "Descriptions stay outside the voice model unless you choose Use latest scene."
+                          ? "Descriptions stay outside the voice model unless you choose Use in next reply."
                           : "Experimental context injection can change the model's learned turn timing."}
                       </span>
                     </div>
@@ -4829,7 +4830,7 @@ function App() {
                         }
                         onClick={useLatestScene}
                       >
-                        {Icon.eye} Use latest scene
+                        {Icon.eye} Use in next reply
                       </button>
                     </div>
                     <div className="mini-row" style={{ paddingTop: 4 }}>
@@ -5141,6 +5142,7 @@ function App() {
             <Row label="Revision" value={serverInfo.modelRevision ? serverInfo.modelRevision.slice(0, 12) : "·"} />
             <Row label="Server" value={serverInfo.serverBuild || "·"} />
             <Row label="Client" value="React · Bun" />
+            <Row label="Vision" value={serverInfo.visionModel || "·"} />
             <Row label="License" value={serverInfo.modelLicense || "·"} />
           </div>
         </aside>

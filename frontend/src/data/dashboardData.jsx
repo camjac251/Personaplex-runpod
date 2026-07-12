@@ -452,7 +452,7 @@ export const PARAM_INFO = {
     ),
   },
   heartbeat: {
-    title: "Idle heartbeat",
+    title: "Fallback capture interval",
     body: (
       <>
         Safety timer for quiet sessions. Most frames are server-requested when

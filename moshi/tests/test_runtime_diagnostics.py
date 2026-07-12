@@ -5,7 +5,9 @@ Run directly: ``uv run python moshi/tests/test_runtime_diagnostics.py``.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import json
 import re
 import sys
 import threading
@@ -19,6 +21,7 @@ sys.path.insert(0, "moshi")
 
 from moshi.server import (  # noqa: E402
     BASE_HF_REPO,
+    GEMINI_VISION_MODEL,
     RL_HF_REPO,
     ServerState,
     SnapshotDeferred,
@@ -75,6 +78,21 @@ def test_model_identity_distinguishes_rl_base_and_custom() -> None:
     assert local["model_label"] == "Local · checkpoint.safetensors"
     assert local["model_variant"] == "local"
     assert local["model_revision"] == "local file"
+
+
+def test_server_info_reports_active_vision_model() -> None:
+    state = ServerState.__new__(ServerState)
+    state.model_identity = _model_identity(RL_HF_REPO, "a" * 40)
+    state.gpu_name = "test-gpu"
+    state.vram_total = 24 * 1024**3
+    state.server_build = "test-build"
+    state._gemini_api_key = "configured"
+
+    response = asyncio.run(state.handle_server_info(None))
+    payload = json.loads(response.text)
+
+    assert payload["vision_available"] is True
+    assert payload["vision_model"] == GEMINI_VISION_MODEL
 
 
 def test_stale_baseline_is_not_an_auto_rewind_target() -> None:
@@ -253,6 +271,7 @@ if __name__ == "__main__":
     tests = [
         test_periodic_snapshots_default_on,
         test_model_identity_distinguishes_rl_base_and_custom,
+        test_server_info_reports_active_vision_model,
         test_stale_baseline_is_not_an_auto_rewind_target,
         test_backpressure_status_names_active_inference_phase,
         test_tracked_inference_lock_clears_phase_after_error,

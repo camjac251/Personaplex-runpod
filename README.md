@@ -165,7 +165,7 @@ You can also upload 10-30 s of clean audio for any speaker via the **Clone a voi
 
 ## Vision (optional)
 
-Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.5 Flash** via the Interactions API; the one-sentence scene description is drip-fed into the model's text channel during natural silence windows so PersonaPlex stays contextually aware of what you're seeing without speaking the description aloud.
+Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.5 Flash** via the Interactions API. Captions stay outside PersonaPlex by default; reaction modes can drip a compact scene fact into its text channel during natural silence windows.
 
 Enable it by providing `GEMINI_API_KEY` and clicking **Add Vision** in the UI. Without the key the button stays disabled and a toast explains why.
 
@@ -174,13 +174,15 @@ Controls:
 - **Add Vision / Stop Vision**: start or end the capture stream.
 - **Pause Vision / Resume Vision**: keep the stream open but stop sending frames.
 - **Capture Now**: force a high-detail frame send immediately (bypasses motion gate and pause).
+- **Use in next reply**: explicitly queue the latest scene fact for PersonaPlex's next response.
 - **Rewind**: restore the last KV-cache snapshot if the model gets stuck. Auto-rewind also fires when the safety net trips 3+ times in 30 s.
 
-The reaction selector has three explicit levels: **Captions only** keeps scene
-descriptions outside the speech model, **After speech** queues one scene fact
-after a user turn, and **Continuous** is an experimental ambient feed. The last
-two inject text mid-stream and can alter the checkpoint's learned turn timing;
-Captions only is the cleanest mode for evaluating native duplex behavior.
+The reaction selector has three levels and defaults to **Captions only**.
+Captions only keeps descriptions outside the speech model, **After speech**
+queues one scene fact after a user turn, and **Continuous** is an experimental
+ambient feed. The last two inject text mid-stream and can alter the checkpoint's
+learned turn timing; Captions only is the cleanest mode for evaluating native
+duplex behavior.
 
 The **Vision Prompt** textarea in the config panel customizes the system prompt sent to Gemini at the start of each session. Frames are motion-gated client-side so static scenes don't waste calls. A live cost meter and a rolling caption history sit below the preview. The fallback frame interval is configurable; most frames are server-requested when the model just went silent, so the timer rarely fires in practice.
 

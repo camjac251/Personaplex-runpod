@@ -504,6 +504,7 @@ VISION_AUTO_DISABLE_THRESHOLD = 3
 GEMINI_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 GEMINI_TRANSIENT_COOLDOWN_SEC = 5.0
 GEMINI_TRANSIENT_COOLDOWN_MAX_SEC = 60.0
+GEMINI_VISION_MODEL = "gemini-3.5-flash"
 
 # Bound each Gemini request so one stuck HTTP call cannot hold the
 # per-session _vision_in_flight guard and silently stop future captures.
@@ -3047,7 +3048,7 @@ class ServerState:
                 VISION_DETAIL_THINKING_LEVEL if detail else "minimal"
             )
             payload = {
-                "model": "gemini-3.5-flash",
+                "model": GEMINI_VISION_MODEL,
                 "system_instruction": system_instruction,
                 "input": input_parts,
                 "store": False,
@@ -3622,6 +3623,7 @@ class ServerState:
                 "vram_total": self.vram_total,
                 "server_build": self.server_build,
                 "vision_available": bool(self._gemini_api_key),
+                "vision_model": GEMINI_VISION_MODEL,
             }
         )
 
@@ -5403,6 +5405,7 @@ class ServerState:
                 "gpu_name": self.gpu_name,
                 "vram_total": self.vram_total,
                 "server_build": self.server_build,
+                "vision_model": GEMINI_VISION_MODEL,
             }
             if resuming:
                 # Tells the client its session state survived, so it keeps
@@ -6147,8 +6150,9 @@ def main():
     state._infer_executor.submit(state.warmup).result()
     logger.info("warmup complete in %.1f s", time.monotonic() - t)
     logger.info(
-        "vision: %s",
+        "vision: %s · model=%s",
         "enabled" if state._gemini_api_key else "disabled (no GEMINI_API_KEY)",
+        GEMINI_VISION_MODEL,
     )
 
     # Pre-warm Cloudflare TURN credentials so the very first session
