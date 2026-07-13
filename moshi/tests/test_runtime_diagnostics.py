@@ -26,6 +26,7 @@ from moshi.server import (  # noqa: E402
     ServerState,
     SnapshotDeferred,
     _model_identity,
+    _resolve_session_seed,
 )
 
 
@@ -93,6 +94,14 @@ def test_server_info_reports_active_vision_model() -> None:
 
     assert payload["vision_available"] is True
     assert payload["vision_model"] == GEMINI_VISION_MODEL
+
+
+def test_random_seed_resolves_to_a_replayable_value() -> None:
+    assert _resolve_session_seed(42) == 42
+    for requested in (None, -1):
+        resolved = _resolve_session_seed(requested)
+        assert 0 <= resolved <= 2_147_483_647
+        assert resolved != -1
 
 
 def test_stale_baseline_is_not_an_auto_rewind_target() -> None:
@@ -250,6 +259,79 @@ def test_short_noise_burst_does_not_complete_user_turn() -> None:
     assert ended is True
 
 
+def test_short_reply_releases_stop_without_weakening_general_vad() -> None:
+    state = ServerState.__new__(ServerState)
+    state._stop_response_latched = True
+    state._stop_user_audio_active = False
+    state._stop_user_audio_attack_streak = 0
+    state._stop_user_audio_silence_streak = 0
+    state._user_audio_active = False
+    state._user_audio_attack_streak = 0
+    state._user_audio_active_frames = 0
+    state._user_audio_silence_streak = 0
+
+    for _ in range(2):
+        _, general_ended = state._update_user_turn_activity(0.01)
+        stop_ended = state._update_stop_latch_user_turn_activity(0.01)
+    assert general_ended is False
+    assert stop_ended is False
+    assert state._user_audio_active is False
+
+    for _ in range(7):
+        _, general_ended = state._update_user_turn_activity(0.0)
+        stop_ended = state._update_stop_latch_user_turn_activity(0.0)
+    assert general_ended is False
+    assert stop_ended is True
+
+
+def test_single_frame_noise_does_not_release_stop_latch() -> None:
+    state = ServerState.__new__(ServerState)
+    state._stop_response_latched = True
+    state._stop_user_audio_active = False
+    state._stop_user_audio_attack_streak = 0
+    state._stop_user_audio_silence_streak = 0
+
+    assert state._update_stop_latch_user_turn_activity(0.01) is False
+    for _ in range(10):
+        assert state._update_stop_latch_user_turn_activity(0.0) is False
+
+    assert state._stop_user_audio_active is False
+    assert state._stop_user_audio_attack_streak == 0
+
+
+def test_barge_in_carries_pre_interrupt_speech_into_stop_release() -> None:
+    def bare_state() -> ServerState:
+        state = ServerState.__new__(ServerState)
+        state._stop_response_latched = False
+        state._stop_user_audio_active = False
+        state._stop_user_audio_attack_streak = 0
+        state._stop_user_audio_silence_streak = 0
+        state._user_audio_active = False
+        state._user_audio_attack_streak = 0
+        state._user_audio_active_frames = 0
+        state._user_audio_silence_streak = 0
+        return state
+
+    state = bare_state()
+    state._update_user_turn_activity(0.01)
+    state._arm_stop_response_latch_locked("barge_in")
+    assert state._stop_user_audio_attack_streak == 1
+
+    assert state._update_stop_latch_user_turn_activity(0.01) is False
+    assert state._stop_user_audio_active is True
+    for _ in range(7):
+        ended = state._update_stop_latch_user_turn_activity(0.0)
+    assert ended is True
+
+    manual = bare_state()
+    manual._update_user_turn_activity(0.01)
+    manual._arm_stop_response_latch_locked("manual")
+    assert manual._stop_user_audio_attack_streak == 0
+    assert manual._update_stop_latch_user_turn_activity(0.01) is False
+    for _ in range(7):
+        assert manual._update_stop_latch_user_turn_activity(0.0) is False
+
+
 def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     class _Lm:
         _non_pad_streak = 77
@@ -266,6 +348,66 @@ def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     assert state.lm_gen._pad_force_remaining == 5
     assert list(state._collapse_triggers) == []
     assert state._prev_pad_force_remaining == 5
+
+
+def test_turn_cap_event_reports_applied_limit() -> None:
+    class _Lm:
+        max_turn_text_tokens = 80
+
+    class _Session:
+        def send_event(self, *_args) -> None:
+            return None
+
+    class _Loop:
+        called: tuple | None = None
+
+        def call_soon_threadsafe(self, *args) -> None:
+            self.called = args
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._active_session = _Session()
+    state._main_loop = _Loop()
+
+    state._schedule_turn_cap_event(12)
+
+    assert state._main_loop.called is not None
+    callback, kind, text, level, data = state._main_loop.called
+    assert callback == state._active_session.send_event
+    assert kind == "turn_cap"
+    assert "yielding" in text
+    assert level == "warn"
+    assert data == {"max_turn_text_tokens": 80, "forced_frames": 12}
+
+
+def test_stop_latch_releases_only_at_a_new_turn_boundary() -> None:
+    class _Lm:
+        _pad_force_remaining = 12
+        _non_pad_streak = 9
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._stop_response_latched = True
+    state._interrupt_gate_remaining = 7
+    state._prev_pad_force_remaining = 12
+    state._vision_pad_streak = 20
+    state._audio_silence_streak = 20
+    state._stop_user_audio_active = True
+    state._stop_user_audio_attack_streak = 2
+    state._stop_user_audio_silence_streak = 3
+
+    assert state._release_stop_response_latch_locked() is True
+    assert state._stop_response_latched is False
+    assert state._interrupt_gate_remaining == 0
+    assert state.lm_gen._pad_force_remaining == 0
+    assert state.lm_gen._non_pad_streak == 0
+    assert state._prev_pad_force_remaining == 0
+    assert state._vision_pad_streak == 0
+    assert state._audio_silence_streak == 0
+    assert state._stop_user_audio_active is False
+    assert state._stop_user_audio_attack_streak == 0
+    assert state._stop_user_audio_silence_streak == 0
+    assert state._release_stop_response_latch_locked() is False
 
 
 def test_auto_recovery_replaces_extreme_tuning() -> None:
@@ -332,6 +474,7 @@ if __name__ == "__main__":
         test_periodic_snapshots_default_on,
         test_model_identity_distinguishes_rl_base_and_custom,
         test_server_info_reports_active_vision_model,
+        test_random_seed_resolves_to_a_replayable_value,
         test_stale_baseline_is_not_an_auto_rewind_target,
         test_backpressure_status_names_active_inference_phase,
         test_tracked_inference_lock_clears_phase_after_error,
@@ -340,7 +483,12 @@ if __name__ == "__main__":
         test_snapshot_defers_mid_context_injection,
         test_restore_waits_for_cuda_copy_completion,
         test_short_noise_burst_does_not_complete_user_turn,
+        test_short_reply_releases_stop_without_weakening_general_vad,
+        test_single_frame_noise_does_not_release_stop_latch,
+        test_barge_in_carries_pre_interrupt_speech_into_stop_release,
         test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_turn_cap_event_reports_applied_limit,
+        test_stop_latch_releases_only_at_a_new_turn_boundary,
         test_auto_recovery_replaces_extreme_tuning,
         test_clearing_resume_grant_cancels_snapshot_retaining_timer,
     ]

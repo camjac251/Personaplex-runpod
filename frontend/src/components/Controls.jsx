@@ -80,7 +80,7 @@ export function Info({ k }) {
   );
 }
 
-export function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder, caption, info }) {
+export function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder, caption, info, disabled = false }) {
   const ref = useRef(null);
   const menuId = useId();
   const [open, setOpen] = useState(false);
@@ -99,7 +99,7 @@ export function Listbox({ value, options, onChange, placeholder = "Select", labe
   }, [activeIndex, open]);
 
   const choose = (option) => {
-    if (!option) return;
+    if (!option || disabled) return;
     onChange(option.value);
     setOpen(false);
   };
@@ -136,13 +136,16 @@ export function Listbox({ value, options, onChange, placeholder = "Select", labe
         type="button"
         role="combobox"
         className={cls("lb-trigger", open && "open")}
+        disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={menuId}
         aria-activedescendant={open ? `${menuId}-opt-${focusIdx}` : undefined}
         aria-label={label}
         onKeyDown={onKeyDown}
-        onClick={() => setOpen((currentOpen) => !currentOpen)}
+        onClick={() => {
+          if (!disabled) setOpen((currentOpen) => !currentOpen);
+        }}
       >
         <span className="lb-trigger-label">{current?.label || placeholder}</span>
         <svg className="lb-chev" viewBox="0 0 10 10" aria-hidden="true" focusable="false">

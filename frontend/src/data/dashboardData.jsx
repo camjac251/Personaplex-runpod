@@ -207,9 +207,29 @@ export const INFERENCE_RANGES = {
 
 export const SESSION_PROFILES = [
   {
+    id: "balanced",
+    label: "Balanced",
+    desc: "Stable defaults for natural full-duplex conversation.",
+    presetId: "assistant",
+    voice: "NATF1",
+    adherenceMode: "balanced",
+    expressionMode: "natural",
+    turnHandling: "recommended",
+    // Sampling fields intentionally inherit the active checkpoint defaults.
+    // Base and the aligned checkpoint do not share the same safe values.
+    echoCancel: true,
+    noiseSupp: true,
+    autoGain: false,
+    visionInTranscript: false,
+    visionFeedModel: false,
+    visionGroundTurns: false,
+    visionIntervalMs: 5000,
+    seedRandom: true,
+  },
+  {
     id: "live_support",
-    label: "Live support",
-    desc: "Short turns with strong yield pressure.",
+    label: "Concise",
+    desc: "Short, focused answers with quick turn handoff.",
     presetId: "assistant",
     voice: "NATF1",
     adherenceMode: "strict",
@@ -234,13 +254,16 @@ export const SESSION_PROFILES = [
   },
   {
     id: "expressive_guide",
-    label: "Expressive guide",
-    desc: "More color while keeping interruption friendly.",
-    presetId: "teacher",
+    label: "Expressive",
+    desc: "More vocal color while remaining interruption friendly.",
+    presetId: "assistant",
     voice: "VARF4",
     adherenceMode: "balanced",
     expressionMode: "expressive",
-    turnHandling: "native",
+    // Resolve to Native on the aligned checkpoint and Assisted on Base.
+    // Keep checkpoint-specific overlap behavior separate from the sampling
+    // preset instead of forcing the aligned model's Native mode onto Base.
+    turnHandling: "recommended",
     textTemp: 0.82,
     textTopk: 40,
     audioTemp: 0.9,
@@ -493,9 +516,10 @@ export const PARAM_INFO = {
     title: "Session profile",
     body: (
       <>
-        A saved bundle of every connect-time setting: persona, voice, sampling,
-        and mic. Pick one to load it whole, or save your current setup as a new
-        card.
+        A dashboard preset for persona, built-in voice, sampling, microphone
+        processing, vision behavior, and seed. Uploaded voice audio and device
+        routing are not portable. Pick one to load it, or save the current core
+        setup as a new card.
       </>
     ),
   },

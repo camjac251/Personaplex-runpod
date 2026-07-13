@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "pause_mid_utterance",
+  "description": "Pause handling: provide a WAV containing one utterance with an 800 ms internal hesitation from 1800-2600 ms, then speech through 4200 ms.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. User speech 0-1800 ms, digital or room silence 1800-2600 ms, continuation 2600-4200 ms.",
+  "config": {
+    "seed": 42
+  },
+  "actions": [],
+  "expectations": [
+    {
+      "kind": "pause",
+      "label": "internal hesitation",
+      "start_ms": 1800,
+      "end_ms": 2600,
+      "max_assistant_active_ms": 160
+    },
+    {
+      "kind": "turn",
+      "label": "completed utterance",
+      "at_ms": 4200,
+      "deadline_ms": 4000,
+      "max_latency_ms": 3000
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 7000
+}

@@ -725,6 +725,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.padding_bonus = padding_bonus
         self.max_turn_text_tokens = max_turn_text_tokens
         self._non_pad_streak = 0
+        self._turn_pad_streak = 0
         self._pad_force_remaining = 0
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
@@ -1039,9 +1040,11 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
-        # Hard cap on turn length. If the model emits N consecutive non-pad
-        # text tokens, force pad for ~1 s of text frames (12.5 Hz) so the
-        # audio decoder produces real silence and the turn actually yields.
+        # Hard cap on turn length. If the model emits N text tokens within a
+        # turn, force pad for ~1 s of text frames (12.5 Hz) so the audio
+        # decoder produces real silence and the turn actually yields. Brief
+        # PAD gaps between phrases do not reset the count; only a sustained
+        # natural PAD/EPAD run marks a new turn.
         # The sampled-token accounting happens after the depformer launch to
         # avoid synchronizing CUDA between the main and depth graphs. A newly
         # reached cap arms padding for the following frame, preserving the
@@ -1087,20 +1090,12 @@ class LMGen(StreamingModule[_LMGenState]):
             state.cache[:, 1 : lm_model.dep_q + 1, target_position],
         )
 
-        if not text_was_forced:
-            if turn_pad_forced:
-                self._non_pad_streak = 0
-            elif self.max_turn_text_tokens > 0:
-                tok = int(next_text_token[0].item())
-                if tok in (0, lm_model.text_padding_token_id):
-                    self._non_pad_streak = 0
-                else:
-                    self._non_pad_streak += 1
-                    if self._non_pad_streak >= self.max_turn_text_tokens:
-                        self._pad_force_remaining = 12
-                        self._non_pad_streak = 0
-            else:
-                self._non_pad_streak = 0
+        self._update_turn_cap(
+            next_text_token,
+            pad_id,
+            text_was_forced=text_was_forced,
+            turn_pad_forced=turn_pad_forced,
+        )
 
         ####
         # Calculate loss of model logits (based on state.offset - 1) compared to target (state.offset)
@@ -1324,6 +1319,37 @@ class LMGen(StreamingModule[_LMGenState]):
             return next_text_token, False
         self._pad_force_remaining -= 1
         return torch.full_like(next_text_token, pad_id), True
+
+    def _update_turn_cap(
+        self,
+        next_text_token: torch.Tensor,
+        pad_id: int,
+        *,
+        text_was_forced: bool,
+        turn_pad_forced: bool,
+    ) -> None:
+        """Count text across brief pauses, resetting at a real turn break."""
+        if text_was_forced:
+            return
+        if turn_pad_forced:
+            self._non_pad_streak = 0
+            self._turn_pad_streak = 0
+            return
+        if self.max_turn_text_tokens <= 0:
+            self._non_pad_streak = 0
+            self._turn_pad_streak = 0
+            return
+        token = int(next_text_token[0].item())
+        if token in (0, pad_id):
+            self._turn_pad_streak += 1
+            if self._turn_pad_streak >= REPETITION_TURN_BREAK_FRAMES:
+                self._non_pad_streak = 0
+            return
+        self._turn_pad_streak = 0
+        self._non_pad_streak += 1
+        if self._non_pad_streak >= self.max_turn_text_tokens:
+            self._pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
+            self._non_pad_streak = 0
 
     def reset_repetition_state(self) -> None:
         """Clear turn-scoped repetition history without reallocating tensors."""

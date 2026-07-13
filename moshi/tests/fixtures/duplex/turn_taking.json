@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "turn_taking",
+  "description": "Turn-taking latency after one clearly completed user request.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. One natural spoken request ending at exactly 3000 ms; pad the WAV with silence if needed.",
+  "config": {
+    "seed": 42
+  },
+  "actions": [],
+  "expectations": [
+    {
+      "kind": "turn",
+      "label": "request end",
+      "at_ms": 3000,
+      "deadline_ms": 4000,
+      "max_latency_ms": 3000
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 8000
+}

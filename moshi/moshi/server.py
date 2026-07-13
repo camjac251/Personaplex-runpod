@@ -59,6 +59,7 @@ from .rtc_session import (
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
     MAX_TURN_TEXT_TOKENS_MIN,
+    SEED_MAX,
     VISION_FRAME_MAX_CHARS,
     RTCSession,
     SessionConfig,
@@ -217,6 +218,13 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuning for better performance
+
+
+def _resolve_session_seed(requested: Optional[int]) -> int:
+    """Turn the wire-level random sentinel into a reportable session seed."""
+    if requested is None or requested == -1:
+        return secrets.randbelow(SEED_MAX + 1)
+    return int(requested)
 
 
 def wrap_with_system_tags(text: str) -> str:
@@ -624,6 +632,13 @@ USER_TURN_RELEASE_RMS = 0.0045
 USER_TURN_ATTACK_STREAK = 3
 USER_TURN_MIN_ACTIVE_FRAMES = 4
 USER_TURN_END_SILENCE_STREAK = 7
+# Stop uses a separate, deliberately shorter speech gate. A one- or two-word
+# reply can occupy only two 80 ms outer frames, so requiring the normal four
+# voiced frames leaves the latched assistant muted after "yes", "no", or
+# "okay". Keep the normal detector unchanged because it also gates visual
+# grounding and collapse-boundary bookkeeping.
+STOP_LATCH_USER_TURN_ATTACK_STREAK = 2
+STOP_LATCH_USER_TURN_END_SILENCE_STREAK = 7
 
 # Download filename presented to the operator. The on-disk name is keyed
 # to the opaque session id; this is the neutral name the browser saves.
@@ -1158,6 +1173,10 @@ class ServerState:
         # debugging can compare the client payload with the server-applied
         # token stream.
         self._active_text_prompt: str = ""
+        # Actual RNG seed used for this session. Even a client request for
+        # "random" resolves to a concrete value before priming so exported
+        # diagnostics can reproduce the same sampling stream.
+        self._active_seed: Optional[int] = None
         # Per-session system prompt for Gemini. Set in _run_rtc_session
         # from cfg.vision_prompt (or DEFAULT_VISION_SYSTEM_PROMPT if blank).
         self._vision_system_prompt: str = DEFAULT_VISION_SYSTEM_PROMPT
@@ -1227,6 +1246,14 @@ class ServerState:
         self._last_rewind_at: Optional[float] = None
         self._auto_rewind_pending: bool = False
         self._interrupt_gate_remaining: int = 0
+        # Manual Stop/barge-in is a latched turn abort, not merely a one-second
+        # mute. While set, force assistant PAD+silence until the next valid
+        # user turn completes; otherwise the model can resume the abandoned
+        # answer as soon as the short interrupt gate expires.
+        self._stop_response_latched: bool = False
+        self._stop_user_audio_active: bool = False
+        self._stop_user_audio_attack_streak: int = 0
+        self._stop_user_audio_silence_streak: int = 0
         # Gemini consecutive-error counter for the auto-disable path.
         # Reset on every 2xx success and on session start. Transient
         # statuses (GEMINI_TRANSIENT_STATUSES) bypass the counter and set a
@@ -1459,8 +1486,8 @@ class ServerState:
                 self._reinforce_prompt_text = ""
                 self._reinforce_prompt_tokens = []
 
-            if cfg.seed is not None and cfg.seed != -1:
-                seed_all(cfg.seed)
+            self._active_seed = _resolve_session_seed(cfg.seed)
+            seed_all(self._active_seed)
             self.lm_gen.temp_text = cfg.text_temperature
             self.lm_gen.top_k_text = min(
                 max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
@@ -1486,6 +1513,7 @@ class ServerState:
                 MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens
             )
             self.lm_gen._non_pad_streak = 0
+            self.lm_gen._turn_pad_streak = 0
             self.lm_gen._pad_force_remaining = 0
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
@@ -1518,6 +1546,7 @@ class ServerState:
             self._user_audio_attack_streak = 0
             self._user_audio_active_frames = 0
             self._user_audio_silence_streak = 0
+            self._reset_stop_latch_user_turn_activity()
 
         return {
             "voice_load_ms": voice_load_ms,
@@ -1739,6 +1768,7 @@ class ServerState:
                     wrap_with_system_tags(PREVIEW_SAMPLE_TEXT)
                 )
                 self.lm_gen._non_pad_streak = 0
+                self.lm_gen._turn_pad_streak = 0
                 self.lm_gen._pad_force_remaining = 0
 
                 self.mimi.reset_streaming()
@@ -1769,6 +1799,7 @@ class ServerState:
                 self.lm_gen.set_streaming_state_inplace(dict(snapshot))
                 self.lm_gen._pad_force_remaining = 0
                 self.lm_gen._non_pad_streak = 0
+                self.lm_gen._turn_pad_streak = 0
                 self.lm_gen.voice_prompt = None
                 self.lm_gen.voice_prompt_audio = None
                 self.lm_gen.voice_prompt_cache = None
@@ -1917,6 +1948,70 @@ class ServerState:
             self._user_audio_attack_streak = 0
         return user_turn_started, user_turn_ended
 
+    def _reset_stop_latch_user_turn_activity(self) -> None:
+        self._stop_user_audio_active = False
+        self._stop_user_audio_attack_streak = 0
+        self._stop_user_audio_silence_streak = 0
+
+    def _arm_stop_response_latch_locked(self, reason: str) -> None:
+        """Arm Stop, carrying server-observed speech only for barge-in.
+
+        Assisted barge-in is emitted after user speech has already begun. If
+        those frames are discarded here, a short utterance can finish before
+        the independent Stop detector sees its two-frame attack. Manual Stop
+        has no such speech guarantee and must keep starting from a clean gate.
+        """
+        self._stop_response_latched = True
+        if reason != "barge_in":
+            self._reset_stop_latch_user_turn_activity()
+            return
+
+        observed_attack = self._user_audio_attack_streak
+        if self._user_audio_active:
+            observed_attack = max(observed_attack, USER_TURN_ATTACK_STREAK)
+        self._stop_user_audio_attack_streak = min(
+            observed_attack,
+            STOP_LATCH_USER_TURN_ATTACK_STREAK,
+        )
+        self._stop_user_audio_active = (
+            observed_attack >= STOP_LATCH_USER_TURN_ATTACK_STREAK
+        )
+        self._stop_user_audio_silence_streak = 0
+
+    def _update_stop_latch_user_turn_activity(self, chunk_rms: float) -> bool:
+        """Return true once a short post-Stop user turn has completed.
+
+        This detector is independent of ``_update_user_turn_activity`` so a
+        brief acknowledgement can release Stop without making the general
+        turn detector more susceptible to breaths, taps, or room noise.
+        """
+        if not self._stop_response_latched:
+            self._reset_stop_latch_user_turn_activity()
+            return False
+
+        if self._stop_user_audio_active:
+            if chunk_rms <= USER_TURN_RELEASE_RMS:
+                self._stop_user_audio_silence_streak += 1
+            else:
+                self._stop_user_audio_silence_streak = 0
+            if (
+                self._stop_user_audio_silence_streak
+                >= STOP_LATCH_USER_TURN_END_SILENCE_STREAK
+            ):
+                self._reset_stop_latch_user_turn_activity()
+                return True
+        elif chunk_rms >= USER_TURN_SPEECH_RMS:
+            self._stop_user_audio_attack_streak += 1
+            if (
+                self._stop_user_audio_attack_streak
+                >= STOP_LATCH_USER_TURN_ATTACK_STREAK
+            ):
+                self._stop_user_audio_active = True
+                self._stop_user_audio_silence_streak = 0
+        else:
+            self._stop_user_audio_attack_streak = 0
+        return False
+
     @torch.no_grad()
     @_track_inflight_frame
     def _process_audio_frame(self, chunk_np):
@@ -1942,6 +2037,9 @@ class ServerState:
             else 0.0
         )
         user_turn_started, user_turn_ended = self._update_user_turn_activity(
+            chunk_rms
+        )
+        stop_user_turn_ended = self._update_stop_latch_user_turn_activity(
             chunk_rms
         )
         if user_turn_started:
@@ -1984,6 +2082,11 @@ class ServerState:
         lm_elapsed = 0.0
         with self._tracked_inference_lock():
             _rtf_t0 = time.perf_counter()
+            if (
+                (user_turn_ended or stop_user_turn_ended)
+                and self._stop_response_latched
+            ):
+                self._release_stop_response_latch_locked()
             # Mimi and LM state must advance under the same lock so a snapshot
             # cannot capture the codec after frame N and the LM before it.
             codes = self.mimi.encode(chunk)
@@ -2021,6 +2124,7 @@ class ServerState:
                 and model_silent
                 and not inbound_speaking
                 and self._interrupt_gate_remaining <= 0
+                and not self._stop_response_latched
             ):
                 self._promote_vision_context()
             if self._vision_active and not inbound_speaking:
@@ -2048,6 +2152,7 @@ class ServerState:
                 and not self._vision_pending
                 and not inbound_speaking
                 and self._interrupt_gate_remaining <= 0
+                and not self._stop_response_latched
                 and self._reinforce_enabled
                 and self._reinforce_prompt_tokens
             ):
@@ -2104,13 +2209,21 @@ class ServerState:
                 # drip cadence stays at one per outer call regardless of
                 # how many Mimi codes a chunk emits.
                 forced_text = None
-                if inject_token is not None and c == 0:
+                if self._stop_response_latched:
+                    forced_text = torch.tensor(
+                        [[pad_id]], device=self.device, dtype=torch.long
+                    )
+                elif inject_token is not None and c == 0:
                     forced_text = torch.tensor(
                         [[inject_token]], device=self.device, dtype=torch.long
                     )
 
                 interrupt_gate = self._interrupt_gate_remaining > 0
-                force_assistant_silence = forced_text is not None or interrupt_gate
+                force_assistant_silence = (
+                    forced_text is not None
+                    or interrupt_gate
+                    or self._stop_response_latched
+                )
                 self._set_inflight_phase("lm_step")
                 tokens = self.lm_gen.step(
                     codes[:, :, c: c + 1],
@@ -2212,6 +2325,7 @@ class ServerState:
             pad_force = self.lm_gen._pad_force_remaining
             if pad_force > 0 and self._prev_pad_force_remaining == 0:
                 now = time.monotonic()
+                self._schedule_turn_cap_event(pad_force)
                 cutoff = now - COLLAPSE_WINDOW_SEC
                 while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
                     self._collapse_triggers.popleft()
@@ -2757,6 +2871,7 @@ class ServerState:
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
         self.lm_gen._non_pad_streak = 0
+        self.lm_gen._turn_pad_streak = 0
         self.lm_gen._pad_force_remaining = 0
         self._clear_vision_pending()
         self._clear_reinforce_pending()
@@ -2770,6 +2885,8 @@ class ServerState:
         self._collapse_triggers.clear()
         self._prev_pad_force_remaining = 0
         self._interrupt_gate_remaining = 0
+        self._stop_response_latched = False
+        self._reset_stop_latch_user_turn_activity()
         self._user_audio_active = False
         self._user_audio_attack_streak = 0
         self._user_audio_active_frames = 0
@@ -3415,6 +3532,7 @@ class ServerState:
             "vision_in_transcript": bool(self._vision_in_transcript),
             "vision_feed_model": bool(self._vision_feed_model),
             "vision_ground_user_turns": bool(self._vision_ground_user_turns),
+            "seed": self._active_seed,
             "text_temperature": float(self.lm_gen.temp_text),
             "audio_temperature": float(self.lm_gen.temp),
             "text_topk": int(self.lm_gen.top_k_text),
@@ -3541,11 +3659,53 @@ class ServerState:
     def _reset_turn_cap_tracking_for_config_change(self) -> None:
         """Start a new cap accounting window without cancelling an interrupt."""
         self.lm_gen._non_pad_streak = 0
+        self.lm_gen._turn_pad_streak = 0
         self._collapse_triggers.clear()
         # A live update may land during the shared forced-PAD window used by
         # manual interruption. Preserve that window and mark its current
         # state as already observed so it cannot manufacture a new cap edge.
         self._prev_pad_force_remaining = self.lm_gen._pad_force_remaining
+
+    def _schedule_turn_cap_event(self, pad_force: int) -> None:
+        """Surface a cap transition from the inference worker safely."""
+        sess = self._active_session
+        loop = self._main_loop
+        if sess is None or loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(
+                sess.send_event,
+                "turn_cap",
+                "Maximum turn length reached; yielding",
+                "warn",
+                {
+                    "max_turn_text_tokens": int(
+                        self.lm_gen.max_turn_text_tokens
+                    ),
+                    "forced_frames": int(pad_force),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "turn-cap event scheduling failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _release_stop_response_latch_locked(self) -> bool:
+        """Release a Stop latch after a complete new user turn."""
+        if not self._stop_response_latched:
+            return False
+        self._stop_response_latched = False
+        self._interrupt_gate_remaining = 0
+        self.lm_gen._pad_force_remaining = 0
+        self.lm_gen._non_pad_streak = 0
+        self.lm_gen._turn_pad_streak = 0
+        self._prev_pad_force_remaining = 0
+        self._vision_pad_streak = 0
+        self._audio_silence_streak = 0
+        self._reset_stop_latch_user_turn_activity()
+        return True
 
     def _apply_auto_recovery_tuning_locked(self) -> None:
         """Replace collapse-causing live tuning after an automatic rewind."""
@@ -4348,6 +4508,8 @@ class ServerState:
                 self._last_rewind_at = None
                 self._auto_rewind_pending = False
                 self._interrupt_gate_remaining = 0
+                self._stop_response_latched = False
+                self._reset_stop_latch_user_turn_activity()
                 # Start this session's labelled-snapshot store empty so pins from
                 # a prior session can never be jumped to in this one.
                 self._session_bookmarks[session_id] = []
@@ -4658,6 +4820,7 @@ class ServerState:
                                 INTERRUPT_YIELD_FRAMES,
                             )
                             self.lm_gen._non_pad_streak = 0
+                            self.lm_gen._turn_pad_streak = 0
                             # A user stop is a real turn boundary, unlike the
                             # automatic max-turn cap. Do not carry abandoned
                             # response words into the next reply's penalty.
@@ -4669,6 +4832,7 @@ class ServerState:
                                 self._interrupt_gate_remaining,
                                 INTERRUPT_YIELD_FRAMES,
                             )
+                            self._arm_stop_response_latch_locked(reason)
                             self._clear_vision_pending()
                             self._vision_inject_steps = 0
                             self._clear_reinforce_pending()
@@ -5282,12 +5446,14 @@ class ServerState:
                             else None
                         )
                         try:
+                            diagnostics = await session.diagnostics_snapshot()
                             session.send_stat(
                                 vram_used,
                                 gpu_util,
                                 rtf,
                                 idle_rms=idle_rms,
                                 silence_streak=self._audio_silence_streak,
+                                diagnostics=diagnostics,
                             )
                         except Exception as exc:
                             clog.log(

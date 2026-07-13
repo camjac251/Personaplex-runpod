@@ -187,6 +187,46 @@ def test_interrupt_force_window_works_with_turn_cap_disabled() -> None:
     assert forced is False and third.item() == 17
 
 
+def test_turn_cap_counts_across_short_natural_pauses() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.max_turn_text_tokens = 3
+    lm_gen._non_pad_streak = 0
+    lm_gen._turn_pad_streak = 0
+    lm_gen._pad_force_remaining = 0
+
+    def account(token: int, *, forced_text: bool = False) -> None:
+        lm_gen._update_turn_cap(
+            torch.tensor([token], dtype=torch.long),
+            3,
+            text_was_forced=forced_text,
+            turn_pad_forced=False,
+        )
+
+    account(11)
+    account(3)
+    account(12)
+    account(3)
+    assert lm_gen._pad_force_remaining == 0
+    account(13)
+    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen._non_pad_streak == 0
+
+    # A sustained natural PAD run is a true boundary, so prior words no
+    # longer count toward the next turn's cap.
+    lm_gen._pad_force_remaining = 0
+    account(21)
+    account(22)
+    for _ in range(REPETITION_TURN_BREAK_FRAMES):
+        account(3)
+    account(23)
+    assert lm_gen._pad_force_remaining == 0
+    assert lm_gen._non_pad_streak == 1
+
+    # External text injection/Stop padding never advances either counter.
+    account(24, forced_text=True)
+    assert lm_gen._non_pad_streak == 1
+
+
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
@@ -196,6 +236,7 @@ if __name__ == "__main__":
         test_forced_pads_do_not_break_the_turn,
         test_new_turn_clears_history_before_penalty,
         test_interrupt_force_window_works_with_turn_cap_disabled,
+        test_turn_cap_counts_across_short_natural_pauses,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

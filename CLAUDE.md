@@ -16,6 +16,8 @@ RunPod single-template deployment of PersonaPlex over WebRTC, defaulting to Kyut
 - `uv run python moshi/tests/test_vision_chunk.py` - vision chunk reassembly tests.
 - `uv run python moshi/tests/test_rtc_pipeline.py` - control ordering, teardown, and audio pipeline tests.
 - `uv run python moshi/tests/test_lm_controls.py` - sampling and anti-collapse tests.
+- `uv run python moshi/tests/test_duplex_scenarios.py` - CPU checks for duplex manifests, VAD, Stop/cap scoring, and artifact bundles.
+- `uv run python scripts/run_duplex_regression.py --base-url http://127.0.0.1:8998 --input-wav <mono-48k-pcm16.wav> moshi/tests/fixtures/duplex/turn_taking.json` - drive an actual running WebRTC/GPU session and write replayable artifacts.
 - `uv run python moshi/tests/test_cuda_dynamic_topk.py` - optional CUDA graph/top-k smoke test.
 
 ## Key files
@@ -25,6 +27,8 @@ RunPod single-template deployment of PersonaPlex over WebRTC, defaulting to Kyut
 - `moshi/moshi/models/lm.py` - `LMGen` (sampling, anti-collapse, voice prompt loading).
 - `moshi/moshi/modules/streaming.py` - state flatten/restore used by snapshot/rewind.
 - `frontend/src/App.jsx` - the React dashboard: realtime state machine, tuning console, transcript, vision panel. `frontend/src/data/dashboardData.jsx` holds slider defs and tooltips.
+- `frontend/src/utils/sessionTrace.js` - bounded privacy-safe browser bug reports. It must never export audio/images, network or session identifiers, device IDs, credentials, or raw prompts/transcripts by default.
+- `moshi/tests/duplex_harness.py` and `scripts/run_duplex_regression.py` - shared scenario validation/scoring and the real aiortc regression client.
 
 ## Architecture invariants
 
@@ -35,7 +39,9 @@ RunPod single-template deployment of PersonaPlex over WebRTC, defaulting to Kyut
 - Auto-rewind: `_pad_force_remaining` tripping `COLLAPSE_TRIGGER_THRESHOLD` times in `COLLAPSE_WINDOW_SEC` restores the latest snapshot via `set_streaming_state_inplace` and resets sampling/anti-collapse controls to the active model's safe defaults. Manual/bookmark rewind preserves tuning. Always pass `dict(state_dict)` so subsequent rewinds still find the keys. It only accepts snapshots younger than `AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC` (90 s), so it depends on periodic snapshots (60 s cadence, on by default; `--no-periodic-snapshots` disables and leaves only the session-start baseline). Snapshot capture defers while a context drip is active.
 - Audio top-k is a scalar CUDA tensor consumed by a fixed-cardinality masked sampler. Live tuning must never reset or recapture the depformer CUDA graph.
 - The default checkpoint is `kyutai/personaplex-rl-seamless` at its pinned revision; `PERSONAPLEX_MODEL=base` selects the pinned NVIDIA rollback. Repository and revision are one startup-time identity and voice markers include both.
-- Native-duplex defaults: `audio_temperature=0.8`, `padding_bonus=0.0`, `repetition_penalty=1.0`, `max_turn_text_tokens=120`. User configuration cannot lower max-turn below 40 because that cap is also the collapse signal. Native mode never turns client-detected overlap into an automatic interrupt; Assisted mode does. The repetition ring is turn-scoped and clears after `REPETITION_TURN_BREAK_FRAMES` natural PAD/EPAD frames.
+- Native-duplex defaults: `audio_temperature=0.8`, `padding_bonus=0.0`, `repetition_penalty=1.0`, `max_turn_text_tokens=120`. User configuration cannot lower max-turn below 40 because that cap is also the collapse signal. Max-turn counts text across brief PAD gaps and resets only after `REPETITION_TURN_BREAK_FRAMES` natural PAD/EPAD frames. Native mode never turns client-detected overlap into an automatic interrupt; Assisted mode does. The repetition ring uses the same natural turn boundary.
+- Stop is latched: `_stop_response_latched` forces assistant PAD and zero PCM until the next valid user turn completes. A fixed one-second gate alone is insufficient because the model can resume the abandoned answer. Rewind/new-session reset the latch; transport resume preserves it.
+- The slow `stat` envelope exposes cumulative inbound queue and outbound-buffer pressure. Keep those fields numeric and explicitly allowlisted; never put PCM, paths, SDP/candidates, or free-form secrets in telemetry.
 - Vision captions are safe/UI-only by default. After-speech and on-demand injection are retired because GPU traces proved they are neither reliable next-reply grounding nor a private context channel. Unsafe Ambient react remains explicit, injects at most once per 8 s, and may speak without a user prompt. Live Gemini captions use an 80-token budget and schema-valid JSON is accepted even if the provider marks an interaction incomplete.
 - `torch.cuda.empty_cache()` in `_run_rtc_session.finally`. Model weights and KV cache buffer stay resident across sessions.
 - Transport recovery is fresh-pc resume, not ICE restart (aiortc can't restart a live transport): unexpected transport death records a 25 s `_resume_grant`; a new offer with `resume_session_id` skips reset/warmup and continues from resident state. Server-initiated ends (`send_end`) and client `goodbye` must NOT record a grant.

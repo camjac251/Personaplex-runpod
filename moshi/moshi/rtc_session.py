@@ -151,6 +151,14 @@ class MimiOutputTrack(MediaStreamTrack):
         self._backlog_window: deque[int] = deque(
             maxlen=OUTBOUND_STANDING_BACKLOG_WINDOW
         )
+        # Cumulative transport-health counters. These stay session-local and
+        # are sampled by the slow diagnostics task; no per-frame control
+        # messages are emitted from the audio path.
+        self._buffer_high_water = 0
+        self._drop_events = 0
+        self._dropped_samples = 0
+        self._flush_events = 0
+        self._flushed_samples = 0
         # Persistent resampler so its internal anti-alias filter state
         # carries between chunks. Recreating per-call breaks continuity.
         self._resampler = AudioResampler(
@@ -180,13 +188,22 @@ class MimiOutputTrack(MediaStreamTrack):
         upsampled = np.concatenate(chunks)
         async with self._buffer_lock:
             self._buffer = np.concatenate([self._buffer, upsampled])
+            self._buffer_high_water = max(
+                self._buffer_high_water, self._buffer.size
+            )
             # Sanity cap: if recv() falls way behind, drop oldest.
             if self._buffer.size > OUTBOUND_BUFFER_CAP_SAMPLES:
+                dropped = self._buffer.size - OUTBOUND_BUFFER_CAP_SAMPLES
                 self._buffer = self._buffer[-OUTBOUND_BUFFER_CAP_SAMPLES:]
+                self._drop_events += 1
+                self._dropped_samples += dropped
 
     async def clear_buffer(self) -> None:
         """Drop queued assistant audio immediately."""
         async with self._buffer_lock:
+            if self._buffer.size:
+                self._flush_events += 1
+                self._flushed_samples += self._buffer.size
             self._buffer = np.empty(0, dtype=np.float32)
             # Pre-flush readings would keep the standing-backlog floor high
             # for another window; the flush already shed that latency.
@@ -248,6 +265,8 @@ class MimiOutputTrack(MediaStreamTrack):
                 drop = max(0, backlog - target)
                 if drop > 0:
                     self._buffer = self._buffer[drop:]
+                    self._drop_events += 1
+                    self._dropped_samples += drop
                     self._backlog_window.clear()
                     self._backlog_window.append(self._buffer.size)
         if delay > 0:
@@ -261,6 +280,26 @@ class MimiOutputTrack(MediaStreamTrack):
         frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
         self._timestamp += OUTBOUND_FRAME_SAMPLES
         return frame
+
+    async def diagnostics_snapshot(self) -> dict[str, int | float]:
+        """Return cumulative outbound-buffer health without exposing audio."""
+        async with self._buffer_lock:
+            return {
+                "outbound_buffer_ms": round(
+                    self._buffer.size / WEBRTC_SAMPLE_RATE * 1000.0, 1
+                ),
+                "outbound_high_water_ms": round(
+                    self._buffer_high_water / WEBRTC_SAMPLE_RATE * 1000.0, 1
+                ),
+                "outbound_drop_events": self._drop_events,
+                "outbound_dropped_ms": round(
+                    self._dropped_samples / WEBRTC_SAMPLE_RATE * 1000.0, 1
+                ),
+                "outbound_flush_events": self._flush_events,
+                "outbound_flushed_ms": round(
+                    self._flushed_samples / WEBRTC_SAMPLE_RATE * 1000.0, 1
+                ),
+            }
 
 
 # Numeric config bounds are shared by connect-time parsing and the server's
@@ -1273,6 +1312,7 @@ class RTCSession:
         rtf: Optional[float] = None,
         idle_rms: Optional[float] = None,
         silence_streak: Optional[int] = None,
+        diagnostics: Optional[dict[str, int | float]] = None,
     ) -> None:
         """Periodic accelerator-memory / utilization / inference-health readout.
 
@@ -1298,9 +1338,48 @@ class RTCSession:
             payload["idle_rms"] = round(float(idle_rms), 4)
         if silence_streak is not None:
             payload["silence_streak"] = int(silence_streak)
+        if diagnostics:
+            # The snapshot is generated locally from numeric counters. Keep
+            # this allowlist explicit so future internal diagnostics cannot
+            # accidentally put free-form paths or messages on the wire.
+            integer_fields = {
+                "pcm_queue_depth",
+                "pcm_queue_capacity",
+                "pcm_queue_high_water",
+                "pcm_drop_events",
+                "outbound_drop_events",
+                "outbound_flush_events",
+            }
+            float_fields = {
+                "pcm_dropped_ms",
+                "outbound_buffer_ms",
+                "outbound_high_water_ms",
+                "outbound_dropped_ms",
+                "outbound_flushed_ms",
+            }
+            for field in integer_fields:
+                value = diagnostics.get(field)
+                if isinstance(value, (int, float)):
+                    payload[field] = int(value)
+            for field in float_fields:
+                value = diagnostics.get(field)
+                if isinstance(value, (int, float)):
+                    payload[field] = round(float(value), 1)
         if len(payload) == 1:
             return
         self._control.send(json.dumps(payload))
+
+    async def diagnostics_snapshot(self) -> dict[str, int | float]:
+        """Return queue health for the low-frequency stat envelope."""
+        snapshot: dict[str, int | float] = {
+            "pcm_queue_depth": self._pcm_queue.qsize(),
+            "pcm_queue_capacity": self._pcm_queue.maxsize,
+            "pcm_queue_high_water": self._pcm_queue_high_water,
+            "pcm_drop_events": self._pcm_drop_events,
+            "pcm_dropped_ms": round(self._pcm_dropped_ms, 1),
+        }
+        snapshot.update(await self._output_track.diagnostics_snapshot())
+        return snapshot
 
     def send_error(self, reason: str) -> None:
         if self._control and self._control.readyState == "open":

@@ -33,6 +33,7 @@ import { useStoredState } from "./hooks/useStoredState.js";
 import { useToast } from "./hooks/useToast.js";
 import { rmsFromAnalyser } from "./utils/audio.js";
 import { cls, fmt, fmtGb } from "./utils/format.js";
+import { createSessionTrace, downloadSessionTrace } from "./utils/sessionTrace.js";
 
 function parseStoredArray(value) {
   try {
@@ -112,6 +113,46 @@ const EMPTY_CONTEXT_STATUS = {
   at: "",
 };
 
+const EMPTY_TRANSPORT_HEALTH = {
+  queueDepth: 0,
+  queueCapacity: 0,
+  queueHighWater: 0,
+  inputDropEvents: 0,
+  inputDroppedMs: 0,
+  outputBufferMs: 0,
+  outputHighWaterMs: 0,
+  outputDropEvents: 0,
+  outputDroppedMs: 0,
+  outputFlushEvents: 0,
+  outputFlushedMs: 0,
+};
+
+function combineTransportLegs(base, leg) {
+  return {
+    queueDepth: leg.queueDepth,
+    queueCapacity: leg.queueCapacity,
+    queueHighWater: Math.max(base.queueHighWater, leg.queueHighWater),
+    inputDropEvents: base.inputDropEvents + leg.inputDropEvents,
+    inputDroppedMs: base.inputDroppedMs + leg.inputDroppedMs,
+    outputBufferMs: leg.outputBufferMs,
+    outputHighWaterMs: Math.max(base.outputHighWaterMs, leg.outputHighWaterMs),
+    outputDropEvents: base.outputDropEvents + leg.outputDropEvents,
+    outputDroppedMs: base.outputDroppedMs + leg.outputDroppedMs,
+    outputFlushEvents: base.outputFlushEvents + leg.outputFlushEvents,
+    outputFlushedMs: base.outputFlushedMs + leg.outputFlushedMs,
+  };
+}
+
+function completedTransportLeg(base, leg) {
+  const combined = combineTransportLegs(base, leg);
+  return {
+    ...combined,
+    queueDepth: 0,
+    queueCapacity: 0,
+    outputBufferMs: 0,
+  };
+}
+
 const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
@@ -133,6 +174,12 @@ function defaultsForModel(variant, nativeDuplexRecommended = null) {
   if (variant === "rl-seamless" || nativeDuplexRecommended === true) return DEFAULTS;
   if (variant) return ASSISTED_MODEL_DEFAULTS;
   return DEFAULTS;
+}
+
+function recommendedTurnHandlingForModel(variant, nativeDuplexRecommended = null) {
+  return variant === "rl-seamless" || nativeDuplexRecommended === true
+    ? "native"
+    : "assisted";
 }
 // Prior shipped default sets. Stored tuning that exactly matches one of
 // these follows the defaults forward; hand-tuned values are left alone.
@@ -400,6 +447,11 @@ function App() {
   const [userTurns, setUserTurns] = useState([]);
   const [notices, setNotices] = useState([]);
   const [sessionTimeline, setSessionTimeline] = useState([]);
+  const [runtimeCounters, setRuntimeCounters] = useState({
+    recoveries: 0,
+    reconnects: 0,
+    interrupts: 0,
+  });
   const [assistantRate, setAssistantRate] = useState({ words: 0, seconds: 0, wpm: 0 });
   const [recordingUrl, setRecordingUrl] = useState(null);
   const [recordingMime, setRecordingMime] = useState("audio/webm");
@@ -520,6 +572,7 @@ function App() {
     serverInfo.nativeDuplexRecommended,
   );
   const [gpuStat, setGpuStat] = useState({ vramUsed: 0, gpuUtil: null });
+  const [transportHealth, setTransportHealth] = useState(EMPTY_TRANSPORT_HEALTH);
   // Server-measured real-time factor: compute time per audio frame divided
   // by that frame's audio duration. Below 1 means inference keeps up; at or
   // above 1 it is falling behind. 0 when not live (no measurement).
@@ -646,6 +699,28 @@ function App() {
   // that answers it (whose segment opens before the meter detects resumed
   // assistant audio).
   const userSpokeAtRef = useRef(0);
+  const sessionTraceRef = useRef(null);
+  const traceMaximaRef = useRef({ rtf: 0, gpuUtil: 0, vramUsed: 0 });
+  // React's diagnostic arrays are intentionally capped for rendering and
+  // transport health is cleared during terminal cleanup. Keep session-wide
+  // counters and the final server sample separately so an exported report
+  // remains a faithful postmortem after a long or already-ended session.
+  const traceTotalsRef = useRef({
+    assistantTurns: 0,
+    userTurns: 0,
+    visionCaptions: 0,
+    visionFrames: 0,
+    rewinds: 0,
+    errors: 0,
+  });
+  const transportBaseRef = useRef({ ...EMPTY_TRANSPORT_HEALTH });
+  const transportLegRef = useRef({ ...EMPTY_TRANSPORT_HEALTH });
+  const transportHealthRef = useRef({ ...EMPTY_TRANSPORT_HEALTH });
+  if (sessionTraceRef.current === null) sessionTraceRef.current = createSessionTrace();
+
+  const recordTrace = useCallback((kind, data = {}, options = {}) => {
+    sessionTraceRef.current?.record(kind, data, options);
+  }, []);
 
   stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer };
 
@@ -725,7 +800,9 @@ function App() {
       { id: `${Date.now()}-${items.length}`, ts, offsetMs, level, kind, label: text, ...extra },
       ...items,
     ].slice(0, 80));
-  }, []);
+    if (level === "err") traceTotalsRef.current.errors += 1;
+    recordTrace(kind, { message: text, offset_ms: offsetMs, ...extra }, { level });
+  }, [recordTrace]);
 
   const recordRttSample = useCallback((rtt) => {
     if (!(rtt > 0)) return;
@@ -1091,27 +1168,50 @@ function App() {
       setPresetId(preset.id);
       setTextPrompt(preset.prompt);
     }
-    setVoice(profile.voice || "NATF1");
+    setVoice(typeof profile.voice === "string" && profile.voice ? profile.voice : "NATF1");
     setVoiceGender("all");
     setVoiceBlend(false);
     clearUploadedVoice();
-    setAdherenceMode(profile.adherenceMode || "none");
-    setExpressionMode(profile.expressionMode || "none");
+    setAdherenceMode(
+      ADHERENCE_MODES.some((item) => item.id === profile.adherenceMode)
+        ? profile.adherenceMode
+        : "none",
+    );
+    setExpressionMode(
+      EXPRESSION_MODES.some((item) => item.id === profile.expressionMode)
+        ? profile.expressionMode
+        : "none",
+    );
     if (profile.turnHandling === "assisted" || profile.turnHandling === "native") {
       setTurnHandling(profile.turnHandling);
+    } else {
+      // Built-ins use `recommended`, and older partial profiles may have no
+      // turn mode at all. Unknown model identity takes the conservative path.
+      setTurnHandling(
+        recommendedTurnHandlingForModel(
+          serverInfo.modelVariant,
+          serverInfo.nativeDuplexRecommended,
+        ),
+      );
     }
-    setTextTemp(clampInferenceValue("textTemp", profile.textTemp, DEFAULTS.textTemp));
-    setTextTopk(clampInferenceValue("textTopk", profile.textTopk, DEFAULTS.textTopk));
-    setAudioTemp(clampInferenceValue("audioTemp", profile.audioTemp, DEFAULTS.audioTemp));
-    setAudioTopk(clampInferenceValue("audioTopk", profile.audioTopk, DEFAULTS.audioTopk));
-    setRepPenalty(clampInferenceValue("repPenalty", profile.repPenalty, DEFAULTS.repPenalty));
-    setRepContext(clampInferenceValue("repContext", profile.repContext, DEFAULTS.repContext));
-    setPadBonus(clampInferenceValue("padBonus", profile.padBonus, DEFAULTS.padBonus));
-    setMaxTurn(clampInferenceValue("maxTurn", profile.maxTurn, DEFAULTS.maxTurn));
+    // Missing fields in an old/imported profile follow the active checkpoint,
+    // rather than accidentally applying the RL checkpoint's defaults to Base.
+    setTextTemp(clampInferenceValue("textTemp", profile.textTemp, modelDefaults.textTemp));
+    setTextTopk(clampInferenceValue("textTopk", profile.textTopk, modelDefaults.textTopk));
+    setAudioTemp(clampInferenceValue("audioTemp", profile.audioTemp, modelDefaults.audioTemp));
+    setAudioTopk(clampInferenceValue("audioTopk", profile.audioTopk, modelDefaults.audioTopk));
+    setRepPenalty(clampInferenceValue("repPenalty", profile.repPenalty, modelDefaults.repPenalty));
+    setRepContext(clampInferenceValue("repContext", profile.repContext, modelDefaults.repContext));
+    setPadBonus(clampInferenceValue("padBonus", profile.padBonus, modelDefaults.padBonus));
+    setMaxTurn(clampInferenceValue("maxTurn", profile.maxTurn, modelDefaults.maxTurn));
     setEchoCancel(typeof profile.echoCancel === "boolean" ? profile.echoCancel : DEFAULTS.echoCancel);
     setNoiseSupp(typeof profile.noiseSupp === "boolean" ? profile.noiseSupp : DEFAULTS.noiseSupp);
     setAutoGain(typeof profile.autoGain === "boolean" ? profile.autoGain : DEFAULTS.autoGain);
-    setVisionInTranscript(!!profile.visionInTranscript);
+    setVisionInTranscript(
+      typeof profile.visionInTranscript === "boolean"
+        ? profile.visionInTranscript
+        : false,
+    );
     setVisionReactionMode(
       visionReactionModeFromFlags(
         !!profile.visionFeedModel,
@@ -1119,12 +1219,27 @@ function App() {
         profile.visionReactionMode,
       ),
     );
-    setReinforceInSilences(!!profile.reinforceInSilences);
-    setVisionPrompt(profile.visionPrompt || DEFAULT_VISION_PROMPT);
+    setReinforceInSilences(
+      typeof profile.reinforceInSilences === "boolean"
+        ? profile.reinforceInSilences
+        : false,
+    );
+    setVisionPrompt(
+      typeof profile.visionPrompt === "string"
+        ? profile.visionPrompt
+        : DEFAULT_VISION_PROMPT,
+    );
     setVisionIntervalMs(Number.isFinite(Number(profile.visionIntervalMs)) ? Number(profile.visionIntervalMs) : DEFAULTS.visionIntervalMs);
     setVisionCostLimitUsd(Number.isFinite(Number(profile.visionCostLimitUsd)) ? Number(profile.visionCostLimitUsd) : 0);
-    setSeedRandom(!!profile.seedRandom);
-    if (Number.isFinite(Number(profile.seed))) setSeed(Number(profile.seed));
+    const nextSeedRandom = typeof profile.seedRandom === "boolean"
+      ? profile.seedRandom
+      : true;
+    setSeedRandom(nextSeedRandom);
+    if (Number.isFinite(Number(profile.seed))) {
+      setSeed(Number(profile.seed));
+    } else if (!nextSeedRandom) {
+      setSeed(DEFAULTS.seed);
+    }
     addNotice("ok", `Profile loaded: ${profile.label}`);
   }, [
     addNotice,
@@ -1139,6 +1254,7 @@ function App() {
     setNoiseSupp,
     setPadBonus,
     setProfileName,
+    modelDefaults,
     setRepContext,
     setRepPenalty,
     setSeed,
@@ -1155,6 +1271,8 @@ function App() {
     setVisionCostLimitUsd,
     setVoice,
     setVoiceBlend,
+    serverInfo.modelVariant,
+    serverInfo.nativeDuplexRecommended,
   ]);
 
   const applySessionProfile = (id) => {
@@ -1894,6 +2012,9 @@ function App() {
       setLevels({ mic: 0, ai: 0 });
       setSpeaking(null);
       setGpuStat({ vramUsed: 0, gpuUtil: null });
+      setTransportHealth((health) => showDownload
+        ? { ...health, queueDepth: 0, outputBufferMs: 0 }
+        : EMPTY_TRANSPORT_HEALTH);
       setRtf(0);
       setInjectStat({ idleRms: null, streak: null });
       // The server's finalize event usually can't reach a closing data
@@ -1915,6 +2036,15 @@ function App() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: captureFrame is declared after this hook (temporal dead zone); it is referentially stable, so omitting it is safe
   const handleControlMessage = useCallback(
     (message) => {
+      if (!["text", "user_text", "pong"].includes(message.type)) {
+        const traceKind = message.type === "event" && message.kind
+          ? `server.event.${message.kind}`
+          : `server.${message.type || "event"}`;
+        recordTrace(traceKind, message, {
+          source: "server",
+          level: message.type === "error" ? "error" : message.level || "info",
+        });
+      }
       if (message.type === "ready") {
         // Ready is the reconnect confirmation: it can only arrive once the
         // new transport carries the control channel, so success is claimed
@@ -1926,7 +2056,22 @@ function App() {
         setStageMessage(resumed ? "Live" : "Connected");
         setConnectionIssue(null);
         setServerInfo((info) => mergeServerInfo(info, message));
+        sessionTraceRef.current?.setRuntime({
+          server_build: message.server_build,
+          model_repo: message.model_repo,
+          model_revision: message.model_revision,
+          model_variant: message.model_variant,
+          model_license: message.model_license,
+          gpu_name: message.gpu_name,
+          vram_total: message.vram_total,
+          vision_model: message.vision_model,
+          native_duplex_recommended: message.native_duplex_recommended,
+        });
         if (resumed) {
+          setRuntimeCounters((counters) => ({
+            ...counters,
+            reconnects: counters.reconnects + 1,
+          }));
           addNotice("ok", "Reconnected, session and model state preserved");
           toast("Reconnected");
         } else if (wasResuming) {
@@ -2004,6 +2149,8 @@ function App() {
             { id: `${Date.now()}-ai`, ts, offsetMs, level: "ok", kind: "assistant", label: "Assistant turn started" },
             ...items,
           ].slice(0, 80));
+          recordTrace("turn.assistant_start", { status: "active" }, { source: "server" });
+          traceTotalsRef.current.assistantTurns += 1;
           const aiTurnId = `${Date.now()}-ai-${Math.random().toString(36).slice(2, 7)}`;
           aiTurnOpenRef.current = aiTurnId;
           setAiTurns((turns) => [...turns, { id: aiTurnId, at: now, text: "" }].slice(-60));
@@ -2034,6 +2181,11 @@ function App() {
           const ts = new Date().toTimeString().slice(0, 8);
           const offsetMs = sessionStartedAtRef.current ? Math.max(0, endedAt - sessionStartedAtRef.current) : 0;
           const durationMs = Math.max(0, endedAt - turn.startedAt);
+          recordTrace(
+            "turn.assistant_end",
+            { duration_ms: durationMs, words: turn.words || 0, status: "closed" },
+            { source: "server" },
+          );
           setSessionTimeline((items) => [
             {
               id: `${Date.now()}-ai-end`,
@@ -2078,6 +2230,7 @@ function App() {
         const freshAt = userSpokeAtRef.current || performance.now();
         if (freshId !== null) userTurnOpenRef.current = userFinal ? null : freshId;
         else if (userFinal) userTurnOpenRef.current = null;
+        if (openId == null) traceTotalsRef.current.userTurns += 1;
         if (userFinal) {
           // The recognizer closed this utterance; drop the local latch so
           // the speaking-transition effect does not append a duplicate
@@ -2127,6 +2280,7 @@ function App() {
         const feed = normalizeVisionFeed(message.feed);
         if (frameId) pendingVisionFramesRef.current.delete(frameId);
         const entryId = frameId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        traceTotalsRef.current.visionCaptions += 1;
         if (!historicalDetail) {
           setCurrentCaption(text);
           setCurrentVisionFeed(feed);
@@ -2184,6 +2338,32 @@ function App() {
             streak: Number.isFinite(message.silence_streak) ? message.silence_streak : prev.streak,
           }));
         }
+        const health = transportLegRef.current;
+        const nextLeg = {
+          queueDepth: Number.isFinite(message.pcm_queue_depth) ? message.pcm_queue_depth : health.queueDepth,
+          queueCapacity: Number.isFinite(message.pcm_queue_capacity) ? message.pcm_queue_capacity : health.queueCapacity,
+          queueHighWater: Number.isFinite(message.pcm_queue_high_water) ? message.pcm_queue_high_water : health.queueHighWater,
+          inputDropEvents: Number.isFinite(message.pcm_drop_events) ? message.pcm_drop_events : health.inputDropEvents,
+          inputDroppedMs: Number.isFinite(message.pcm_dropped_ms) ? message.pcm_dropped_ms : health.inputDroppedMs,
+          outputBufferMs: Number.isFinite(message.outbound_buffer_ms) ? message.outbound_buffer_ms : health.outputBufferMs,
+          outputHighWaterMs: Number.isFinite(message.outbound_high_water_ms) ? message.outbound_high_water_ms : health.outputHighWaterMs,
+          outputDropEvents: Number.isFinite(message.outbound_drop_events) ? message.outbound_drop_events : health.outputDropEvents,
+          outputDroppedMs: Number.isFinite(message.outbound_dropped_ms) ? message.outbound_dropped_ms : health.outputDroppedMs,
+          outputFlushEvents: Number.isFinite(message.outbound_flush_events) ? message.outbound_flush_events : health.outputFlushEvents,
+          outputFlushedMs: Number.isFinite(message.outbound_flushed_ms) ? message.outbound_flushed_ms : health.outputFlushedMs,
+        };
+        transportLegRef.current = nextLeg;
+        const nextHealth = combineTransportLegs(
+          transportBaseRef.current,
+          nextLeg,
+        );
+        transportHealthRef.current = nextHealth;
+        setTransportHealth(nextHealth);
+        traceMaximaRef.current = {
+          rtf: Math.max(traceMaximaRef.current.rtf, Number(message.rtf) || 0),
+          gpuUtil: Math.max(traceMaximaRef.current.gpuUtil, Number(message.gpu_util) || 0),
+          vramUsed: Math.max(traceMaximaRef.current.vramUsed, Number(message.vram_used) || 0),
+        };
       } else if (message.type === "pong") {
         const sentAt = typeof message.t === "number" ? message.t : null;
         if (sentAt !== null) {
@@ -2220,9 +2400,14 @@ function App() {
           at: new Date().toTimeString().slice(0, 8),
         });
       } else if (message.type === "interrupted") {
+        setRuntimeCounters((counters) => ({
+          ...counters,
+          interrupts: counters.interrupts + 1,
+        }));
         pulseInterrupt();
       } else if (message.type === "config_applied") {
         const config = message.config && typeof message.config === "object" ? message.config : {};
+        sessionTraceRef.current?.setAppliedConfig(config);
         // Live updates echo the FULL config snapshot with the touched keys
         // listed in `applied`. Reconciling untouched fields would clobber
         // local slider state mid-drag (the commit-only Audio Top-k slider in
@@ -2252,6 +2437,15 @@ function App() {
         });
       } else if (message.type === "event") {
         const text = message.text || message.kind || "Server event";
+        if (message.kind === "auto_rewind") {
+          setRuntimeCounters((counters) => ({
+            ...counters,
+            recoveries: counters.recoveries + 1,
+          }));
+        }
+        if (message.kind === "rewind" && message.level === "ok") {
+          traceTotalsRef.current.rewinds += 1;
+        }
         if (message.kind === "recording") {
           const data = message.data || {};
           setServerRecording({
@@ -2279,16 +2473,18 @@ function App() {
         toast(text);
       } else if (message.type === "error") {
         addNotice("err", message.reason || "Server error");
+        sessionTraceRef.current?.finish(message.reason || "server_error");
         toast(message.reason || "Server error");
         cleanup({ keepPhase: true });
         setPhase("idle");
       } else if (message.type === "end") {
         addNotice("info", "Server ended session");
+        sessionTraceRef.current?.finish(message.reason || "server_end");
         cleanup({ showDownload: true });
         setStageMessage("Session complete");
       }
     },
-    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, recordRttSample, startRecording, stopVision, toast],
+    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, recordRttSample, recordTrace, startRecording, stopVision, toast],
   );
 
   const startCandidateStream = useCallback(
@@ -2360,6 +2556,7 @@ function App() {
         pc.onconnectionstatechange = () => {
           if (pcRef.current !== pc) return;
           const state = pc.connectionState;
+          recordTrace("transport.connection", { status: state });
           const live = stateRef.current.phase === "live";
           if (state === "connected") {
             if (reconnectGraceTimerRef.current) {
@@ -2396,6 +2593,7 @@ function App() {
         pc.oniceconnectionstatechange = () => {
           if (pcRef.current !== pc) return;
           const state = pc.iceConnectionState;
+          recordTrace("transport.ice", { status: state });
           const live = stateRef.current.phase === "live";
           if (!live) {
             if (state === "checking") setStageMessage("Connecting peers");
@@ -2418,6 +2616,8 @@ function App() {
         controlRef.current = control;
         control.onopen = () => {
           const payload = buildConfigPayload();
+          sessionTraceRef.current?.setRequestedConfig(payload);
+          recordTrace("config.sent", { config: payload });
           control.send(JSON.stringify({ type: "config", ...payload }));
           if (resumingRef.current && offerResumedRef.current) {
             // The server resumes under the original session's applied
@@ -2452,6 +2652,7 @@ function App() {
           // connection takes; its catch runs the terminal teardown.
           if (controlRef.current !== control) return;
           if (stateRef.current.phase !== "live") return;
+          recordTrace("transport.control_closed", { status: "closed" }, { level: "error" });
           addNotice("err", "Control channel closed");
           reconnectRef.current?.();
         };
@@ -2516,7 +2717,7 @@ function App() {
         throw error;
       }
     },
-    [addNotice, attachAudioGraph, buildConfigPayload, cleanup, handleControlMessage, postCandidate, startCandidateStream],
+    [addNotice, attachAudioGraph, buildConfigPayload, cleanup, handleControlMessage, postCandidate, recordTrace, startCandidateStream],
   );
 
   // Fresh-pc reconnect. aiortc cannot ICE-restart a live transport (the
@@ -2535,6 +2736,19 @@ function App() {
     }
     setReconnecting(true);
     resumingRef.current = true;
+    // The next peer connection has fresh transport counters even when the
+    // resident model session resumes. Roll this leg into session totals now,
+    // before any stat from the replacement connection can arrive.
+    transportBaseRef.current = completedTransportLeg(
+      transportBaseRef.current,
+      transportLegRef.current,
+    );
+    transportLegRef.current = { ...EMPTY_TRANSPORT_HEALTH };
+    transportHealthRef.current = combineTransportLegs(
+      transportBaseRef.current,
+      transportLegRef.current,
+    );
+    setTransportHealth(transportHealthRef.current);
     addNotice("warn", "Transport lost, rebuilding the connection");
     try {
       // Transport-only teardown: transcript, bookmarks, elapsed clock, and
@@ -2576,6 +2790,7 @@ function App() {
       addNotice("err", error.message || "Reconnect failed");
       addNotice("warn", "Connection lost, session ended; recording kept");
       toast("Connection lost");
+      sessionTraceRef.current?.finish("reconnect_failed");
       cleanup({ showDownload: true });
       setStageMessage("Connection lost");
     } finally {
@@ -2588,6 +2803,29 @@ function App() {
   const startConversation = useCallback(async () => {
     if (phase === "connecting" || phase === "warmup" || phase === "live") return;
     cleanup({ keepPhase: true });
+    sessionTraceRef.current = createSessionTrace();
+    traceMaximaRef.current = { rtf: 0, gpuUtil: 0, vramUsed: 0 };
+    traceTotalsRef.current = {
+      assistantTurns: 0,
+      userTurns: 0,
+      visionCaptions: 0,
+      visionFrames: 0,
+      rewinds: 0,
+      errors: 0,
+    };
+    transportBaseRef.current = { ...EMPTY_TRANSPORT_HEALTH };
+    transportLegRef.current = { ...EMPTY_TRANSPORT_HEALTH };
+    transportHealthRef.current = { ...EMPTY_TRANSPORT_HEALTH };
+    sessionTraceRef.current.setSession({
+      turn_handling: turnHandling,
+      jitter_buffer: jitterBuffer,
+      audio_constraints: {
+        echo_cancellation: !!echoCancel,
+        noise_suppression: !!noiseSupp,
+        auto_gain_control: !!autoGain,
+      },
+    });
+    recordTrace("session.start", { status: "connecting" });
     setConnectionIssue(null);
     setSideExpanded(false);
     setPhase("connecting");
@@ -2602,6 +2840,7 @@ function App() {
     userSpokeAtRef.current = 0;
     setNotices([]);
     setSessionTimeline([]);
+    setRuntimeCounters({ recoveries: 0, reconnects: 0, interrupts: 0 });
     setServerRecording(null);
     setAssistantRate({ words: 0, seconds: 0, wpm: 0 });
     assistantTurnRef.current = { startedAt: 0, startLength: 0, lastChunkAt: 0, lastLength: 0, words: 0 };
@@ -2639,6 +2878,7 @@ function App() {
       } else {
         addNotice("err", error.message || "Failed to start conversation");
       }
+      sessionTraceRef.current?.finish(error.code || error.name || "connect_failed");
       toast(error.message || "Failed to start conversation");
       cleanup({ keepPhase: true });
       setPhase("idle");
@@ -2652,7 +2892,13 @@ function App() {
     openPeerSession,
     phase,
     refreshAudioOutputs,
+    autoGain,
+    echoCancel,
+    jitterBuffer,
+    noiseSupp,
+    recordTrace,
     toast,
+    turnHandling,
   ]);
 
   const clearConnectHold = useCallback(() => {
@@ -2695,12 +2941,14 @@ function App() {
       }
     }
     addNotice("info", "Session ended, recording available");
+    recordTrace("session.goodbye", { end_reason: "user_goodbye" });
+    sessionTraceRef.current?.finish("user_goodbye");
     setPhase("ended");
     setStageMessage("Session complete");
     // Give the goodbye a moment on the wire before the pc closes; an
     // aborted SCTP queue would turn this back into a transport drop.
     window.setTimeout(() => cleanup({ showDownload: true }), 150);
-  }, [addNotice, cleanup]);
+  }, [addNotice, cleanup, recordTrace]);
 
   const newConversation = () => {
     cleanup();
@@ -2804,12 +3052,21 @@ function App() {
       return null;
     }
     setVisionFramesSent((count) => count + 1);
+    traceTotalsRef.current.visionFrames += 1;
+    recordTrace("vision.frame_sent", {
+      bytes: nextMeta.bytes,
+      width: nextMeta.width,
+      detail: nextMeta.detail,
+      source: nextMeta.source,
+      source_generation: sourceGeneration,
+      chunk_count: Math.ceil(base64.length / VISION_FRAME_CHUNK_CHARS),
+    });
     const now = performance.now();
     visionLastSentAtRef.current = now;
     setVisionLastSentAt(now);
     setVisionClockMs(now);
     return frameId;
-  }, [addNotice, toast]);
+  }, [addNotice, recordTrace, toast]);
 
   const captureFrame = useCallback(
     async (detail = false, force = false, reason = "") => {
@@ -3114,10 +3371,11 @@ function App() {
       const fields = liveConfigPendingRef.current;
       liveConfigPendingRef.current = {};
       if (controlRef.current?.readyState === "open" && Object.keys(fields).length) {
+        recordTrace("config.update_sent", { config: fields });
         controlRef.current.send(JSON.stringify({ type: "update_config", ...fields }));
       }
     }, 150);
-  }, [isLive]);
+  }, [isLive, recordTrace]);
 
   const selectTuningRangeMode = useCallback((mode) => {
     if (mode === "expert") {
@@ -3506,9 +3764,16 @@ function App() {
       userSpokeAtRef.current = 0;
       const id = `${Date.now()}-you-${Math.random().toString(36).slice(2, 7)}`;
       userTurnOpenRef.current = id;
+      recordTrace("turn.user_end", { status: "closed" });
+      traceTotalsRef.current.userTurns += 1;
       setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "", at }].slice(-40));
     }
-  }, [speaking, phase]);
+  }, [speaking, phase, recordTrace]);
+
+  useEffect(() => {
+    if (phase !== "live") return;
+    recordTrace("speech.state", { status: speaking || "silence" });
+  }, [phase, recordTrace, speaking]);
 
   useEffect(() => {
     if (phase !== "live") {
@@ -3579,6 +3844,15 @@ function App() {
           lossPct: Math.round(lossPct * 10) / 10,
           candidate,
         });
+        const [candidateType = "unknown", transport = "unknown"] = candidate.split(" · ");
+        recordTrace("network.sample", {
+          network_quality: quality,
+          jitter_ms: Math.round(jitterMs),
+          loss_pct: Math.round(lossPct * 10) / 10,
+          rtt_ms: rtt,
+          candidate_type: candidateType.toLowerCase(),
+          transport: transport.toLowerCase(),
+        });
         // App-level pongs drive the RTT readout when fresh; the transport
         // round-trip only fills the gap while measured RTT is stale.
         if (performance.now() - lastPongAtRef.current >= HEARTBEAT_STALE_AFTER_MS) {
@@ -3589,7 +3863,7 @@ function App() {
       }
     }, 1000);
     return () => clearInterval(id);
-  }, [phase, recordRttSample]);
+  }, [phase, recordRttSample, recordTrace]);
 
   useEffect(() => {
     const pc = pcRef.current;
@@ -3707,6 +3981,64 @@ function App() {
     return parts.length ? parts.join(" · ") : "live";
   })();
 
+  const exportSessionReport = async () => {
+    const trace = sessionTraceRef.current;
+    if (!trace) return;
+    trace.setRuntime({
+      server_build: serverInfo.serverBuild,
+      model_repo: serverInfo.modelRepo,
+      model_revision: serverInfo.modelRevision,
+      model_variant: serverInfo.modelVariant,
+      model_license: serverInfo.modelLicense,
+      gpu_name: serverInfo.gpuName,
+      vram_total: serverInfo.vramTotal,
+      vision_model: serverInfo.visionModel,
+      native_duplex_recommended: serverInfo.nativeDuplexRecommended,
+    });
+    trace.setSession({
+      turn_handling: turnHandling,
+      jitter_buffer: jitterBuffer,
+      resume_legs: runtimeCounters.reconnects,
+      audio_constraints: {
+        echo_cancellation: !!echoCancel,
+        noise_suppression: !!noiseSupp,
+        auto_gain_control: !!autoGain,
+      },
+    });
+    const totals = traceTotalsRef.current;
+    const finalTransport = transportHealthRef.current;
+    trace.setSummary({
+      assistant_turns: totals.assistantTurns,
+      user_turns: totals.userTurns,
+      vision_captions: totals.visionCaptions,
+      vision_frames: totals.visionFrames,
+      bookmarks: bookmarks.length,
+      auto_recoveries: runtimeCounters.recoveries,
+      reconnects: runtimeCounters.reconnects,
+      interrupts: runtimeCounters.interrupts,
+      rewinds: totals.rewinds,
+      errors: totals.errors,
+      max_rtf: traceMaximaRef.current.rtf,
+      max_gpu_util: traceMaximaRef.current.gpuUtil,
+      max_vram_used: traceMaximaRef.current.vramUsed,
+      pcm_drop_events: finalTransport.inputDropEvents,
+      pcm_dropped_ms: finalTransport.inputDroppedMs,
+      outbound_high_water_ms: finalTransport.outputHighWaterMs,
+      outbound_drop_events: finalTransport.outputDropEvents,
+      outbound_dropped_ms: finalTransport.outputDroppedMs,
+      outbound_flush_events: finalTransport.outputFlushEvents,
+      outbound_flushed_ms: finalTransport.outputFlushedMs,
+    });
+    try {
+      await downloadSessionTrace(trace, {
+        filename: `personaplex-${serverInfo.modelVariant || "session"}-bug-report.json`,
+      });
+      addNotice("ok", "Privacy-safe bug report exported");
+    } catch (error) {
+      addNotice("err", `Bug report export failed: ${error.message || error}`);
+    }
+  };
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -3806,6 +4138,7 @@ function App() {
                   label="Session profile"
                   caption="Session profile"
                   info="profile"
+                  disabled={!serverInfo.modelVariant}
                   value={sessionProfileId}
                   options={[
                     ...allSessionProfiles.map((profile) => ({
@@ -4985,6 +5318,8 @@ function App() {
             <Row label="Status" value={phase} dot={isLive ? "ok" : phase === "connecting" || phase === "warmup" ? "warn" : ""} />
             <Row label="Uptime" value={elapsedStr} />
             <Row label="Voice" value={voiceDisplay} />
+            <Row label="Auto-recoveries" value={runtimeCounters.recoveries} dot={runtimeCounters.recoveries > 0 ? "warn" : ""} />
+            <Row label="Reconnects · interrupts" value={`${runtimeCounters.reconnects} · ${runtimeCounters.interrupts}`} />
             <Row label="Vision" value={visionOn ? (visionPaused ? "paused" : `live · ${visionAge ?? "idle"} s`) : visionEnabledFromServer ? "available" : "disabled"} />
             {serverRecording && (
               <Row
@@ -4997,6 +5332,27 @@ function App() {
               label="Real-time factor"
               value={isLive ? `${rtf.toFixed(2)}×` : "—"}
               dot={isLive ? (rtf < 1 ? "ok" : "warn") : ""}
+            />
+            <Row
+              label="Input queue"
+              value={isLive && transportHealth.queueCapacity
+                ? `${transportHealth.queueDepth}/${transportHealth.queueCapacity} · peak ${transportHealth.queueHighWater}`
+                : "—"}
+              dot={transportHealth.inputDropEvents > 0 ? "warn" : ""}
+            />
+            <Row
+              label="Output buffer"
+              value={isLive || phase === "ended"
+                ? `${transportHealth.outputBufferMs.toFixed(0)} ms · peak ${transportHealth.outputHighWaterMs.toFixed(0)} ms`
+                : "—"}
+              dot={transportHealth.outputBufferMs > 200 || transportHealth.outputHighWaterMs > 200 ? "warn" : ""}
+            />
+            <Row
+              label="Audio discarded"
+              value={isLive || phase === "ended"
+                ? `in ${transportHealth.inputDroppedMs.toFixed(0)} ms · out ${(transportHealth.outputDroppedMs + transportHealth.outputFlushedMs).toFixed(0)} ms`
+                : "—"}
+              dot={transportHealth.inputDropEvents > 0 || transportHealth.outputDroppedMs > 200 ? "warn" : ""}
             />
             <div className="rttgraph">
               <div className="axis">RTT · 60 s</div>
@@ -5121,6 +5477,18 @@ function App() {
             <Row label="Client" value="React · Bun" />
             <Row label="Vision" value={serverInfo.visionModel || "·"} />
             <Row label="License" value={serverInfo.modelLicense || "·"} />
+            <button
+              className="btn ghost block"
+              type="button"
+              disabled={!sessionStartedAtRef.current}
+              onClick={exportSessionReport}
+              title="Exports bounded diagnostics and prompt hashes without transcript, audio, images, network addresses, device IDs, or credentials"
+            >
+              {Icon.dl} Export bug report
+            </button>
+            <div className="cons-note">
+              Privacy-safe JSON: no conversation content, audio, images, addresses, device IDs, or credentials.
+            </div>
           </div>
         </aside>
       </div>

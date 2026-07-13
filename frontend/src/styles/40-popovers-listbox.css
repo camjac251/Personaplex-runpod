@@ -119,7 +119,8 @@
     transition: border-color 0.12s, box-shadow 0.12s;
     line-height: 1.2;
   }
-  .lb-trigger:hover { border-color: var(--line-2); }
+  .lb-trigger:hover:not(:disabled) { border-color: var(--line-2); }
+  .lb-trigger:disabled { opacity: 0.55; cursor: wait; }
   .lb-trigger.open {
     border-color: var(--line-3);
     box-shadow: 0 0 0 2px rgba(132, 168, 90, 0.12);

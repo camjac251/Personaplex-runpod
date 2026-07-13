@@ -152,6 +152,54 @@ When the server log prints `serving static content from`, open the proxy URL fro
 
 To confirm TURN is doing its job: open `chrome://webrtc-internals` in another tab while a session is live. The active candidate pair under `selectedCandidatePairId` should have `relayProtocol: tcp` or `udp` and a remote address pointing at `turn.cloudflare.com`. If it shows `host` or `srflx` and you see no audio, TURN didn't engage.
 
+## Profiles and diagnostics
+
+The dashboard includes checkpoint-aware **Balanced**, **Concise**, and
+**Expressive** profiles. Expressive uses the tested VARF4 voice and selects
+Native duplex only for the aligned checkpoint; Base and unknown checkpoints
+use Assisted overlap handling. Raw sampling controls remain available under
+Advanced.
+
+The diagnostics rail reports model/build identity, RTF, WebRTC jitter/loss,
+input queue pressure, discarded buffered audio, reconnects, confirmed
+interrupts, and auto-recoveries. **Export bug report** downloads a bounded JSON
+trace with the applied seed, numeric configuration, prompt hashes, timing, and
+structured events. It deliberately excludes transcript text, prompt text,
+audio, images, SDP/ICE addresses, session/device IDs, URLs, and credentials.
+
+For reproducible GPU checks, start the server and run a checked-in scenario
+with a mono PCM16 48 kHz speech fixture whose timing matches the manifest:
+
+```bash
+uv run python scripts/run_duplex_regression.py \
+  --base-url http://127.0.0.1:8998 \
+  --input-wav /tmp/turn-taking.wav \
+  moshi/tests/fixtures/duplex/turn_taking.json
+```
+
+The runner uses the production WebRTC/DataChannel protocol and captures the
+actual remote audio. It scores pause takeover, turn latency, Stop
+acknowledgement and audible yield, cap events, clipping, repetition, text
+bursts, and RTF. Artifacts include both audio stems, raw control events,
+configuration, model revision, tool hashes, and metrics. Treat these developer
+artifacts as sensitive: unlike the dashboard's privacy-safe report, they can
+contain conversation audio and text, prompts and full config, the server URL
+and session ID, absolute local paths, and raw server/control metadata. Keep
+them on trusted storage and inspect/redact them before sharing.
+
+Runtime metrics also retain input-queue depth/high-water/drop counters and
+output-buffer high-water/drop/flush counters from the server's periodic stat
+envelope. Any dropped inbound microphone audio is a hard run failure. Outbound
+backlog shedding is the intentional latency guard seen in normal GPU runs, so
+up to 200 ms is recorded without failing; more than 200 ms is a suppressible
+quality-threshold failure. Explicit output flushes are informational and never
+fail a run.
+
+`--no-fail-on-thresholds` is only for collecting results that exceed numeric
+quality limits. Missing required turns/events, config mismatches, absent RTF
+telemetry, failed actions, server errors, early disconnects, and signaling
+failures still produce a non-zero exit status.
+
 ## Voices
 
 Pre-packaged voice embeddings:
@@ -210,9 +258,8 @@ Vision path (when `GEMINI_API_KEY` is set and the user enables it):
 
 1. Browser motion-gates each captured frame and sends a base64 JPEG over the `control` DataChannel.
 2. Server forwards the frame to Gemini 3.5 Flash via the Interactions API. Conversation state chains turn-to-turn through `previous_interaction_id`, so the model has long-term memory of prior frames.
-3. The one-sentence description is tokenised and queued in `ServerState._vision_pending`.
-4. `_process_audio_frame` drains one queued token per Mimi frame, but only when the model has been in a PAD streak for at least two frames. Outbound PCM is zeroed for the duration so the model never tries to speak the injection.
-5. The caption is mirrored to the browser as a subtitle and added to the rolling history log.
+3. The one-sentence description is mirrored to the browser as a subtitle and added to the rolling history log. In the default Captions-only mode it never enters PersonaPlex.
+4. Unsafe Ambient react may tokenise and queue the caption in `ServerState._vision_pending`. `_process_audio_frame` drains one token per Mimi frame only at a confirmed silent boundary, with outbound PCM gated for the duration.
 
 ## Known issues
 
@@ -237,15 +284,20 @@ uv run moshi-server --host 127.0.0.1 --port 8998 --voice-prompt-dir voices
 
 Voice prompts need to be downloaded manually (see `start.sh` for the HuggingFace pull recipe) or symlinked from a previous RunPod volume.
 
-Run the resampler smoke tests:
+Run the focused CPU regression checks:
 
 ```bash
 uv run python moshi/tests/test_rtc_resampler.py
+uv run python moshi/tests/test_duplex_scenarios.py
+bun test frontend/src/utils/sessionTrace.test.js
 ```
 
 ## License
 
-Code: MIT. Model weights: NVIDIA Open Model License.
+Code: MIT. The default `kyutai/personaplex-rl-seamless` checkpoint combines
+CC BY-NC 4.0 and the NVIDIA Open Model License and is non-commercial. The
+rollback `nvidia/personaplex-7b-v1` checkpoint uses the NVIDIA Open Model
+License. Always follow the license shown for the active model revision.
 
 ## Citation
 

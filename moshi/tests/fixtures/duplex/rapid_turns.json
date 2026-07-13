@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "rapid_turns",
+  "description": "Three short requests with narrow response windows to expose queued-input and stale-audio behavior.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. Three spoken turns ending at 1500, 4500, and 7500 ms, with silence between them.",
+  "config": {
+    "seed": 42
+  },
+  "actions": [],
+  "expectations": [
+    {
+      "kind": "turn",
+      "label": "turn one",
+      "at_ms": 1500,
+      "deadline_ms": 2500,
+      "max_latency_ms": 2000
+    },
+    {
+      "kind": "turn",
+      "label": "turn two",
+      "at_ms": 4500,
+      "deadline_ms": 2500,
+      "max_latency_ms": 2000
+    },
+    {
+      "kind": "turn",
+      "label": "turn three",
+      "at_ms": 7500,
+      "deadline_ms": 3500,
+      "max_latency_ms": 2500
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 9000
+}

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "max_turn_cap",
+  "description": "Low-cap circuit-breaker exercise. The input should request a long enumeration so max_turn_text_tokens=40 is reached naturally.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. A request for a long enumeration ending at exactly 3000 ms.",
+  "config": {
+    "seed": 42,
+    "max_turn_text_tokens": 40
+  },
+  "actions": [],
+  "expectations": [
+    {
+      "kind": "turn",
+      "label": "enumeration request",
+      "at_ms": 3000,
+      "deadline_ms": 5000,
+      "max_latency_ms": 4000
+    },
+    {
+      "kind": "event",
+      "label": "turn cap activation",
+      "event_kind": "turn_cap",
+      "at_ms": 3000,
+      "deadline_ms": 13000
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 16000
+}

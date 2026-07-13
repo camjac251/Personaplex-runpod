@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, "moshi")
 
-from moshi.rtc_session import RTCSession  # noqa: E402
+from moshi.rtc_session import MimiOutputTrack, RTCSession  # noqa: E402
 from moshi.server import ServerState  # noqa: E402
 
 
@@ -29,6 +29,12 @@ class _OutputTrack:
     async def clear_buffer(self) -> None:
         self.clear_count += 1
         self.pushed.clear()
+
+    async def diagnostics_snapshot(self) -> dict[str, int | float]:
+        return {
+            "outbound_buffer_ms": 20.0,
+            "outbound_drop_events": 2,
+        }
 
 
 def _bare_session(process_fn) -> RTCSession:
@@ -157,6 +163,75 @@ def test_standing_inbound_backlog_is_trimmed_to_one_frame() -> None:
     assert session._pcm_drop_events == 1
 
 
+async def test_transport_diagnostics_expose_counts_without_audio() -> None:
+    session = _bare_session(lambda chunk: [(chunk, None)])
+    session._pcm_queue_high_water = 7
+    session._pcm_drop_events = 3
+    session._pcm_dropped_ms = 240.0
+    session._pcm_queue.put_nowait((2, np.ones(4, dtype=np.float32)))
+
+    snapshot = await session.diagnostics_snapshot()
+
+    assert snapshot == {
+        "pcm_queue_depth": 1,
+        "pcm_queue_capacity": 10,
+        "pcm_queue_high_water": 7,
+        "pcm_drop_events": 3,
+        "pcm_dropped_ms": 240.0,
+        "outbound_buffer_ms": 20.0,
+        "outbound_drop_events": 2,
+    }
+
+
+async def test_outbound_diagnostics_separate_flush_from_backlog_drop() -> None:
+    track = MimiOutputTrack()
+    track._buffer = np.zeros(4800, dtype=np.float32)
+    track._buffer_high_water = 9600
+    track._drop_events = 2
+    track._dropped_samples = 2400
+
+    await track.clear_buffer()
+    snapshot = await track.diagnostics_snapshot()
+
+    assert snapshot["outbound_buffer_ms"] == 0.0
+    assert snapshot["outbound_high_water_ms"] == 200.0
+    assert snapshot["outbound_drop_events"] == 2
+    assert snapshot["outbound_dropped_ms"] == 50.0
+    assert snapshot["outbound_flush_events"] == 1
+    assert snapshot["outbound_flushed_ms"] == 100.0
+
+
+def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
+    class _Control:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    session = RTCSession.__new__(RTCSession)
+    session._control = _Control()
+    session.send_stat(
+        rtf=0.42,
+        diagnostics={
+            "pcm_queue_depth": 4,
+            "pcm_dropped_ms": 80.04,
+            "private_path": "/workspace/secret",
+            "outbound_drop_events": "not numeric",
+        },
+    )
+
+    payload = json.loads(session._control.sent[0])
+    assert payload == {
+        "type": "stat",
+        "rtf": 0.42,
+        "pcm_queue_depth": 4,
+        "pcm_dropped_ms": 80.0,
+    }
+
+
 class _Peer:
     async def close(self) -> None:
         return None
@@ -280,6 +355,9 @@ if __name__ == "__main__":
         test_in_flight_result_is_discarded_across_pause,
         test_stop_processing_freezes_and_drains_in_flight_model_work,
         test_standing_inbound_backlog_is_trimmed_to_one_frame,
+        test_transport_diagnostics_expose_counts_without_audio,
+        test_outbound_diagnostics_separate_flush_from_backlog_drop,
+        test_stat_envelope_only_forwards_numeric_diagnostics,
         test_control_commands_preserve_wire_order,
         test_close_drains_active_control_and_cancels_waiters,
         test_control_failure_is_retrieved_and_closes_session,

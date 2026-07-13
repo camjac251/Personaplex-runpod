@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "manual_stop",
+  "description": "Stop-response latency. The input should request a deliberately long answer; the runner interrupts after 400 ms of continuous assistant audio.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. A request for a long answer ending at exactly 3000 ms.",
+  "config": {
+    "seed": 42,
+    "max_turn_text_tokens": 120
+  },
+  "actions": [
+    {
+      "type": "interrupt",
+      "reason": "regression_stop",
+      "when": {
+        "kind": "assistant_active_ms",
+        "value": 400
+      },
+      "timeout_ms": 12000
+    }
+  ],
+  "expectations": [
+    {
+      "kind": "turn",
+      "label": "long-answer request",
+      "at_ms": 3000,
+      "deadline_ms": 5000,
+      "max_latency_ms": 4000
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_interrupt_ack_ms": 500,
+    "max_interrupt_yield_ms": 1600,
+    "max_audio_after_ack_ms": 1600,
+    "max_post_interrupt_active_ms": 500,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 14000
+}
