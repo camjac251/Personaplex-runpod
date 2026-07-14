@@ -14,6 +14,7 @@ from collections import deque
 sys.path.insert(0, "moshi")
 
 from moshi.server import (  # noqa: E402
+    DEFAULT_VISION_SYSTEM_PROMPT,
     ServerState,
     VISION_AMBIENT_MIN_INTERVAL_SEC,
     VISION_QUEUE_MAX,
@@ -72,6 +73,22 @@ def test_sanitize_removes_labels_and_extra_sentences() -> None:
     assert _sanitize_vision_text("Observation: Trees line the road") == (
         "Trees line the road"
     )
+
+
+def test_default_prompt_uses_second_person_viewpoint_without_role_tags() -> None:
+    assert '"In your current view,"' in DEFAULT_VISION_SYSTEM_PROMPT
+    assert "no more than 20 words" in DEFAULT_VISION_SYSTEM_PROMPT
+    assert "opener counts toward the 20-word limit" in (
+        DEFAULT_VISION_SYSTEM_PROMPT
+    )
+    assert 'Use "your" only to establish the viewpoint' in (
+        DEFAULT_VISION_SYSTEM_PROMPT
+    )
+    assert "Do not address anyone" not in DEFAULT_VISION_SYSTEM_PROMPT
+    assert "<system>" not in DEFAULT_VISION_SYSTEM_PROMPT
+    assert _sanitize_vision_text(
+        "In your current view, a red mug rests beside the keyboard."
+    ) == "In your current view, a red mug rests beside the keyboard."
 
 
 def test_incomplete_interaction_keeps_valid_caption_json() -> None:
@@ -214,6 +231,7 @@ def test_stale_source_generation_cannot_queue_context() -> None:
 if __name__ == "__main__":
     tests = [
         test_sanitize_removes_labels_and_extra_sentences,
+        test_default_prompt_uses_second_person_viewpoint_without_role_tags,
         test_incomplete_interaction_keeps_valid_caption_json,
         test_clipping_preserves_complete_untruncated_text,
         test_fit_context_keeps_complete_words_within_token_window,
