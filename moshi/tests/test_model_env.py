@@ -9,6 +9,7 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 RESOLVER = ROOT / "docker" / "model-env.sh"
+BOOTSTRAP = ROOT / "start.sh"
 RL_REPO = "kyutai/personaplex-rl-seamless"
 RL_REVISION = "3fa800309a4b743a8a6d764253eb45def0334afc"
 BASE_REPO = "nvidia/personaplex-7b-v1"
@@ -44,10 +45,57 @@ def _resolve(**values: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _resolve_runpod_snapshot_policy(
+    value: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    assignment = next(
+        (
+            line
+            for line in BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+            if line.startswith("export PERSONAPLEX_PERIODIC_SNAPSHOTS=")
+        ),
+        None,
+    )
+    assert assignment is not None, "RunPod bootstrap must set the snapshot policy"
+    env = {
+        key: current
+        for key, current in os.environ.items()
+        if key != "PERSONAPLEX_PERIODIC_SNAPSHOTS"
+    }
+    if value is not None:
+        env["PERSONAPLEX_PERIODIC_SNAPSHOTS"] = value
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                f"{assignment}; "
+                'printf "%s\\n" "$PERSONAPLEX_PERIODIC_SNAPSHOTS"'
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
 def test_default_model_is_pinned_rl_seamless() -> None:
     result = _resolve()
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [RL_REPO, RL_REVISION]
+
+
+def test_runpod_disables_periodic_snapshots_by_default() -> None:
+    result = _resolve_runpod_snapshot_policy()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["0"]
+
+
+def test_runpod_preserves_periodic_snapshot_override() -> None:
+    result = _resolve_runpod_snapshot_policy("1")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["1"]
 
 
 def test_base_alias_selects_pinned_nvidia_model() -> None:

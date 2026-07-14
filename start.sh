@@ -28,6 +28,10 @@ export TRITON_CACHE_DIR="/workspace/.cache/triton"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TMPDIR="/workspace/tmp"
 
+# Full-state refreshes share the one-worker inference executor with live audio.
+# Keep them off for RunPod by default; operators can opt back in with 1.
+export PERSONAPLEX_PERIODIC_SNAPSHOTS="${PERSONAPLEX_PERIODIC_SNAPSHOTS:-0}"
+
 # uv binary, wheel cache, and project venv all on /workspace.
 # UV_CACHE_DIR path matches runpod/base so other RunPod tooling can
 # share the same wheel cache. UV_LINK_MODE=copy because MooseFS does

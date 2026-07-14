@@ -6108,7 +6108,8 @@ def main():
             "baseline. The first ~1.6 GB snapshot allocation occurs before "
             "the session becomes ready; later captures usually fit inside "
             "one 80 ms frame on a modern GPU. "
-            "--no-periodic-snapshots restores the capture-free behavior."
+            "--no-periodic-snapshots disables the once-per-minute refresh; "
+            "the session-start baseline and explicit bookmarks remain."
         ),
     )
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')

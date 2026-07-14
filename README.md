@@ -90,6 +90,7 @@ public IP.
 | `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned tested model revision (optional) |
+| `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` for 60 s snapshot refreshes |
 
 The launcher defaults to the pinned Seamless RL checkpoint. Set
 `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint.
@@ -98,6 +99,12 @@ an unchanged image cannot silently pick up different assets. A custom
 `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`. Launchers
 ignore the old NVIDIA revision pin when it is the only model variable left in
 an existing pod; set `PERSONAPLEX_MODEL=base` when that rollback is intended.
+
+The RunPod launcher disables periodic full-state snapshots so their GPU copy
+cannot interrupt the realtime inference worker once per minute. Each fresh
+session still keeps one baseline snapshot for manual Rewind, and explicit
+bookmarks still capture on demand. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=1` to
+restore fresh 60-second snapshots and long-session auto-rewind coverage.
 
 Use **Stop** / **Start** on the same Pod to keep `/workspace`. Terminating a
 regular Pod deletes its volume disk; use a network volume if you need the cache
@@ -209,7 +216,10 @@ The **Vision Prompt** textarea in the config panel customizes the system prompt 
 
 ## Hardware
 
-Use at least 24 GB VRAM for the resident model and rewind snapshot. Smaller cards require CPU offload or disabling periodic snapshots and will have higher latency.
+Use at least 24 GB VRAM for the resident model and baseline rewind snapshot.
+The RunPod launcher disables periodic refreshes by default; the baseline still
+uses snapshot memory. Smaller cards require CPU offload and have higher
+latency.
 
 ## Architecture notes
 
