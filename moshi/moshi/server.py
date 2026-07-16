@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import wraps
 import json
+import logging
 import random
 import re
 import os
@@ -546,6 +547,20 @@ BOOKMARK_LABEL_MAX_LEN = 64
 RTF_EMA_ALPHA = 0.2
 SLOW_INFERENCE_FRAME_MS = 250.0
 
+# GPU-hang watchdog. A kernel-level hang blocks the infer worker inside a
+# tracked frame phase without raising, so the fatal-CUDA exception path in
+# teardown never fires and teardown itself wedges awaiting the
+# uncancellable executor future (holding the session lock forever). The
+# watchdog thread polls the inflight-phase fields and hard-exits with the
+# supervisor exit code instead. Every tracked phase is bounded by
+# single-frame work: healthy phases run <40 ms against an 80 ms budget and
+# the slow-frame log fires at 250 ms. The worst pathological stall is the
+# ~7 s cold-worker CUDA init that the persistent executor already avoids,
+# so 30 s cannot fire on a healthy server.
+INFER_STALL_EXIT_MS = 30_000.0
+INFER_STALL_CONFIRM_POLLS = 3
+INFER_STALL_POLL_SEC = 1.0
+
 # Smoothing for the observed idle decoded-output RMS, sampled only during
 # pad streaks so active speech doesn't inflate it. The stat channel reports
 # it so the Silence floor slider can be tuned against the model's real
@@ -999,6 +1014,44 @@ class _AsrEngine:
             pass
 
 
+class _StallDetector:
+    """Decides when an inflight phase counts as a wedged GPU pipeline.
+
+    Pure bookkeeping so the watchdog decision is unit-testable. A stall is
+    ``confirm_polls`` consecutive observations of the identical
+    ``(phase, started_at)`` pair, each older than the threshold. Requiring
+    identity across polls filters the cross-thread write races:
+    ``_set_inflight_phase`` stores the phase before the timestamp and
+    ``_clear_inflight_frame`` zeroes the timestamp after flipping the phase
+    to idle, so a single sample can pair a live phase with a stale or zero
+    timestamp and compute a nonsense age.
+    """
+
+    def __init__(
+        self,
+        threshold_ms: float = INFER_STALL_EXIT_MS,
+        confirm_polls: int = INFER_STALL_CONFIRM_POLLS,
+    ) -> None:
+        self._threshold_ms = threshold_ms
+        self._confirm_polls = confirm_polls
+        self._last_sample: Optional[tuple[str, float]] = None
+        self._strikes = 0
+
+    def observe(self, phase: str, started_at: float, now: float) -> bool:
+        age_ms = (now - started_at) * 1000.0
+        if phase == "idle" or started_at <= 0.0 or age_ms < self._threshold_ms:
+            self._last_sample = None
+            self._strikes = 0
+            return False
+        sample = (phase, started_at)
+        if sample != self._last_sample:
+            self._last_sample = sample
+            self._strikes = 1
+            return False
+        self._strikes += 1
+        return self._strikes >= self._confirm_polls
+
+
 def _track_inflight_frame(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
@@ -1335,6 +1388,15 @@ class ServerState:
         self.server_build: str = _resolve_server_build()
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+        # GPU-hang watchdog: process-lifetime, so it outlives sessions and
+        # still fires in the post-disconnect zombie stage where every
+        # per-session task has self-exited but the stuck phase persists
+        # (the frame's finally-clears never ran).
+        threading.Thread(
+            target=self._hang_watchdog_loop,
+            name="personaplex-hang-watchdog",
+            daemon=True,
+        ).start()
 
     def _backpressure_status(self) -> str:
         target_ms = self._frame_audio_sec * 1000.0
@@ -1390,6 +1452,13 @@ class ServerState:
         return snapshot
 
     def _set_inflight_phase(self, phase: str) -> None:
+        # Written only from _process_audio_frame's execution scope (the
+        # _track_inflight_frame decorator, _tracked_inference_lock, and the
+        # frame body). The hang watchdog hard-exits the process when a phase
+        # ages past INFER_STALL_EXIT_MS, so long-running executor work
+        # (prompt priming, warmup, snapshot capture, rewind restore, voice
+        # previews) must never set a phase. test_hang_watchdog.py enforces
+        # this statically.
         self._inflight_phase = phase
         self._inflight_phase_started_at = time.perf_counter()
 
@@ -1408,7 +1477,53 @@ class ServerState:
                 yield
         finally:
             self._clear_inflight_frame()
-    
+
+    def _hang_watchdog_loop(self) -> None:
+        # HARD RULE: this thread must never call torch/CUDA APIs, acquire
+        # _infer_lock, or submit to _infer_executor, in the check or the
+        # firing path. All of those can block on the wedged CUDA context
+        # this thread exists to detect. _backpressure_status is plain
+        # attribute reads and formatting, and is the only permitted
+        # diagnostic.
+        detector = _StallDetector()
+        while True:
+            time.sleep(INFER_STALL_POLL_SEC)
+            phase = self._inflight_phase
+            started_at = self._inflight_phase_started_at
+            if detector.observe(phase, started_at, time.perf_counter()):
+                self._exit_on_pipeline_hang(phase, started_at)
+
+    def _exit_on_pipeline_hang(self, phase: str, started_at: float) -> None:
+        age_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.critical(
+            "GPU pipeline hang: inflight phase %r stuck for %.0f ms (%s); "
+            "exiting for a supervised restart. In-memory session state and "
+            "any in-memory recording are lost intentionally.",
+            phase,
+            age_ms,
+            self._backpressure_status(),
+        )
+        # Best-effort goodbye so a still-connected client takes its graceful
+        # end path instead of reading a dead transport. Scheduled on the
+        # loop because aiortc sends are not thread-safe; send_end no-ops on
+        # a closed channel. The exit must never be gated on this: the event
+        # loop itself may already be frozen by the same wedge.
+        try:
+            loop = self._main_loop
+            session = self._active_session
+            if loop is not None and session is not None:
+                loop.call_soon_threadsafe(session.send_end, "gpu_hang")
+        except Exception:
+            pass
+        # DataChannel sends queue on the SCTP transport; give the end
+        # message a moment to flush, then exit unconditionally. os._exit
+        # skips atexit, so flush log handlers explicitly. Exit code 70
+        # matches the poisoned-context exit in teardown: the supervisor
+        # treats both as "relaunch with a fresh CUDA context".
+        time.sleep(0.5)
+        logging.shutdown()
+        os._exit(70)
+
     def warmup(self):
         # More warmup iterations for CUDA graphs to stabilize
         for _ in range(8):

@@ -16,6 +16,7 @@ PersonaPlex served over WebRTC on any CUDA GPU host with a public IP, defaulting
 - `uv run python moshi/tests/test_vision_chunk.py` - vision chunk reassembly tests.
 - `uv run python moshi/tests/test_rtc_pipeline.py` - control ordering, teardown, and audio pipeline tests.
 - `uv run python moshi/tests/test_lm_controls.py` - sampling and anti-collapse tests.
+- `uv run python moshi/tests/test_hang_watchdog.py` - GPU-hang stall detector and phase-write invariant tests.
 - `uv run python moshi/tests/test_duplex_scenarios.py` - CPU checks for duplex manifests, VAD, Stop/cap scoring, and artifact bundles.
 - `uv run python scripts/run_duplex_regression.py --base-url http://127.0.0.1:8998 --input-wav <mono-48k-pcm16.wav> moshi/tests/fixtures/duplex/turn_taking.json` - drive an actual running WebRTC/GPU session and write replayable artifacts.
 - `uv run python moshi/tests/test_cuda_dynamic_topk.py` - optional CUDA graph/top-k smoke test.
