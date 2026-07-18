@@ -15,6 +15,7 @@ const PROMPT_FIELDS = new Set(["text_prompt", "system_prompt", "vision_prompt"])
 const BOOLEAN_FIELDS = new Set([
   "active",
   "auto_gain_control",
+  "caption_cfg",
   "detail",
   "echo_cancellation",
   "enabled",
@@ -28,6 +29,7 @@ const BOOLEAN_FIELDS = new Set([
   "vision_feed_model",
   "vision_ground_user_turns",
   "vision_in_transcript",
+  "vision_prompt_replace",
 ]);
 
 const NUMBER_FIELDS = new Set([
@@ -40,6 +42,7 @@ const NUMBER_FIELDS = new Set([
   "auto_recoveries",
   "bookmarks",
   "bytes",
+  "caption_cfg_gamma",
   "chars",
   "chunk_count",
   "clipped_samples",
@@ -214,6 +217,8 @@ const CONTENT_FIELDS = new Set([
 const CONFIG_FIELDS = new Set([
   "audio_temperature",
   "audio_topk",
+  "caption_cfg",
+  "caption_cfg_gamma",
   "clone_strength",
   "inject_silence_rms",
   "inject_silence_streak",
@@ -235,6 +240,7 @@ const CONFIG_FIELDS = new Set([
   "vision_ground_user_turns",
   "vision_in_transcript",
   "vision_prompt_chars",
+  "vision_prompt_replace",
   "voice_blend_mix",
   "voice_fingerprint",
 ]);

@@ -14,6 +14,8 @@ sys.path.insert(0, "moshi")
 from moshi.rtc_session import (  # noqa: E402
     AUDIO_TOPK_MAX,
     AUDIO_TOPK_MIN,
+    CAPTION_CFG_GAMMA_MAX,
+    CAPTION_CFG_GAMMA_MIN,
     INJECT_SILENCE_RMS_MAX,
     INJECT_SILENCE_RMS_MIN,
     INJECT_SILENCE_STREAK_MAX,
@@ -43,6 +45,7 @@ from moshi.rtc_session import (  # noqa: E402
     VISION_COST_PER_CALL_USD_MIN,
     SessionConfig,
     clamp_audio_topk,
+    clamp_caption_cfg_gamma,
     clamp_inject_silence_rms,
     clamp_inject_silence_streak,
     clamp_max_turn_text_tokens,
@@ -99,6 +102,7 @@ def test_defaults_are_within_clamp_bounds() -> None:
     )
     assert defaults.vision_feed_model is False
     assert defaults.vision_ground_user_turns is False
+    assert defaults.vision_prompt_replace is False
 
 
 def test_defaults_match_stable_conversation_tuning() -> None:
@@ -157,6 +161,9 @@ def test_all_numeric_hard_bounds() -> None:
     assert clamp_vision_cost_limit_usd(100) == VISION_COST_LIMIT_USD_MAX
     assert clamp_vision_cost_per_call_usd(-1) == VISION_COST_PER_CALL_USD_MIN
     assert clamp_vision_cost_per_call_usd(100) == VISION_COST_PER_CALL_USD_MAX
+    assert clamp_caption_cfg_gamma(0) == CAPTION_CFG_GAMMA_MIN
+    assert clamp_caption_cfg_gamma(99) == CAPTION_CFG_GAMMA_MAX
+    assert clamp_caption_cfg_gamma(2.5) == 2.5
     assert clamp_seed(None) is None
     assert clamp_seed(SEED_RANDOM) == SEED_RANDOM
     assert clamp_seed(-2) == SEED_MIN
@@ -217,6 +224,7 @@ def test_parse_session_config_rejects_non_finite_values() -> None:
         "vision_cost_limit_usd",
         "vision_cost_per_call_usd",
         "inject_silence_rms",
+        "caption_cfg_gamma",
     )
     int_fields = (
         "seed",
@@ -260,6 +268,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
             "voice_prompt": "voice.pt",
             "text_prompt": "You enjoy talking.",
             "vision_feed_model": True,
+            "vision_prompt_replace": True,
             "seed": SEED_RANDOM,
             "text_topk": "64",
             "text_min_p": "0.08",
@@ -277,6 +286,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.voice_prompt == "voice.pt"
     assert cfg.text_prompt == "You enjoy talking."
     assert cfg.vision_feed_model is True
+    assert cfg.vision_prompt_replace is True
     assert cfg.seed == SEED_RANDOM
     assert cfg.text_topk == 64
     assert cfg.text_min_p == 0.08

@@ -716,6 +716,7 @@ class LMGen(StreamingModule[_LMGenState]):
         padding_bonus: float = 0.0,
         max_turn_text_tokens: int = 0,
         semantic_temperature_cap: float = DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+        caption_cfg: bool = False,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -735,6 +736,21 @@ class LMGen(StreamingModule[_LMGenState]):
         # probability is at least min_p_text of the step's maximum. 0
         # disables it and leaves top-k as the sole truncation.
         self.min_p_text: float = 0.0
+        # Caption-CFG (context-aware decoding): the streaming state runs two
+        # batch rows. Row 0 is the conditional branch and the only row that
+        # receives injected context text; row 1 is the unconditional branch
+        # and receives PAD in those frames. Text logits are guided as
+        # uncond + cfg_gamma * (cond - uncond), sampled once, and the chosen
+        # token feeds both rows, so the branches differ only by
+        # context-window text and the emitted timeline never carries it.
+        # Requires entering streaming with batch size 2.
+        self.caption_cfg = bool(caption_cfg)
+        # Guidance strength. 1.0 reproduces the conditional branch exactly
+        # (context in attention at natural strength); higher values amplify
+        # the context delta. Plain Python float mutated live by the server
+        # and read once per frame outside the CUDA graphs, like
+        # padding_bonus.
+        self.cfg_gamma: float = 1.0
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
@@ -990,6 +1006,10 @@ class LMGen(StreamingModule[_LMGenState]):
     def step_embeddings(self, embeddings: torch.Tensor):
         state = self._streaming_state
         lm_model = self.lm_model
+        if self.caption_cfg and embeddings.shape[0] == 1:
+            # Voice sidecars are saved from single-row sessions; both CFG
+            # rows prime identically from the same embedding.
+            embeddings = embeddings.expand(2, -1, -1)
         needed_input_tokens = lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
         _dummy_audio_token = lm_model._get_initial_token()
         while True:
@@ -1030,6 +1050,19 @@ class LMGen(StreamingModule[_LMGenState]):
         # repetition penalty first because it already returns a clone; only
         # make a separate copy when padding bias is the sole mutation.
         text_logits_f = text_logits.float()
+        cfg_active = self.caption_cfg and text_logits_f.shape[0] == 2
+        if cfg_active:
+            # Guided text logits: the unconditional row plus cfg_gamma times
+            # the context-conditioned delta. The single guided row is
+            # penalized and sampled once below; the clone at gamma 1.0 keeps
+            # the padding-bonus write off the graph output buffer.
+            gamma = float(self.cfg_gamma)
+            cond = text_logits_f[0:1]
+            if gamma == 1.0:
+                text_logits_f = cond.clone()
+            else:
+                uncond = text_logits_f[1:2]
+                text_logits_f = uncond + gamma * (cond - uncond)
         if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
             text_logits_f = self._apply_text_repetition_penalty(text_logits_f)
         elif (
@@ -1053,6 +1086,10 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[2] == 1
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
+        if cfg_active:
+            # One guided sample drives both rows; forced context windows
+            # still win per row through the provided/target mask below.
+            sampled_text_token = sampled_text_token.expand(2)
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
@@ -1105,6 +1142,14 @@ class LMGen(StreamingModule[_LMGenState]):
             sampled_audio_tokens,
             state.cache[:, 1 : lm_model.dep_q + 1, target_position],
         )
+        if cfg_active:
+            # Both rows must hear the same assistant audio. Row 0's depformer
+            # (whose transformer state carries the context) is canonical; its
+            # codes overwrite row 1's slot so the two KV timelines differ
+            # only by context-window text tokens.
+            state.cache[1:2, 1 : lm_model.dep_q + 1, target_position] = (
+                state.cache[0:1, 1 : lm_model.dep_q + 1, target_position]
+            )
 
         self._update_turn_cap(
             next_text_token,
@@ -1179,6 +1224,10 @@ class LMGen(StreamingModule[_LMGenState]):
         meta_path = base_path + ".json"
         
         if exists(state_path) and exists(meta_path):
+            # Single-row sidecars restore into a two-row caption-CFG stream
+            # as well: the tensor restore copies via Tensor.copy_, which
+            # broadcasts (1, ...) into (2, ...), priming both rows
+            # identically.
             logger.info("loading full streaming state from %s", state_path)
             full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
             self._migrate_legacy_full_state(full_state)
@@ -1316,9 +1365,16 @@ class LMGen(StreamingModule[_LMGenState]):
         # the previous turn bias the first token of the next one.
         self._clear_repetition_boundary()
         ctx = self.repetition_penalty_context
+        # Under caption-CFG the guided logits collapse to a single row while
+        # the ring keeps one row per branch; the rows hold identical history
+        # (both branches consume the same sampled token), so the leading
+        # slice is the shared context.
+        recent = self._streaming_state.recent_text_tokens[
+            : text_logits.shape[0], :ctx
+        ]
         return apply_repetition_penalty(
             text_logits,
-            self._streaming_state.recent_text_tokens[:, :ctx],
+            recent,
             self.repetition_penalty,
         )
 

@@ -477,6 +477,12 @@ VOICE_BLEND_MIX_MIN = 0.0
 VOICE_BLEND_MIX_MAX = 1.0
 CLONE_STRENGTH_MIN = 0.0
 CLONE_STRENGTH_MAX = 1.0
+# Caption-CFG guidance boost applied when a context packet finishes
+# delivering. 1.0 is the neutral conditional (caption in context at natural
+# strength, no amplification); by 4.0 the caption delta already dominates
+# the text distribution and hotter values distort sampling.
+CAPTION_CFG_GAMMA_MIN = 1.0
+CAPTION_CFG_GAMMA_MAX = 4.0
 
 
 def _coerce_finite_float(value, field: str) -> float:
@@ -517,6 +523,15 @@ def clamp_text_topk(value) -> int:
 
 def clamp_audio_topk(value) -> int:
     return _clamp_int(value, AUDIO_TOPK_MIN, AUDIO_TOPK_MAX, "audio_topk")
+
+
+def clamp_caption_cfg_gamma(value) -> float:
+    return _clamp_float(
+        value,
+        CAPTION_CFG_GAMMA_MIN,
+        CAPTION_CFG_GAMMA_MAX,
+        "caption_cfg_gamma",
+    )
 
 
 def clamp_repetition_penalty(value) -> float:
@@ -794,6 +809,11 @@ class SessionConfig:
     clone_strength: float = 1.0
     text_prompt: str = ""
     vision_prompt: str = ""
+    # When true, a non-empty vision_prompt fully replaces the default vision
+    # system instruction instead of appending as an extra observation focus.
+    # Lets A/B runs swap caption phrasing styles wholesale from the client
+    # without a server restart.
+    vision_prompt_replace: bool = False
     vision_in_transcript: bool = False
     # When true, live Gemini captions are drip-fed into Moshi's text
     # channel during silence windows. Off by default so vision capture is a
@@ -848,6 +868,10 @@ class SessionConfig:
     # inject_silence_streak frames before a queued caption is dripped in.
     inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
     inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
+    # Caption-CFG guidance boost applied when a context packet finishes
+    # delivering, decaying back to the neutral 1.0 between packets. Only
+    # meaningful on servers started in caption-CFG mode; ignored otherwise.
+    caption_cfg_gamma: float = 2.0
 
 
 def parse_session_config(payload: dict) -> SessionConfig:
@@ -864,6 +888,11 @@ def parse_session_config(payload: dict) -> SessionConfig:
         ),
         text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
         vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
+        vision_prompt_replace=bool(
+            payload.get(
+                "vision_prompt_replace", defaults.vision_prompt_replace
+            )
+        ),
         vision_in_transcript=bool(
             payload.get("vision_in_transcript", defaults.vision_in_transcript)
         ),
@@ -926,6 +955,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
         ),
         inject_silence_streak=clamp_inject_silence_streak(
             payload.get("inject_silence_streak", defaults.inject_silence_streak)
+        ),
+        caption_cfg_gamma=clamp_caption_cfg_gamma(
+            payload.get("caption_cfg_gamma", defaults.caption_cfg_gamma)
         ),
     )
 
