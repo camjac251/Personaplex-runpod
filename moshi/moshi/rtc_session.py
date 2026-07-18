@@ -301,6 +301,11 @@ TEMPERATURE_MIN = 0.1
 TEMPERATURE_MAX = 1.5
 TEXT_TOPK_MIN = 1
 TEXT_TOPK_MAX = 500
+# Min-p keeps text tokens whose probability is at least this fraction of
+# the step's best candidate. 0 disables it; 0.5 is already a near-greedy
+# truncation, so the clamp stops there.
+TEXT_MIN_P_MIN = 0.0
+TEXT_MIN_P_MAX = 0.5
 # k=1 is greedy acoustic sampling: a deterministic monotone drone that
 # presents as voice collapse. Keep a little diversity even at the floor.
 AUDIO_TOPK_MIN = 8
@@ -398,6 +403,10 @@ def clamp_repetition_penalty_context(value) -> int:
 
 def clamp_padding_bonus(value) -> float:
     return _clamp_float(value, PADDING_BONUS_MIN, PADDING_BONUS_MAX, "padding_bonus")
+
+
+def clamp_text_min_p(value) -> float:
+    return _clamp_float(value, TEXT_MIN_P_MIN, TEXT_MIN_P_MAX, "text_min_p")
 
 
 def clamp_max_turn_text_tokens(value) -> int:
@@ -669,6 +678,9 @@ class SessionConfig:
     audio_temperature: float = 0.8
     text_temperature: float = 0.7
     text_topk: int = 25
+    # Adaptive text truncation relative to the step's best candidate; 0
+    # (default) disables it and leaves top-k as the sole truncation.
+    text_min_p: float = 0.0
     audio_topk: int = 250
     repetition_penalty: float = 1.0
     repetition_penalty_context: int = 64
@@ -735,6 +747,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
             payload.get("text_temperature", defaults.text_temperature)
         ),
         text_topk=clamp_text_topk(payload.get("text_topk", defaults.text_topk)),
+        text_min_p=clamp_text_min_p(
+            payload.get("text_min_p", defaults.text_min_p)
+        ),
         audio_topk=clamp_audio_topk(payload.get("audio_topk", defaults.audio_topk)),
         repetition_penalty=clamp_repetition_penalty(
             payload.get("repetition_penalty", defaults.repetition_penalty)

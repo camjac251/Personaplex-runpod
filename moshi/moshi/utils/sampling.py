@@ -172,11 +172,19 @@ def sample_token(
     temp: float = 1.0,
     top_k: int = 0,
     top_p: float = 0.0,
+    min_p: float = 0.0,
 ) -> torch.Tensor:
     """Given logits of shape [*, Card], returns a LongTensor of shape [*]."""
     # Apply softmax for sampling if temp > 0. Else, do greedy sampling to avoid zero division error.
     if use_sampling and temp > 0.0:
         probs = torch.softmax(logits / temp, dim=-1)
+        if min_p > 0.0:
+            # Adaptive truncation: drop tokens below min_p of the step's
+            # best candidate. Tight when the model is confident, wide when
+            # it is not; composes with the top-k/top-p paths below, which
+            # sample from the masked weights.
+            top_prob = probs.amax(dim=-1, keepdim=True)
+            probs = probs.masked_fill(probs < min_p * top_prob, 0.0)
         if top_p > 0.0:
             next_token = sample_top_p(probs, p=top_p)
         elif top_k > 0:

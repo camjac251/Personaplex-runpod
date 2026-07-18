@@ -70,6 +70,11 @@ SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=n
 # this floor the softmax collapses to a one-hot at the argmax, so temperature
 # 0 still means greedy decoding instead of NaN probabilities.
 MIN_AUDIO_TEMPERATURE = 1e-6
+# Ceiling for the first depformer level's sampling temperature. Level 0 is
+# Mimi's semantic codebook and decides WHAT the audio says; sampling it as
+# hot as the acoustic residuals destabilizes content and reads as crackle,
+# while the residual levels tolerate heat for prosody and timbre.
+DEFAULT_SEMANTIC_TEMPERATURE_CAP = 0.7
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
 
@@ -710,6 +715,7 @@ class LMGen(StreamingModule[_LMGenState]):
         repetition_penalty_context: int = 64,
         padding_bonus: float = 0.0,
         max_turn_text_tokens: int = 0,
+        semantic_temperature_cap: float = DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -724,6 +730,11 @@ class LMGen(StreamingModule[_LMGenState]):
         self.repetition_penalty_context = max(0, min(repetition_penalty_context, MAX_REPETITION_CONTEXT))
         self.padding_bonus = padding_bonus
         self.max_turn_text_tokens = max_turn_text_tokens
+        self.semantic_temperature_cap = float(semantic_temperature_cap)
+        # Min-p truncation for the text head only: keep tokens whose
+        # probability is at least min_p_text of the step's maximum. 0
+        # disables it and leaves top-k as the sole truncation.
+        self.min_p_text: float = 0.0
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
@@ -749,12 +760,16 @@ class LMGen(StreamingModule[_LMGenState]):
             device=self.lm_model.device,
         ).view(1, 8, 1)
         # Tensor inputs to the CUDA-graphed depformer so live sampling updates
-        # change replayed computation without replacing a working graph.
-        self._audio_temperature = torch.tensor(
-            max(float(temp), MIN_AUDIO_TEMPERATURE),
+        # change replayed computation without replacing a working graph. The
+        # temperature is one value per depformer level: level 0 (the semantic
+        # codebook) is capped by semantic_temperature_cap, the acoustic
+        # residual levels use the requested temperature directly.
+        self._audio_temperature = torch.empty(
+            lm_model.dep_q,
             dtype=torch.float32,
             device=self.lm_model.device,
         )
+        self._write_audio_temperature(float(temp))
         self._audio_top_k = torch.tensor(
             int(top_k),
             dtype=torch.long,
@@ -1032,6 +1047,7 @@ class LMGen(StreamingModule[_LMGenState]):
             self.use_sampling,
             self.temp_text,
             self.top_k_text,
+            min_p=self.min_p_text,
         )
         assert sampled_text_token.dim() == 3, sampled_text_token.shape
         assert sampled_text_token.shape[2] == 1
@@ -1360,12 +1376,28 @@ class LMGen(StreamingModule[_LMGenState]):
         state.recent_text_offset.zero_()
         state.repetition_pad_streak.zero_()
 
+    def _write_audio_temperature(self, temperature: float) -> None:
+        """Fill the per-level temperature vector for one acoustic setting.
+
+        The semantic level (0) never exceeds semantic_temperature_cap; when
+        the requested temperature sits at or below the cap, every level
+        matches it exactly.
+        """
+        acoustic = max(float(temperature), MIN_AUDIO_TEMPERATURE)
+        semantic = max(
+            min(acoustic, self.semantic_temperature_cap),
+            MIN_AUDIO_TEMPERATURE,
+        )
+        self._audio_temperature.fill_(acoustic)
+        self._audio_temperature[0] = semantic
+
     def set_audio_sampling(self, temperature: float, top_k: int) -> bool:
         """Apply graph-safe acoustic sampling controls in place.
 
         Both values are copied into CUDA-graph input tensors. The depformer
         uses a fixed-cardinality top-k and masks ranks against the tensor k,
-        so neither update requires graph recapture.
+        and the per-level temperature vector keeps its shape, so neither
+        update requires graph recapture.
 
         Returns whether top-k changed (for applied-config telemetry).
         """
@@ -1373,7 +1405,7 @@ class LMGen(StreamingModule[_LMGenState]):
         top_k = int(top_k)
         top_k_changed = top_k != self.top_k
         self.temp = temperature
-        self._audio_temperature.fill_(max(temperature, MIN_AUDIO_TEMPERATURE))
+        self._write_audio_temperature(temperature)
         self.top_k = top_k
         self._audio_top_k.fill_(top_k)
         return top_k_changed
@@ -1577,7 +1609,7 @@ class LMGen(StreamingModule[_LMGenState]):
                     depformer_logits.append(ret_logits.float())
                 if self.use_sampling:
                     probs = torch.softmax(
-                        logits.float() / audio_temperature, dim=-1
+                        logits.float() / audio_temperature[cb_index], dim=-1
                     )
                     next_token = sample_top_k_dynamic(
                         probs, audio_top_k

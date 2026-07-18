@@ -13,10 +13,14 @@ import torch
 sys.path.insert(0, "moshi")
 
 from moshi.models.lm import (  # noqa: E402
+    DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     REPETITION_TURN_BREAK_FRAMES,
     LMGen,
 )
-from moshi.utils.sampling import sample_top_k_dynamic  # noqa: E402
+from moshi.utils.sampling import (  # noqa: E402
+    sample_token,
+    sample_top_k_dynamic,
+)
 
 
 class _Graph:
@@ -32,7 +36,8 @@ def _bare_lm_gen() -> tuple[LMGen, _Graph]:
     lm_gen = LMGen.__new__(LMGen)
     lm_gen.temp = 0.8
     lm_gen.top_k = 250
-    lm_gen._audio_temperature = torch.tensor(0.8)
+    lm_gen.semantic_temperature_cap = DEFAULT_SEMANTIC_TEMPERATURE_CAP
+    lm_gen._audio_temperature = torch.full((8,), 0.8)
     lm_gen._audio_top_k = torch.tensor(250, dtype=torch.long)
     lm_gen._streaming_state = SimpleNamespace(graphed_depth=graph)
     return lm_gen, graph
@@ -43,8 +48,52 @@ def test_temperature_updates_graph_input_without_reset() -> None:
     changed = lm_gen.set_audio_sampling(1.1, 250)
     assert changed is False
     assert lm_gen.temp == 1.1
-    assert torch.isclose(lm_gen._audio_temperature, torch.tensor(1.1))
+    # Same tensor object, same shape: the graph replays the new values.
+    assert lm_gen._audio_temperature.shape == (8,)
+    assert torch.allclose(
+        lm_gen._audio_temperature[1:], torch.full((7,), 1.1)
+    )
     assert graph.resets == []
+
+
+def test_semantic_codebook_temperature_is_capped() -> None:
+    lm_gen, _ = _bare_lm_gen()
+
+    # Hot acoustic settings leave the semantic level at the cap.
+    lm_gen.set_audio_sampling(1.2, 250)
+    assert torch.isclose(
+        lm_gen._audio_temperature[0],
+        torch.tensor(DEFAULT_SEMANTIC_TEMPERATURE_CAP),
+    )
+    assert torch.allclose(
+        lm_gen._audio_temperature[1:], torch.full((7,), 1.2)
+    )
+
+    # At or below the cap every level matches the request exactly.
+    lm_gen.set_audio_sampling(0.6, 250)
+    assert torch.allclose(
+        lm_gen._audio_temperature, torch.full((8,), 0.6)
+    )
+
+
+def test_min_p_masks_low_probability_text_tokens() -> None:
+    # Token 2 dominates; token 0 sits far below half of its probability.
+    logits = torch.tensor([[0.0, 2.2, 3.0]], dtype=torch.float32)
+    torch.manual_seed(7)
+    with_min_p = {
+        sample_token(logits, True, 1.0, 0, min_p=0.5).item()
+        for _ in range(200)
+    }
+    assert 0 not in with_min_p
+    assert 2 in with_min_p
+
+    # Disabled min-p keeps the full distribution reachable.
+    torch.manual_seed(7)
+    without = {
+        sample_token(logits, True, 1.0, 0, min_p=0.0).item()
+        for _ in range(400)
+    }
+    assert 0 in without
 
 
 def test_top_k_updates_graph_input_without_reset() -> None:
@@ -230,6 +279,8 @@ def test_turn_cap_counts_across_short_natural_pauses() -> None:
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
+        test_semantic_codebook_temperature_is_capped,
+        test_min_p_masks_low_probability_text_tokens,
         test_top_k_updates_graph_input_without_reset,
         test_dynamic_top_k_masks_candidates_without_graph_shape_changes,
         test_repetition_ring_is_turn_scoped,

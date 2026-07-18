@@ -33,6 +33,8 @@ from moshi.rtc_session import (  # noqa: E402
     SESSION_TIMEOUT_SEC_MIN,
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
+    TEXT_MIN_P_MAX,
+    TEXT_MIN_P_MIN,
     TEXT_TOPK_MAX,
     TEXT_TOPK_MIN,
     VISION_COST_LIMIT_USD_MAX,
@@ -50,6 +52,7 @@ from moshi.rtc_session import (  # noqa: E402
     clamp_seed,
     clamp_session_timeout_sec,
     clamp_temperature,
+    clamp_text_min_p,
     clamp_text_topk,
     clamp_vision_cost_limit_usd,
     clamp_vision_cost_per_call_usd,
@@ -102,6 +105,7 @@ def test_defaults_match_stable_conversation_tuning() -> None:
     defaults = SessionConfig()
     assert defaults.text_temperature == 0.7
     assert defaults.text_topk == 25
+    assert defaults.text_min_p == 0.0
     assert defaults.audio_temperature == 0.8
     assert defaults.audio_topk == 250
     assert defaults.repetition_penalty == 1.0
@@ -134,6 +138,8 @@ def test_inject_silence_clamps() -> None:
 def test_all_numeric_hard_bounds() -> None:
     assert clamp_text_topk(-1) == TEXT_TOPK_MIN
     assert clamp_text_topk(10_000) == TEXT_TOPK_MAX
+    assert clamp_text_min_p(-1) == TEXT_MIN_P_MIN
+    assert clamp_text_min_p(2) == TEXT_MIN_P_MAX
     assert clamp_audio_topk(-1) == AUDIO_TOPK_MIN
     assert clamp_audio_topk(10_000) == AUDIO_TOPK_MAX
     assert clamp_repetition_penalty(-1) == REPETITION_PENALTY_MIN
@@ -203,6 +209,7 @@ def test_parse_session_config_rejects_non_finite_values() -> None:
         "text_temperature",
         "repetition_penalty",
         "padding_bonus",
+        "text_min_p",
         "vision_cost_limit_usd",
         "vision_cost_per_call_usd",
         "inject_silence_rms",
@@ -251,6 +258,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
             "vision_feed_model": True,
             "seed": SEED_RANDOM,
             "text_topk": "64",
+            "text_min_p": "0.08",
             "audio_topk": "420",
             "repetition_penalty": "1.08",
             "repetition_penalty_context": "128",
@@ -266,6 +274,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.vision_feed_model is True
     assert cfg.seed == SEED_RANDOM
     assert cfg.text_topk == 64
+    assert cfg.text_min_p == 0.08
     assert cfg.audio_topk == 420
     assert cfg.repetition_penalty == 1.08
     assert cfg.repetition_penalty_context == 128

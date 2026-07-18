@@ -53,7 +53,7 @@ import torch
 from aiortc import RTCSessionDescription
 
 from .models import loaders, MimiModel, LMGen
-from .models.lm import MAX_REPETITION_CONTEXT
+from .models.lm import DEFAULT_SEMANTIC_TEMPERATURE_CAP, MAX_REPETITION_CONTEXT
 from .rtc_session import (
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
@@ -70,6 +70,7 @@ from .rtc_session import (
     clamp_repetition_penalty,
     clamp_repetition_penalty_context,
     clamp_temperature,
+    clamp_text_min_p,
     clamp_text_topk,
     clamp_vision_cost_limit_usd,
     reassemble_vision_chunk,
@@ -562,6 +563,7 @@ AUTO_RECOVERY_CONFIG_KEYS = (
     "repetition_penalty_context",
     "padding_bonus",
     "max_turn_text_tokens",
+    "text_min_p",
 )
 
 # Fail-safe ceiling on how long the Stop latch may hold the assistant
@@ -1706,6 +1708,7 @@ class ServerState:
                 ),
             )
             self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
+            self.lm_gen.min_p_text = max(0.0, cfg.text_min_p)
             self.lm_gen.max_turn_text_tokens = max(
                 MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens
             )
@@ -3732,6 +3735,7 @@ class ServerState:
                 self.lm_gen.repetition_penalty_context
             ),
             "padding_bonus": float(self.lm_gen.padding_bonus),
+            "text_min_p": float(self.lm_gen.min_p_text),
             "max_turn_text_tokens": int(self.lm_gen.max_turn_text_tokens),
             "inject_silence_rms": float(self._inject_silence_rms),
             "inject_silence_streak": int(self._inject_silence_streak),
@@ -4008,6 +4012,7 @@ class ServerState:
         self.lm_gen.repetition_penalty = 1.15 if is_base else 1.0
         self.lm_gen.repetition_penalty_context = 64
         self.lm_gen.padding_bonus = 0.0
+        self.lm_gen.min_p_text = 0.0
         self.lm_gen.max_turn_text_tokens = 120
         self.lm_gen.reset_repetition_state()
         self._reset_turn_cap_tracking_for_config_change()
@@ -5079,6 +5084,7 @@ class ServerState:
                         "repetition_penalty",
                         "repetition_penalty_context",
                         "padding_bonus",
+                        "text_min_p",
                         "max_turn_text_tokens",
                         "vision_cost_limit_usd",
                         "vision_in_transcript",
@@ -5134,6 +5140,10 @@ class ServerState:
                         if "padding_bonus" in msg:
                             updates["padding_bonus"] = clamp_padding_bonus(
                                 msg["padding_bonus"]
+                            )
+                        if "text_min_p" in msg:
+                            updates["min_p_text"] = clamp_text_min_p(
+                                msg["text_min_p"]
                             )
                         if "max_turn_text_tokens" in msg:
                             updates["max_turn_text_tokens"] = (
@@ -6278,6 +6288,17 @@ def _environment_flag(name: str, default: bool = False) -> bool:
     return default
 
 
+def _environment_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -6568,7 +6589,11 @@ def main():
                         sample_rate=mimi.sample_rate,
                         device=args.device,
                         frame_rate=mimi.frame_rate,
-                        save_voice_prompt_embeddings=False)
+                        save_voice_prompt_embeddings=False,
+                        semantic_temperature_cap=_environment_float(
+                            "PERSONAPLEX_SEMANTIC_TEMP_CAP",
+                            DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+                        ))
 
     # Optional second model for user-speech transcription. Constructed only
     # when --enable-asr is set; _AsrEngine.load itself returns None (and logs)
