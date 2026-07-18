@@ -56,17 +56,19 @@ OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 # a frame or more means a stall left residue behind. 25 calls ~= 500 ms
 # spans several 80 ms production lumps plus jitter.
 OUTBOUND_STANDING_BACKLOG_WINDOW = 25
-# Deliberate outbound floor: after an underrun (or at session start),
-# hold this much audio before emission resumes, so the healthy sawtooth
-# rides above empty and micro-jitter cannot force mid-word silence
-# insertions, which land as clicks.
-OUTBOUND_PREBUFFER_SAMPLES = OUTBOUND_FRAME_SAMPLES * 2
-# Standing latency above the deliberate prebuffer floor is what the drain
-# sheds; the sawtooth legitimately sits at the prebuffer level, so only a
-# persistent floor a full frame above it counts as excess.
-OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = (
-    OUTBOUND_PREBUFFER_SAMPLES + OUTBOUND_FRAME_SAMPLES
-)
+# Adaptive outbound floor: after an underrun (or at session start), hold
+# this much audio before emission resumes so the healthy sawtooth rides
+# above empty and micro-jitter cannot force mid-word silence insertions.
+# The floor grows one frame per underrun and decays one frame after a
+# sustained clean stretch, so the paid latency tracks the jitter this
+# session actually exhibits instead of a blind worst case; the
+# silence-preferring shed reclaims freed floor inaudibly.
+OUTBOUND_PREBUFFER_START_SAMPLES = OUTBOUND_FRAME_SAMPLES * 2
+OUTBOUND_PREBUFFER_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES
+OUTBOUND_PREBUFFER_MAX_SAMPLES = OUTBOUND_FRAME_SAMPLES * 6
+# 20 ms recv() calls between decays: ~30 s without an underrun earns one
+# frame of latency back.
+OUTBOUND_PREBUFFER_DECAY_RECVS = 1500
 # Silence-preferring shed: when standing latency must be cut, remove
 # near-silent 10 ms stretches first (inaudible), and crossfade any forced
 # cut of live audio over 5 ms so the splice never lands as a click.
@@ -170,6 +172,8 @@ class MimiOutputTrack(MediaStreamTrack):
         # steps from zero to full amplitude.
         self._primed = False
         self._resume_fade_pending = True
+        self._prebuffer_target = OUTBOUND_PREBUFFER_START_SAMPLES
+        self._clean_recvs = 0
         # Persistent resampler so its internal anti-alias filter state
         # carries between chunks. Recreating per-call breaks continuity.
         self._resampler = AudioResampler(
@@ -272,10 +276,32 @@ class MimiOutputTrack(MediaStreamTrack):
         self._buffer = buf
         self._dropped_samples += removed
 
+    def _note_underrun_locked(self) -> None:
+        """Grow the floor and reprime after the buffer ran dry."""
+        self._underrun_events += 1
+        self._clean_recvs = 0
+        self._prebuffer_target = min(
+            self._prebuffer_target + OUTBOUND_FRAME_SAMPLES,
+            OUTBOUND_PREBUFFER_MAX_SAMPLES,
+        )
+        self._primed = False
+        self._resume_fade_pending = True
+
+    def _note_clean_recv_locked(self) -> None:
+        """Decay the floor one frame after a long underrun-free stretch."""
+        self._clean_recvs += 1
+        if self._clean_recvs < OUTBOUND_PREBUFFER_DECAY_RECVS:
+            return
+        self._clean_recvs = 0
+        self._prebuffer_target = max(
+            self._prebuffer_target - OUTBOUND_FRAME_SAMPLES,
+            OUTBOUND_PREBUFFER_MIN_SAMPLES,
+        )
+
     async def _pop_chunk(self) -> np.ndarray:
         async with self._buffer_lock:
             if not self._primed:
-                if self._buffer.size >= OUTBOUND_PREBUFFER_SAMPLES:
+                if self._buffer.size >= self._prebuffer_target:
                     self._primed = True
                 else:
                     return np.zeros(OUTBOUND_FRAME_SAMPLES, dtype=np.float32)
@@ -289,16 +315,14 @@ class MimiOutputTrack(MediaStreamTrack):
                     )
                     self._resume_fade_pending = False
                 if self._buffer.size == 0:
-                    # The deliberate floor is gone, so the next recv() may
-                    # find nothing. Land this chunk on silence and reprime
-                    # so emission resumes from a refilled floor.
+                    # The floor is gone, so the next recv() may find
+                    # nothing. Land this chunk on silence and reprime so
+                    # emission resumes from a refilled floor.
                     fade = OUTBOUND_SHED_CROSSFADE_SAMPLES
                     chunk[-fade:] *= np.linspace(
                         1.0, 0.0, fade, dtype=np.float32
                     )
-                    self._underrun_events += 1
-                    self._primed = False
-                    self._resume_fade_pending = True
+                    self._note_underrun_locked()
                 return chunk
             # Partial frame left: emit it faded to silence, zero-padded,
             # and reprime before emission resumes.
@@ -311,9 +335,10 @@ class MimiOutputTrack(MediaStreamTrack):
                 out[partial.size - fade: partial.size] *= np.linspace(
                     1.0, 0.0, fade, dtype=np.float32
                 )
-                self._underrun_events += 1
-            self._primed = False
-            self._resume_fade_pending = True
+                self._note_underrun_locked()
+            else:
+                self._primed = False
+                self._resume_fade_pending = True
             return out
 
     async def recv(self) -> AudioFrame:
@@ -345,23 +370,23 @@ class MimiOutputTrack(MediaStreamTrack):
         async with self._buffer_lock:
             backlog = self._buffer.size
             self._backlog_window.append(backlog)
+            self._note_clean_recv_locked()
             standing = (
                 len(self._backlog_window) == self._backlog_window.maxlen
                 and min(self._backlog_window)
-                >= OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES
+                >= self._prebuffer_target + OUTBOUND_FRAME_SAMPLES
             )
-            if (rebased and backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES) or (
-                standing and backlog >= OUTBOUND_PREBUFFER_SAMPLES
-            ):
+            if (rebased and backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES) or standing:
                 if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES:
-                    drop = backlog - OUTBOUND_FRAME_SAMPLES * 4
+                    drop = backlog - max(
+                        OUTBOUND_FRAME_SAMPLES * 4, self._prebuffer_target
+                    )
                 else:
-                    # Shed only the persistent floor above the deliberate
+                    # Shed only the persistent floor above the adaptive
                     # prebuffer; the sawtooth above that floor is in-flight
                     # audio, not latency.
                     drop = (
-                        min(self._backlog_window)
-                        - OUTBOUND_PREBUFFER_SAMPLES
+                        min(self._backlog_window) - self._prebuffer_target
                     )
                 if drop > 0:
                     self._drop_events += 1
@@ -399,6 +424,9 @@ class MimiOutputTrack(MediaStreamTrack):
                     self._flushed_samples / WEBRTC_SAMPLE_RATE * 1000.0, 1
                 ),
                 "outbound_underrun_events": self._underrun_events,
+                "outbound_prebuffer_ms": round(
+                    self._prebuffer_target / WEBRTC_SAMPLE_RATE * 1000.0, 1
+                ),
             }
 
 
@@ -1489,6 +1517,7 @@ class RTCSession:
                 "outbound_buffer_ms",
                 "outbound_high_water_ms",
                 "outbound_dropped_ms",
+                "outbound_prebuffer_ms",
                 "outbound_flushed_ms",
             }
             for field in integer_fields:

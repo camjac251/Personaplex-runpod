@@ -16,6 +16,10 @@ sys.path.insert(0, "moshi")
 
 from moshi.rtc_session import (  # noqa: E402
     OUTBOUND_FRAME_SAMPLES,
+    OUTBOUND_PREBUFFER_DECAY_RECVS,
+    OUTBOUND_PREBUFFER_MAX_SAMPLES,
+    OUTBOUND_PREBUFFER_MIN_SAMPLES,
+    OUTBOUND_PREBUFFER_START_SAMPLES,
     OUTBOUND_SHED_CROSSFADE_SAMPLES,
     OUTBOUND_SHED_WINDOW_SAMPLES,
     MimiOutputTrack,
@@ -214,6 +218,9 @@ def test_outbound_underrun_fades_and_reprimes() -> None:
         assert emptied[-1] == 0.0
         assert track._primed is False
         assert track._underrun_events == 1
+        assert track._prebuffer_target == (
+            OUTBOUND_PREBUFFER_START_SAMPLES + OUTBOUND_FRAME_SAMPLES
+        )
 
         # While repriming, queued-but-below-floor audio stays held.
         track._buffer = np.full(OUTBOUND_FRAME_SAMPLES, 0.5, dtype=np.float32)
@@ -228,8 +235,33 @@ def test_outbound_underrun_fades_and_reprimes() -> None:
         assert np.all(partial[400:] == 0.0)
         assert track._underrun_events == 2
         assert track._primed is False
+        assert track._prebuffer_target == (
+            OUTBOUND_PREBUFFER_START_SAMPLES + OUTBOUND_FRAME_SAMPLES * 2
+        )
 
     asyncio.run(scenario())
+
+
+def test_outbound_prebuffer_decays_after_clean_stretch() -> None:
+    track = MimiOutputTrack()
+    track._prebuffer_target = OUTBOUND_PREBUFFER_MAX_SAMPLES
+    for _ in range(OUTBOUND_PREBUFFER_DECAY_RECVS):
+        track._note_clean_recv_locked()
+    assert track._prebuffer_target == (
+        OUTBOUND_PREBUFFER_MAX_SAMPLES - OUTBOUND_FRAME_SAMPLES
+    )
+
+    # An underrun resets the clean streak before it can earn a decay.
+    track._clean_recvs = OUTBOUND_PREBUFFER_DECAY_RECVS - 1
+    track._note_underrun_locked()
+    assert track._clean_recvs == 0
+    assert track._prebuffer_target == OUTBOUND_PREBUFFER_MAX_SAMPLES
+
+    # Decay never sinks below the floor minimum.
+    track._prebuffer_target = OUTBOUND_PREBUFFER_MIN_SAMPLES
+    for _ in range(OUTBOUND_PREBUFFER_DECAY_RECVS * 2):
+        track._note_clean_recv_locked()
+    assert track._prebuffer_target == OUTBOUND_PREBUFFER_MIN_SAMPLES
 
 
 def test_outbound_shed_prefers_silence_and_crossfades() -> None:
@@ -441,6 +473,7 @@ if __name__ == "__main__":
         test_standing_inbound_backlog_is_trimmed_to_one_frame,
         test_transport_diagnostics_expose_counts_without_audio,
         test_outbound_underrun_fades_and_reprimes,
+        test_outbound_prebuffer_decays_after_clean_stretch,
         test_outbound_shed_prefers_silence_and_crossfades,
         test_outbound_diagnostics_separate_flush_from_backlog_drop,
         test_stat_envelope_only_forwards_numeric_diagnostics,
