@@ -301,17 +301,26 @@ TEMPERATURE_MIN = 0.1
 TEMPERATURE_MAX = 1.5
 TEXT_TOPK_MIN = 1
 TEXT_TOPK_MAX = 500
-AUDIO_TOPK_MIN = 1
+# k=1 is greedy acoustic sampling: a deterministic monotone drone that
+# presents as voice collapse. Keep a little diversity even at the floor.
+AUDIO_TOPK_MIN = 8
 AUDIO_TOPK_MAX = 2048
 REPETITION_PENALTY_MIN = 1.0
-REPETITION_PENALTY_MAX = 2.0
+# The CTRL-style penalty divides positive logits, so 1.5 already cuts a
+# recent token's score by a third; hotter values suppress natural
+# function words faster than they kill loops.
+REPETITION_PENALTY_MAX = 1.5
 REPETITION_PENALTY_CONTEXT_MIN = 0
 REPETITION_PENALTY_CONTEXT_MAX = 256
 PADDING_BONUS_MIN = 0.0
-PADDING_BONUS_MAX = 6.0
-# Keep the circuit breaker and its auto-rewind signal available for every
-# user-supplied configuration. LMGen still supports 0 internally so manual
-# interrupt force windows remain independently testable.
+# The bonus adds directly to the PAD logit every step, so 2.0 is already
+# a ~7x yield bias; larger values effectively mute response onset.
+PADDING_BONUS_MAX = 2.0
+# Keep the truncation circuit breaker meaningful for every user-supplied
+# configuration. Caps below the server's collapse-signal floor truncate
+# without feeding auto-rewind (see server.COLLAPSE_SIGNAL_MIN_TURN_TOKENS).
+# LMGen still supports 0 internally so manual interrupt force windows
+# remain independently testable.
 MAX_TURN_TEXT_TOKENS_MIN = 40
 MAX_TURN_TEXT_TOKENS_MAX = 2000
 SESSION_TIMEOUT_SEC_MIN = 0

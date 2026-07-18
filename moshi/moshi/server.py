@@ -488,6 +488,14 @@ LIVE_PROMPT_BOUNDARY_STREAK = 2
 # a return to normal generation. 16 frames is about 1.3 s at 12.5 Hz.
 LIVE_PROMPT_MAX_STEPS = VISION_QUEUE_MAX
 
+# Hold new context injections for this many outer frames (~2 s at
+# 12.5 Hz) after a completed user turn. The silence gate alone cannot
+# protect that window: the model is legitimately silent between the
+# user finishing and the reply starting, and a caption or persona drip
+# landing there conditions the reply on the injected text instead of
+# the user's words. An already-active drip is allowed to finish.
+POST_USER_TURN_INJECT_HOLDOFF_FRAMES = 25
+
 # Minimum wall-clock gap between persona re-assertions. Reinforcement is a
 # slow correction against long-session drift, not a per-pause event;
 # re-asserting on every silence would dominate the text channel and starve
@@ -507,6 +515,13 @@ PAD_STREAK_REREQUEST_EVERY = 62
 # are conservative; healthy sessions never get close.
 COLLAPSE_TRIGGER_THRESHOLD = 3
 COLLAPSE_WINDOW_SEC = 30.0
+# A cap trip only counts as collapse evidence when the active cap is at
+# least the shipped default. Below that, ordinary replies trip the cap on
+# every substantive answer, so the "three in thirty seconds" calibration
+# would auto-rewind healthy conversations; a lowered cap is deliberate
+# truncation tuning, not wobble. The cap itself still forces PAD at any
+# configured value.
+COLLAPSE_SIGNAL_MIN_TURN_TOKENS = 120
 
 # Cooldown between auto-rewinds. Without this, a wobbling model state
 # can re-trigger pad-force right after a restore (the snapshotted state
@@ -1263,6 +1278,9 @@ class ServerState:
         # we auto-rewind to the latest snapshot.
         self._collapse_triggers: deque[float] = deque(maxlen=16)
         self._prev_pad_force_remaining: int = 0
+        # Frames left before context injection may resume after a completed
+        # user turn; see POST_USER_TURN_INJECT_HOLDOFF_FRAMES.
+        self._post_turn_inject_holdoff: int = 0
         # Flag set by _process_audio_frame (executor thread) when the
         # model just entered a natural pad streak; a cadence task on the
         # event loop drains it and asks the client for a fresh vision
@@ -2177,6 +2195,10 @@ class ServerState:
         stop_user_turn_ended = self._update_stop_latch_user_turn_activity(
             chunk_rms
         )
+        if user_turn_ended or stop_user_turn_ended:
+            self._post_turn_inject_holdoff = POST_USER_TURN_INJECT_HOLDOFF_FRAMES
+        elif self._post_turn_inject_holdoff > 0:
+            self._post_turn_inject_holdoff -= 1
         if user_turn_started:
             # A real user turn separates valid long assistant responses. Do
             # not let max-turn cap events accumulate across conversation turns
@@ -2258,6 +2280,7 @@ class ServerState:
                 and self._vision_pending
                 and model_silent
                 and not inbound_speaking
+                and self._post_turn_inject_holdoff <= 0
                 and self._interrupt_gate_remaining <= 0
                 and not self._stop_response_latched
             ):
@@ -2295,6 +2318,7 @@ class ServerState:
                 if not self._reinforce_pending:
                     if (
                         model_silent
+                        and self._post_turn_inject_holdoff <= 0
                         and (now - self._last_reinforce_at)
                         >= REINFORCE_MIN_INTERVAL_SEC
                     ):
@@ -2453,73 +2477,11 @@ class ServerState:
 
             # --- collapse detection ----------------------------------
             # _pad_force_remaining transitions 0 -> >0 when the LM safety
-            # net (max_turn_text_tokens) kicks in. Three of those inside
-            # a short window means the model is wobbling; restore the
-            # latest snapshot in place. Cheap, runs in the lock we
-            # already hold.
+            # net (max_turn_text_tokens) kicks in. Cheap, runs in the
+            # lock we already hold.
             pad_force = self.lm_gen._pad_force_remaining
             if pad_force > 0 and self._prev_pad_force_remaining == 0:
-                now = time.monotonic()
-                self._schedule_turn_cap_event(pad_force)
-                cutoff = now - COLLAPSE_WINDOW_SEC
-                while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
-                    self._collapse_triggers.popleft()
-                # Qualifying gap: long natural turns can pulse _pad_force_remaining
-                # back-to-back without any wobble. Require >= 4 s since the prior
-                # trigger so three consecutive normal turns don't spuriously trip.
-                qualifying_gap_sec = 4.0
-                if (
-                    self._collapse_triggers
-                    and (now - self._collapse_triggers[-1]) < qualifying_gap_sec
-                ):
-                    # treat as continuation of the same turn; don't append, don't fire
-                    pass
-                else:
-                    self._collapse_triggers.append(now)
-                    if len(self._collapse_triggers) >= COLLAPSE_TRIGGER_THRESHOLD:
-                        # Cooldown: the snapshotted state itself is often the
-                        # wobbling state, so back-to-back rewinds would storm.
-                        if self._last_rewind_at is None:
-                            cooldown_left = 0.0
-                        else:
-                            cooldown_left = AUTO_REWIND_MIN_INTERVAL_SEC - (now - self._last_rewind_at)
-                        if cooldown_left > 0:
-                            logger.warning(
-                                "auto-rewind suppressed by cooldown (%.0f s remaining)",
-                                cooldown_left,
-                            )
-                            self._collapse_triggers.clear()
-                        else:
-                            sid = self._active_session_id
-                            snapshots = self._session_snapshots.get(sid, []) if sid else []
-                            rewind_snapshot = (
-                                self._recent_auto_rewind_snapshot(sid, now)
-                                if sid
-                                else None
-                            )
-                            if rewind_snapshot is not None:
-                                trigger_count = len(self._collapse_triggers)
-                                logger.warning(
-                                    "auto-rewind: %d pad-force triggers in %.0fs, "
-                                    "scheduling snapshot restore",
-                                    trigger_count,
-                                    COLLAPSE_WINDOW_SEC,
-                                )
-                                self._collapse_triggers.clear()
-                                self._schedule_auto_rewind(
-                                    rewind_snapshot, trigger_count
-                                )
-                            else:
-                                if snapshots:
-                                    snapshot_age = max(0.0, now - snapshots[-1][0])
-                                    logger.warning(
-                                        "auto-rewind skipped: latest snapshot is "
-                                        "%.0fs old (limit %.0fs)",
-                                        snapshot_age,
-                                        AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC,
-                                    )
-                                # discarding stale pre-snapshot triggers; otherwise the first usable snapshot can be torched by a single new trigger that pulls in pre-snapshot history
-                                self._collapse_triggers.clear()
+                self._note_pad_force_edge(pad_force)
             self._prev_pad_force_remaining = pad_force
 
             # --- inject window edge detection ------------------------
@@ -3019,6 +2981,7 @@ class ServerState:
         self._audio_silence_streak = 0
         self._collapse_triggers.clear()
         self._prev_pad_force_remaining = 0
+        self._post_turn_inject_holdoff = 0
         self._interrupt_gate_remaining = 0
         self._stop_response_latched = False
         self._reset_stop_latch_user_turn_activity()
@@ -3793,6 +3756,82 @@ class ServerState:
         self._reinforce_pending.clear()
         self._reinforce_pending_meta = {}
 
+    def _note_pad_force_edge(
+        self, pad_force: int, now: Optional[float] = None
+    ) -> None:
+        """Account one turn-cap firing for collapse detection.
+
+        Three qualifying trips inside COLLAPSE_WINDOW_SEC mean the model is
+        wobbling; restore the latest snapshot in place. Runs under the
+        inference lock the frame loop already holds.
+        """
+        if now is None:
+            now = time.monotonic()
+        self._schedule_turn_cap_event(pad_force)
+        if self.lm_gen.max_turn_text_tokens < COLLAPSE_SIGNAL_MIN_TURN_TOKENS:
+            # A user-lowered cap trips on ordinary replies; counting those
+            # as wobble would auto-rewind healthy conversations.
+            return
+        cutoff = now - COLLAPSE_WINDOW_SEC
+        while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
+            self._collapse_triggers.popleft()
+        # Qualifying gap: long natural turns can pulse _pad_force_remaining
+        # back-to-back without any wobble. Require >= 4 s since the prior
+        # trigger so three consecutive normal turns don't spuriously trip.
+        qualifying_gap_sec = 4.0
+        if (
+            self._collapse_triggers
+            and (now - self._collapse_triggers[-1]) < qualifying_gap_sec
+        ):
+            # treat as continuation of the same turn; don't append, don't fire
+            return
+        self._collapse_triggers.append(now)
+        if len(self._collapse_triggers) < COLLAPSE_TRIGGER_THRESHOLD:
+            return
+        # Cooldown: the snapshotted state itself is often the wobbling
+        # state, so back-to-back rewinds would storm.
+        if self._last_rewind_at is None:
+            cooldown_left = 0.0
+        else:
+            cooldown_left = AUTO_REWIND_MIN_INTERVAL_SEC - (
+                now - self._last_rewind_at
+            )
+        if cooldown_left > 0:
+            logger.warning(
+                "auto-rewind suppressed by cooldown (%.0f s remaining)",
+                cooldown_left,
+            )
+            self._collapse_triggers.clear()
+            return
+        sid = self._active_session_id
+        snapshots = self._session_snapshots.get(sid, []) if sid else []
+        rewind_snapshot = (
+            self._recent_auto_rewind_snapshot(sid, now) if sid else None
+        )
+        if rewind_snapshot is not None:
+            trigger_count = len(self._collapse_triggers)
+            logger.warning(
+                "auto-rewind: %d pad-force triggers in %.0fs, "
+                "scheduling snapshot restore",
+                trigger_count,
+                COLLAPSE_WINDOW_SEC,
+            )
+            self._collapse_triggers.clear()
+            self._schedule_auto_rewind(rewind_snapshot, trigger_count)
+        else:
+            if snapshots:
+                snapshot_age = max(0.0, now - snapshots[-1][0])
+                logger.warning(
+                    "auto-rewind skipped: latest snapshot is "
+                    "%.0fs old (limit %.0fs)",
+                    snapshot_age,
+                    AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC,
+                )
+            # discarding stale pre-snapshot triggers; otherwise the first
+            # usable snapshot can be torched by a single new trigger that
+            # pulls in pre-snapshot history
+            self._collapse_triggers.clear()
+
     def _reset_turn_cap_tracking_for_config_change(self) -> None:
         """Start a new cap accounting window without cancelling an interrupt."""
         self.lm_gen._non_pad_streak = 0
@@ -4521,6 +4560,7 @@ class ServerState:
                 # Reset collapse-detection state for the new session.
                 self._collapse_triggers.clear()
                 self._prev_pad_force_remaining = 0
+                self._post_turn_inject_holdoff = 0
                 self._vision_request_pending = False
                 self._vision_request_force = False
                 self._vision_request_reason = "cadence"
@@ -4616,6 +4656,7 @@ class ServerState:
             vision_partials: dict[str, dict] = {}
 
             async def on_message(msg: dict):
+                nonlocal client_ended
                 mtype = msg.get("type")
                 if mtype == "rewind":
                     bookmark_id = str(msg.get("id") or "")[:BOOKMARK_ID_MAX_LEN]
@@ -4904,6 +4945,11 @@ class ServerState:
                                 type(exc).__name__,
                                 exc,
                             )
+                        return
+                    if client_ended:
+                        # The client already said goodbye; a slider message
+                        # still in flight must not mutate lm_gen or log as
+                        # applied during teardown.
                         return
                     # Most sampling and anti-collapse scalars are read on
                     # every frame. Acoustic top-k is copied into the graph's
@@ -5320,7 +5366,6 @@ class ServerState:
                     # transport death, so teardown would record a resume
                     # grant and pin the snapshot clones for the full
                     # window on every normal End-session click.
-                    nonlocal client_ended
                     client_ended = True
                     clog.log("info", "client ended session")
 

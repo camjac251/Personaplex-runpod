@@ -350,6 +350,53 @@ def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     assert state._prev_pad_force_remaining == 5
 
 
+def test_cap_trips_below_default_do_not_feed_auto_rewind() -> None:
+    class _Lm:
+        max_turn_text_tokens = 40
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._collapse_triggers = deque()
+    state._schedule_turn_cap_event = lambda _frames: None
+
+    for now in (100.0, 110.0, 120.0):
+        state._note_pad_force_edge(12, now=now)
+    assert list(state._collapse_triggers) == []
+
+    state.lm_gen.max_turn_text_tokens = 120
+    state._note_pad_force_edge(12, now=130.0)
+    assert len(state._collapse_triggers) == 1
+    # Inside the qualifying gap: same-turn continuation, not new evidence.
+    state._note_pad_force_edge(12, now=132.0)
+    assert len(state._collapse_triggers) == 1
+
+
+def test_three_spaced_cap_trips_at_default_schedule_auto_rewind() -> None:
+    class _Lm:
+        max_turn_text_tokens = 120
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._collapse_triggers = deque()
+    state._schedule_turn_cap_event = lambda _frames: None
+    state._last_rewind_at = None
+    state._active_session_id = "sid"
+    state._session_snapshots = {"sid": [(0.0, {})]}
+    sentinel = {"version": 2}
+    state._recent_auto_rewind_snapshot = lambda _sid, _now: sentinel
+    scheduled: list = []
+    state._schedule_auto_rewind = lambda snap, count: scheduled.append(
+        (snap, count)
+    )
+
+    state._note_pad_force_edge(12, now=100.0)
+    state._note_pad_force_edge(12, now=105.0)
+    assert scheduled == []
+    state._note_pad_force_edge(12, now=110.0)
+    assert scheduled == [(sentinel, 3)]
+    assert list(state._collapse_triggers) == []
+
+
 def test_turn_cap_event_reports_applied_limit() -> None:
     class _Lm:
         max_turn_text_tokens = 80
@@ -487,6 +534,8 @@ if __name__ == "__main__":
         test_single_frame_noise_does_not_release_stop_latch,
         test_barge_in_carries_pre_interrupt_speech_into_stop_release,
         test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_cap_trips_below_default_do_not_feed_auto_rewind,
+        test_three_spaced_cap_trips_at_default_schedule_auto_rewind,
         test_turn_cap_event_reports_applied_limit,
         test_stop_latch_releases_only_at_a_new_turn_boundary,
         test_auto_recovery_replaces_extreme_tuning,
