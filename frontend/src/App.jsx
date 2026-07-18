@@ -157,7 +157,7 @@ const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
 const PROMPT_DEFAULTS_VERSION = "2026-07-18-adherence-guardrails-default";
-const TUNING_DEFAULTS_VERSION = "2026-07-18-tightened-expert-bounds";
+const TUNING_DEFAULTS_VERSION = "2026-07-18-text-topk-safe-floor";
 const BASE_MODEL_DEFAULTS = {
   ...DEFAULTS,
   audioTemp: 0.7,

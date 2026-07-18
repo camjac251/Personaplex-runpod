@@ -183,7 +183,9 @@ export const DEFAULTS = {
 export const INFERENCE_RANGES = {
   safe: {
     textTemp: { min: 0.3, max: 1.2, step: 0.05 },
-    textTopk: { min: 1, max: 128, step: 1, integer: true },
+    // Floor of 5 keeps near-greedy text sampling (repetitive, loop-prone)
+    // behind the Expert confirm instead of one drag away.
+    textTopk: { min: 5, max: 128, step: 1, integer: true },
     audioTemp: { min: 0.5, max: 1.15, step: 0.05 },
     audioTopk: { min: 100, max: 500, step: 1, integer: true },
     repPenalty: { min: 1, max: 1.3, step: 0.05 },
