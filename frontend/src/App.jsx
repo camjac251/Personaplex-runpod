@@ -73,6 +73,41 @@ function storedProfileId() {
   return `user_${globalThis.crypto?.randomUUID?.() || Date.now().toString(36)}`;
 }
 
+// Echo self-hearing detector thresholds. While the assistant speaks, a
+// mic envelope that tracks the assistant's own envelope this tightly for
+// this long is speaker bleed, not a person: native duplex feeds the mic
+// channel to the model raw, so bleed means the model hears itself.
+const ECHO_WINDOW_TICKS = 30; // 3 s of 100 ms level ticks
+const ECHO_CORRELATION_THRESHOLD = 0.65;
+const ECHO_SUSTAIN_TICKS = 15;
+const ECHO_NOTICE_COOLDOWN_MS = 120000;
+const ECHO_MIC_FLOOR = 0.03;
+
+function envelopeCorrelation(pairs) {
+  const n = pairs.length;
+  if (n < 2) return 0;
+  let sumMic = 0;
+  let sumAi = 0;
+  for (const [mic, ai] of pairs) {
+    sumMic += mic;
+    sumAi += ai;
+  }
+  const meanMic = sumMic / n;
+  const meanAi = sumAi / n;
+  let cov = 0;
+  let varMic = 0;
+  let varAi = 0;
+  for (const [mic, ai] of pairs) {
+    const dm = mic - meanMic;
+    const da = ai - meanAi;
+    cov += dm * da;
+    varMic += dm * dm;
+    varAi += da * da;
+  }
+  if (varMic <= 0 || varAi <= 0) return 0;
+  return cov / Math.sqrt(varMic * varAi);
+}
+
 function formatOffset(ms = 0) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -652,7 +687,10 @@ function App() {
   const heartbeatWarnedRef = useRef(false);
   const lastRewindClickRef = useRef(0);
   const lastBookmarkClickRef = useRef(0);
-  const lastInterruptClickRef = useRef(0);
+  const lastInterruptClickRef = useRef({});
+  const echoPairsRef = useRef([]);
+  const echoSustainRef = useRef(0);
+  const echoNoticeAtRef = useRef(0);
   const liveConfigPendingRef = useRef({});
   const liveConfigTimerRef = useRef(null);
   // The connect-time config payload as it was sent on channel open, so the
@@ -3555,8 +3593,10 @@ function App() {
   const interruptResponse = useCallback(
     (reason = "manual") => {
       const now = performance.now();
-      if (now - lastInterruptClickRef.current < 900) return;
-      lastInterruptClickRef.current = now;
+      // Debounce per reason: an auto barge-in must not swallow a manual
+      // Stop pressed right after it.
+      if (now - (lastInterruptClickRef.current[reason] || 0) < 900) return;
+      lastInterruptClickRef.current[reason] = now;
       if (controlRef.current?.readyState === "open") {
         controlRef.current.send(JSON.stringify({ type: "interrupt", reason }));
         pulseInterrupt();
@@ -3769,6 +3809,8 @@ function App() {
     if (phase !== "live") {
       setLevels({ mic: 0, ai: 0 });
       setSpeaking(null);
+      echoPairsRef.current = [];
+      echoSustainRef.current = 0;
       return undefined;
     }
     let overlapTicks = 0;
@@ -3778,6 +3820,39 @@ function App() {
       const micBars = Math.min(10, Math.round(mic * 10));
       const aiBars = Math.min(10, Math.round(ai * 10));
       setLevels({ mic: micBars, ai: aiBars });
+      if (aiBars > 2) {
+        const pairs = echoPairsRef.current;
+        pairs.push([mic, ai]);
+        if (pairs.length > ECHO_WINDOW_TICKS) pairs.shift();
+        let correlation = 0;
+        if (pairs.length === ECHO_WINDOW_TICKS) {
+          const meanMic = pairs.reduce((sum, [m]) => sum + m, 0) / pairs.length;
+          if (meanMic >= ECHO_MIC_FLOOR) {
+            correlation = envelopeCorrelation(pairs);
+          }
+        }
+        if (correlation >= ECHO_CORRELATION_THRESHOLD) {
+          echoSustainRef.current += 1;
+        } else {
+          echoSustainRef.current = 0;
+        }
+        if (echoSustainRef.current >= ECHO_SUSTAIN_TICKS) {
+          echoSustainRef.current = 0;
+          echoPairsRef.current = [];
+          const nowMs = performance.now();
+          if (nowMs - echoNoticeAtRef.current >= ECHO_NOTICE_COOLDOWN_MS) {
+            echoNoticeAtRef.current = nowMs;
+            recordTrace("audio.echo_suspected", {
+              correlation: Number(correlation.toFixed(2)),
+            });
+            addNotice(
+              "warn",
+              "Echo suspected: the model may be hearing its own voice. Use headphones or keep echo cancellation on.",
+              "echo",
+            );
+          }
+        }
+      }
       if (micBars > 2 && aiBars > 2) {
         overlapTicks += 1;
         setSpeaking("both");
@@ -3798,7 +3873,7 @@ function App() {
       }
     }, 100);
     return () => clearInterval(id);
-  }, [interruptResponse, phase, turnHandling, visionInjecting]);
+  }, [addNotice, interruptResponse, phase, recordTrace, turnHandling, visionInjecting]);
 
   // Record a user turn from the local speaking transition: the mic channel
   // registered speech, then the assistant resumed. This is the only honest
