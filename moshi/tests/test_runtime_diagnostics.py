@@ -353,6 +353,15 @@ def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     assert state._prev_pad_force_remaining == 5
 
 
+def test_semantic_cap_wire_default_matches_model_constant() -> None:
+    # rtc_session hardcodes the wire default to stay torch-free; keep it in
+    # lockstep with the model-side constant.
+    from moshi.models.lm import DEFAULT_SEMANTIC_TEMPERATURE_CAP
+    from moshi.rtc_session import SessionConfig
+
+    assert SessionConfig().semantic_temp_cap == DEFAULT_SEMANTIC_TEMPERATURE_CAP
+
+
 def test_context_seal_token_derivation_prefers_plain_period() -> None:
     class _Tok:
         def unk_id(self) -> int:
@@ -610,6 +619,7 @@ if __name__ == "__main__":
         test_single_frame_noise_does_not_release_stop_latch,
         test_barge_in_carries_pre_interrupt_speech_into_stop_release,
         test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_semantic_cap_wire_default_matches_model_constant,
         test_context_seal_token_derivation_prefers_plain_period,
         test_stop_latch_hold_ceiling_releases_a_starved_latch,
         test_outbound_gate_fades_at_mute_boundaries,

@@ -681,6 +681,10 @@ class SessionConfig:
     # Adaptive text truncation relative to the step's best candidate; 0
     # (default) disables it and leaves top-k as the sole truncation.
     text_min_p: float = 0.0
+    # Ceiling for the semantic codebook's sampling temperature. Keep the
+    # default in lockstep with models.lm.DEFAULT_SEMANTIC_TEMPERATURE_CAP
+    # (not imported here so this transport module stays torch-free).
+    semantic_temp_cap: float = 0.7
     audio_topk: int = 250
     repetition_penalty: float = 1.0
     repetition_penalty_context: int = 64
@@ -749,6 +753,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
         text_topk=clamp_text_topk(payload.get("text_topk", defaults.text_topk)),
         text_min_p=clamp_text_min_p(
             payload.get("text_min_p", defaults.text_min_p)
+        ),
+        semantic_temp_cap=clamp_temperature(
+            payload.get("semantic_temp_cap", defaults.semantic_temp_cap)
         ),
         audio_topk=clamp_audio_topk(payload.get("audio_topk", defaults.audio_topk)),
         repetition_penalty=clamp_repetition_penalty(

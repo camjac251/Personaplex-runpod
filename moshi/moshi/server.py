@@ -564,6 +564,7 @@ AUTO_RECOVERY_CONFIG_KEYS = (
     "padding_bonus",
     "max_turn_text_tokens",
     "text_min_p",
+    "semantic_temp_cap",
 )
 
 # Fail-safe ceiling on how long the Stop latch may hold the assistant
@@ -1694,6 +1695,9 @@ class ServerState:
             audio_top_k = min(
                 max(1, cfg.audio_topk), self.lm_gen.lm_model.card
             )
+            # Set the cap before the sampling write so the per-level
+            # temperature vector is built against the session's value.
+            self.lm_gen.semantic_temperature_cap = cfg.semantic_temp_cap
             audio_top_k_changed = self.lm_gen.set_audio_sampling(
                 cfg.audio_temperature, audio_top_k
             )
@@ -3736,6 +3740,7 @@ class ServerState:
             ),
             "padding_bonus": float(self.lm_gen.padding_bonus),
             "text_min_p": float(self.lm_gen.min_p_text),
+            "semantic_temp_cap": float(self.lm_gen.semantic_temperature_cap),
             "max_turn_text_tokens": int(self.lm_gen.max_turn_text_tokens),
             "inject_silence_rms": float(self._inject_silence_rms),
             "inject_silence_streak": int(self._inject_silence_streak),
@@ -4005,6 +4010,7 @@ class ServerState:
         is_base = self.model_identity.get("model_variant") == "base"
         self.lm_gen.temp_text = 0.7
         self.lm_gen.top_k_text = min(25, self.lm_gen.lm_model.text_card)
+        self.lm_gen.semantic_temperature_cap = DEFAULT_SEMANTIC_TEMPERATURE_CAP
         self.lm_gen.set_audio_sampling(
             0.7 if is_base else 0.8,
             min(250, self.lm_gen.lm_model.card),
@@ -5085,6 +5091,7 @@ class ServerState:
                         "repetition_penalty_context",
                         "padding_bonus",
                         "text_min_p",
+                        "semantic_temp_cap",
                         "max_turn_text_tokens",
                         "vision_cost_limit_usd",
                         "vision_in_transcript",
@@ -5100,6 +5107,7 @@ class ServerState:
                     updates: dict = {}
                     audio_temperature: Optional[float] = None
                     audio_top_k: Optional[int] = None
+                    semantic_temp_cap: Optional[float] = None
                     vision_cost_limit: Optional[float] = None
                     vision_feed_model: Optional[bool] = None
                     vision_ground_user_turns: Optional[bool] = None
@@ -5113,6 +5121,10 @@ class ServerState:
                         if "audio_temperature" in msg:
                             audio_temperature = clamp_temperature(
                                 msg["audio_temperature"]
+                            )
+                        if "semantic_temp_cap" in msg:
+                            semantic_temp_cap = clamp_temperature(
+                                msg["semantic_temp_cap"]
                             )
                         if "text_topk" in msg:
                             updates["top_k_text"] = min(
@@ -5254,7 +5266,12 @@ class ServerState:
                     if not applied:
                         return
 
-                    if updates or audio_temperature is not None or audio_top_k is not None:
+                    if (
+                        updates
+                        or audio_temperature is not None
+                        or audio_top_k is not None
+                        or semantic_temp_cap is not None
+                    ):
                         def _apply_live_config():
                             # Mutate scalars under the inference lock so the
                             # assignment cannot tear a concurrent step() read
@@ -5264,9 +5281,16 @@ class ServerState:
                                     return
                                 if "max_turn_text_tokens" in updates:
                                     self._reset_turn_cap_tracking_for_config_change()
+                                if semantic_temp_cap is not None:
+                                    # Assign before the sampling write so the
+                                    # refreshed vector uses the new cap.
+                                    self.lm_gen.semantic_temperature_cap = (
+                                        semantic_temp_cap
+                                    )
                                 if (
                                     audio_temperature is not None
                                     or audio_top_k is not None
+                                    or semantic_temp_cap is not None
                                 ):
                                     self.lm_gen.set_audio_sampling(
                                         audio_temperature

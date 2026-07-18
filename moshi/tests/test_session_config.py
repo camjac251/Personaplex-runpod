@@ -106,6 +106,7 @@ def test_defaults_match_stable_conversation_tuning() -> None:
     assert defaults.text_temperature == 0.7
     assert defaults.text_topk == 25
     assert defaults.text_min_p == 0.0
+    assert defaults.semantic_temp_cap == 0.7
     assert defaults.audio_temperature == 0.8
     assert defaults.audio_topk == 250
     assert defaults.repetition_penalty == 1.0
@@ -171,6 +172,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
         {
             "audio_temperature": 0,
             "text_temperature": 99,
+            "semantic_temp_cap": 99,
             "text_topk": -4,
             "audio_topk": 9999,
             "repetition_penalty": -3,
@@ -187,6 +189,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
     )
     assert cfg.audio_temperature == TEMPERATURE_MIN
     assert cfg.text_temperature == TEMPERATURE_MAX
+    assert cfg.semantic_temp_cap == TEMPERATURE_MAX
     assert cfg.text_topk == TEXT_TOPK_MIN
     assert cfg.audio_topk == AUDIO_TOPK_MAX
     assert cfg.repetition_penalty == REPETITION_PENALTY_MIN
@@ -210,6 +213,7 @@ def test_parse_session_config_rejects_non_finite_values() -> None:
         "repetition_penalty",
         "padding_bonus",
         "text_min_p",
+        "semantic_temp_cap",
         "vision_cost_limit_usd",
         "vision_cost_per_call_usd",
         "inject_silence_rms",
@@ -259,6 +263,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
             "seed": SEED_RANDOM,
             "text_topk": "64",
             "text_min_p": "0.08",
+            "semantic_temp_cap": "0.85",
             "audio_topk": "420",
             "repetition_penalty": "1.08",
             "repetition_penalty_context": "128",
@@ -275,6 +280,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.seed == SEED_RANDOM
     assert cfg.text_topk == 64
     assert cfg.text_min_p == 0.08
+    assert cfg.semantic_temp_cap == 0.85
     assert cfg.audio_topk == 420
     assert cfg.repetition_penalty == 1.08
     assert cfg.repetition_penalty_context == 128

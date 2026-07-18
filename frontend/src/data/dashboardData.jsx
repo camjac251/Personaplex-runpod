@@ -164,8 +164,10 @@ export const EXPRESSION_MODES = [
 export const DEFAULTS = {
   textTemp: 0.7,
   textTopk: 25,
+  textMinP: 0,
   audioTemp: 0.8,
   audioTopk: 250,
+  semanticTempCap: 0.7,
   repPenalty: 1.0,
   repContext: 64,
   padBonus: 0,
@@ -189,8 +191,10 @@ export const INFERENCE_RANGES = {
     // Floor of 5 keeps near-greedy text sampling (repetitive, loop-prone)
     // behind the Expert confirm instead of one drag away.
     textTopk: { min: 5, max: 128, step: 1, integer: true },
+    textMinP: { min: 0, max: 0.3, step: 0.01 },
     audioTemp: { min: 0.5, max: 1.15, step: 0.05 },
     audioTopk: { min: 100, max: 500, step: 1, integer: true },
+    semanticTempCap: { min: 0.5, max: 0.8, step: 0.05 },
     repPenalty: { min: 1, max: 1.3, step: 0.05 },
     repContext: { min: 0, max: 128, step: 8, integer: true },
     padBonus: { min: 0, max: 1, step: 0.1 },
@@ -201,8 +205,10 @@ export const INFERENCE_RANGES = {
   expert: {
     textTemp: { min: 0.1, max: 1.5, step: 0.05 },
     textTopk: { min: 1, max: 500, step: 1, integer: true },
+    textMinP: { min: 0, max: 0.5, step: 0.01 },
     audioTemp: { min: 0.1, max: 1.5, step: 0.05 },
     audioTopk: { min: 8, max: 2048, step: 1, integer: true },
+    semanticTempCap: { min: 0.1, max: 1.5, step: 0.05 },
     repPenalty: { min: 1, max: 1.5, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
     padBonus: { min: 0, max: 2, step: 0.1 },
@@ -371,6 +377,18 @@ export const PARAM_INFO = {
       </>
     ),
   },
+  txtMinP: {
+    title: "Text min-p",
+    body: (
+      <>
+        Adaptive truncation: keeps only text tokens whose probability is at
+        least this fraction of the step's best candidate, so the pool
+        tightens when the model is confident and widens when it is not.
+        <b> 0</b> (default) disables it and leaves top-k as the sole
+        truncation; <b>0.05 to 0.1</b> is a typical starting range.
+      </>
+    ),
+  },
   audTemp: {
     title: "Audio temperature",
     body: (
@@ -387,6 +405,18 @@ export const PARAM_INFO = {
       <>
         Number of audio-token candidates considered per step. The codebook is
         large, so <b>250</b> is a balanced default.
+      </>
+    ),
+  },
+  semCap: {
+    title: "Semantic temperature cap",
+    body: (
+      <>
+        Ceiling for the first codebook, which decides <i>what</i> the audio
+        says; the other levels carry prosody and follow the audio
+        temperature directly. Default <b>0.7</b> keeps content stable while
+        hot audio settings stay expressive. Set it at or above the audio
+        temperature to restore uniform sampling.
       </>
     ),
   },
