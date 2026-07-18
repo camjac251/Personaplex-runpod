@@ -56,10 +56,16 @@ OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 # a frame or more means a stall left residue behind. 25 calls ~= 500 ms
 # spans several 80 ms production lumps plus jitter.
 OUTBOUND_STANDING_BACKLOG_WINDOW = 25
-# Resampling can make a nominal 20 ms residue a few dozen samples short of a
-# full RTP frame. Treat a persistent half-frame floor as standing latency;
-# healthy production still reaches zero during each 80 ms sawtooth.
-OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES // 2
+# Treat a persistent one-frame floor as standing latency; healthy
+# production still reaches zero during each 80 ms sawtooth, while a
+# smaller residue is not worth cutting audio over.
+OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES
+# Silence-preferring shed: when standing latency must be cut, remove
+# near-silent 10 ms stretches first (inaudible), and crossfade any forced
+# cut of live audio over 5 ms so the splice never lands as a click.
+OUTBOUND_SHED_SILENCE_RMS = 0.004
+OUTBOUND_SHED_WINDOW_SAMPLES = WEBRTC_SAMPLE_RATE // 100
+OUTBOUND_SHED_CROSSFADE_SAMPLES = WEBRTC_SAMPLE_RATE // 200
 CONTROL_TASK_MAX = 128
 
 
@@ -183,12 +189,12 @@ class MimiOutputTrack(MediaStreamTrack):
             self._buffer_high_water = max(
                 self._buffer_high_water, self._buffer.size
             )
-            # Sanity cap: if recv() falls way behind, drop oldest.
+            # Sanity cap: if recv() falls way behind, shed the excess.
             if self._buffer.size > OUTBOUND_BUFFER_CAP_SAMPLES:
-                dropped = self._buffer.size - OUTBOUND_BUFFER_CAP_SAMPLES
-                self._buffer = self._buffer[-OUTBOUND_BUFFER_CAP_SAMPLES:]
                 self._drop_events += 1
-                self._dropped_samples += dropped
+                self._shed_buffer_locked(
+                    self._buffer.size - OUTBOUND_BUFFER_CAP_SAMPLES
+                )
 
     async def clear_buffer(self) -> None:
         """Drop queued assistant audio immediately."""
@@ -203,6 +209,53 @@ class MimiOutputTrack(MediaStreamTrack):
             self._resampler = AudioResampler(
                 format="s16", layout="mono", rate=WEBRTC_SAMPLE_RATE
             )
+
+    def _shed_buffer_locked(self, drop: int) -> None:
+        """Remove ``drop`` samples of standing latency, quietest first.
+
+        Whole near-silent 10 ms windows go first (oldest first), which is
+        inaudible; any remainder is cut from the oldest audio with a 5 ms
+        crossfade so the splice never lands as a click. Callers hold the
+        buffer lock and count the drop event themselves.
+        """
+        buf = self._buffer
+        drop = min(int(drop), buf.size)
+        if drop <= 0:
+            return
+        removed = 0
+        window = OUTBOUND_SHED_WINDOW_SAMPLES
+        n_windows = buf.size // window
+        budget = drop // window
+        if n_windows and budget:
+            windows = buf[: n_windows * window].reshape(n_windows, window)
+            rms = np.sqrt(np.mean(np.square(windows), axis=1))
+            quiet = np.nonzero(rms < OUTBOUND_SHED_SILENCE_RMS)[0][:budget]
+            if quiet.size:
+                keep = np.ones(n_windows, dtype=bool)
+                keep[quiet] = False
+                buf = np.concatenate(
+                    [windows[keep].reshape(-1), buf[n_windows * window:]]
+                )
+                removed = int(quiet.size) * window
+        remainder = drop - removed
+        if remainder > 0:
+            fade = min(
+                OUTBOUND_SHED_CROSSFADE_SAMPLES,
+                remainder,
+                buf.size - remainder,
+            )
+            if fade > 0:
+                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                splice = (
+                    buf[remainder - fade:remainder] * (1.0 - ramp)
+                    + buf[remainder:remainder + fade] * ramp
+                )
+                buf = np.concatenate([splice, buf[remainder + fade:]])
+            else:
+                buf = buf[remainder:]
+            removed += remainder
+        self._buffer = buf
+        self._dropped_samples += removed
 
     async def _pop_chunk(self) -> np.ndarray:
         async with self._buffer_lock:
@@ -252,13 +305,12 @@ class MimiOutputTrack(MediaStreamTrack):
                 target = (
                     OUTBOUND_FRAME_SAMPLES * 4
                     if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES
-                    else OUTBOUND_FRAME_SAMPLES
+                    else OUTBOUND_FRAME_SAMPLES * 2
                 )
                 drop = max(0, backlog - target)
                 if drop > 0:
-                    self._buffer = self._buffer[drop:]
                     self._drop_events += 1
-                    self._dropped_samples += drop
+                    self._shed_buffer_locked(drop)
                     self._backlog_window.clear()
                     self._backlog_window.append(self._buffer.size)
         if delay > 0:

@@ -14,7 +14,12 @@ import numpy as np
 
 sys.path.insert(0, "moshi")
 
-from moshi.rtc_session import MimiOutputTrack, RTCSession  # noqa: E402
+from moshi.rtc_session import (  # noqa: E402
+    OUTBOUND_SHED_CROSSFADE_SAMPLES,
+    OUTBOUND_SHED_WINDOW_SAMPLES,
+    MimiOutputTrack,
+    RTCSession,
+)
 from moshi.server import ServerState  # noqa: E402
 
 
@@ -181,6 +186,41 @@ async def test_transport_diagnostics_expose_counts_without_audio() -> None:
         "outbound_buffer_ms": 20.0,
         "outbound_drop_events": 2,
     }
+
+
+def test_outbound_shed_prefers_silence_and_crossfades() -> None:
+    window = OUTBOUND_SHED_WINDOW_SAMPLES
+    track = MimiOutputTrack()
+    speech_a = (
+        np.sin(np.linspace(0.0, 40.0 * np.pi, window * 4)) * 0.3
+    ).astype(np.float32)
+    silence = np.zeros(window * 4, dtype=np.float32)
+    speech_b = (
+        np.cos(np.linspace(0.0, 40.0 * np.pi, window * 4)) * 0.3
+    ).astype(np.float32)
+    track._buffer = np.concatenate([speech_a, silence, speech_b])
+
+    track._shed_buffer_locked(silence.size)
+
+    # The silent span absorbed the whole cut; speech survived untouched.
+    assert track._buffer.size == speech_a.size + speech_b.size
+    assert np.allclose(track._buffer[: speech_a.size], speech_a)
+    assert np.allclose(track._buffer[speech_a.size:], speech_b)
+    assert track._dropped_samples == silence.size
+
+    # An all-speech buffer is cut with a crossfade, never a hard splice.
+    loud = (
+        np.sin(np.linspace(0.0, 200.0 * np.pi, window * 8)) * 0.5
+    ).astype(np.float32)
+    track._buffer = loud.copy()
+    track._dropped_samples = 0
+    track._shed_buffer_locked(window * 2)
+    assert track._buffer.size == loud.size - window * 2
+    assert track._dropped_samples == window * 2
+    natural_step = float(np.max(np.abs(np.diff(loud))))
+    splice_region = track._buffer[: OUTBOUND_SHED_CROSSFADE_SAMPLES * 2]
+    splice_step = float(np.max(np.abs(np.diff(splice_region))))
+    assert splice_step <= natural_step * 2.0, (splice_step, natural_step)
 
 
 async def test_outbound_diagnostics_separate_flush_from_backlog_drop() -> None:
@@ -356,6 +396,7 @@ if __name__ == "__main__":
         test_stop_processing_freezes_and_drains_in_flight_model_work,
         test_standing_inbound_backlog_is_trimmed_to_one_frame,
         test_transport_diagnostics_expose_counts_without_audio,
+        test_outbound_shed_prefers_silence_and_crossfades,
         test_outbound_diagnostics_separate_flush_from_backlog_drop,
         test_stat_envelope_only_forwards_numeric_diagnostics,
         test_control_commands_preserve_wire_order,
