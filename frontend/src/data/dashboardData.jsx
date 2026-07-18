@@ -372,8 +372,12 @@ export const PARAM_INFO = {
     title: "Text top-k",
     body: (
       <>
-        Number of text candidates considered per step. Lower values make replies
-        more predictable. <b>25</b> is the server default.
+        How many of the text vocabulary's most likely tokens may be sampled
+        for each inner-monologue word piece. Small pools make phrasing
+        predictable and, at the extreme, loop-prone; large pools admit
+        unlikely words and drift. <b>25</b> is the server default. Text
+        temperature sets how adventurously the pool is sampled, Min-p trims
+        it adaptively; this fixes its maximum size.
       </>
     ),
   },
@@ -405,8 +409,13 @@ export const PARAM_INFO = {
     title: "Audio top-k",
     body: (
       <>
-        Number of audio-token candidates considered per step. The codebook is
-        large, so <b>250</b> is a balanced default.
+        How many of the <b>2048</b> codebook entries may be sampled for each
+        audio token (8 tokens per 80 ms frame). Small pools flatten the voice
+        toward a monotone; large pools admit the noisy tail of the
+        distribution, and <b>2048</b> disables truncation entirely, which
+        reads as crackle. <b>250</b> keeps the plausible core. Audio
+        temperature sets how adventurously the pool is sampled; this sets the
+        pool.
       </>
     ),
   },
