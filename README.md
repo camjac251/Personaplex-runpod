@@ -80,12 +80,12 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
-| `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `1` by default: 60 s snapshot refreshes for long-session auto-rewind; set `0` to disable |
+| `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
 | `WEBRTC_STUN_URLS` | Optional comma-separated STUN URLs for NAT'd hosts; empty means fully direct |
 
 The launcher defaults to the pinned Seamless RL checkpoint. Set `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint. Both aliases select a matching immutable revision automatically, so restarting an unchanged environment cannot silently pick up different assets. A custom `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`.
 
-Periodic full-state snapshots are on by default. Each fresh session keeps one baseline snapshot for manual Rewind, and explicit bookmarks capture on demand; the periodic refresh additionally powers long-session auto-rewind. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=0` if you prefer only the session-start baseline (for example on a GPU where the once-per-minute snapshot copy is too costly).
+Periodic full-state snapshots are off by default: each fresh session keeps one baseline snapshot for manual Rewind, and explicit bookmarks capture on demand. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=1` to refresh a snapshot every 60 s, which keeps manual Rewind recent and powers long-session auto-rewind (each capture is a ~1.6 GB in-VRAM copy, usually inside one 80 ms frame on a modern GPU).
 
 ## Profiles and diagnostics
 

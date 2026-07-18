@@ -51,15 +51,16 @@ def _bare_diagnostics_state() -> ServerState:
     return state
 
 
-def test_periodic_snapshots_default_on() -> None:
-    # Auto-rewind only accepts snapshots younger than 90 s, so the 60 s
-    # periodic capture must be on by default or the collapse safety net is
-    # inert past the first minutes of every session (capture measures ~3 ms).
+def test_periodic_snapshots_default_off() -> None:
+    # Deliberate minimal-scaffolding default: sessions keep only the
+    # baseline snapshot and explicit bookmarks unless the operator opts
+    # into the 60 s refresh, accepting that auto-rewind goes inert once
+    # the baseline exceeds its 90 s freshness limit.
     parameter = inspect.signature(ServerState.__init__).parameters.get(
         "periodic_snapshots"
     )
     assert parameter is not None
-    assert parameter.default is True
+    assert parameter.default is False
 
 
 def test_model_identity_distinguishes_rl_base_and_custom() -> None:
@@ -593,7 +594,7 @@ def test_clearing_resume_grant_cancels_snapshot_retaining_timer() -> None:
 
 if __name__ == "__main__":
     tests = [
-        test_periodic_snapshots_default_on,
+        test_periodic_snapshots_default_off,
         test_model_identity_distinguishes_rl_base_and_custom,
         test_server_info_reports_active_vision_model,
         test_random_seed_resolves_to_a_replayable_value,

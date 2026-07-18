@@ -1128,7 +1128,7 @@ class ServerState:
                  recordings_dir: str | None = None,
                  preview_cache_dir: str | None = None,
                  asr: "Optional[_AsrEngine]" = None,
-                 periodic_snapshots: bool = True,
+                 periodic_snapshots: bool = False,
                  model_repo: str = RL_HF_REPO,
                  model_revision: str | None = RL_HF_REVISION,
                  save_voice_prompt_embeddings: bool = False):
@@ -6287,15 +6287,16 @@ def main():
     parser.add_argument(
         "--periodic-snapshots",
         action=argparse.BooleanOptionalAction,
-        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", True),
+        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", False),
         help=(
             "Clone live model state once per minute so auto-rewind and manual "
             "Rewind restore a recent state instead of the session-start "
-            "baseline. The first ~1.6 GB snapshot allocation occurs before "
-            "the session becomes ready; later captures usually fit inside "
-            "one 80 ms frame on a modern GPU. "
-            "--no-periodic-snapshots disables the once-per-minute refresh; "
-            "the session-start baseline and explicit bookmarks remain."
+            "baseline. Off by default: the session keeps only the baseline "
+            "and explicit bookmarks, and auto-rewind can fire only while the "
+            "baseline is younger than its 90 s freshness limit. The first "
+            "~1.6 GB snapshot allocation occurs before the session becomes "
+            "ready; later captures usually fit inside one 80 ms frame on a "
+            "modern GPU."
         ),
     )
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')
