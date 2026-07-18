@@ -156,8 +156,8 @@ function completedTransportLeg(base, leg) {
 const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
-const PROMPT_DEFAULTS_VERSION = "2026-07-13-second-person-vision-context";
-const TUNING_DEFAULTS_VERSION = "2026-07-12-rl-native-duplex";
+const PROMPT_DEFAULTS_VERSION = "2026-07-18-adherence-guardrails-default";
+const TUNING_DEFAULTS_VERSION = "2026-07-18-tightened-expert-bounds";
 const BASE_MODEL_DEFAULTS = {
   ...DEFAULTS,
   audioTemp: 0.7,
@@ -476,8 +476,10 @@ function App() {
   // Holds at most one at a time, so starting a new preview supersedes any
   // in-flight one. Drives the row's play/stop glyph and waveform recolor.
   const [previewing, setPreviewing] = useState(null);
-  const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "none");
-  const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "none");
+  // Guardrail directives default on: a bare persona with no adherence or
+  // expression instruction wanders and monologues on a full-duplex model.
+  const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "balanced");
+  const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "natural");
   const [turnHandling, setTurnHandling] = useStoredState(
     "pp_turnHandling",
     DEFAULTS.turnHandling,
@@ -762,9 +764,18 @@ function App() {
     if (matchesReplacedDefault(visionPrompt, REPLACED_DEFAULT_VISION_PROMPTS)) {
       setVisionPrompt(DEFAULT_VISION_PROMPT);
     }
+    // "none" was the shipped default for both directives; carry it forward
+    // to the guardrail defaults. A mode re-selected after this migration
+    // sticks because the stored version then matches.
+    if (adherenceMode === "none") setAdherenceMode("balanced");
+    if (expressionMode === "none") setExpressionMode("natural");
     setPromptDefaultsVersion(PROMPT_DEFAULTS_VERSION);
   }, [
+    adherenceMode,
+    expressionMode,
     promptDefaultsVersion,
+    setAdherenceMode,
+    setExpressionMode,
     setPromptDefaultsVersion,
     setTextPrompt,
     setVisionPrompt,
@@ -944,7 +955,17 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [setTurnHandling]);
+  }, [
+    setAudioTemp,
+    setAudioTopk,
+    setMaxTurn,
+    setPadBonus,
+    setRepContext,
+    setRepPenalty,
+    setTextTemp,
+    setTextTopk,
+    setTurnHandling,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1351,14 +1372,16 @@ function App() {
       vision_feed_model: !!visionFeedModel,
       vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
       reinforce_in_silences: !!reinforceInSilences,
-      audio_temperature: Number(audioTemp),
-      text_temperature: Number(textTemp),
-      text_topk: Number.parseInt(textTopk, 10),
-      audio_topk: Number.parseInt(audioTopk, 10),
-      repetition_penalty: Number(repPenalty),
-      repetition_penalty_context: Number.parseInt(repContext, 10),
-      padding_bonus: Number(padBonus),
-      max_turn_text_tokens: Number.parseInt(maxTurn, 10),
+      // Clamp to the active range mode so a stale stored extreme can never
+      // ride into a fresh session unless Expert is deliberately active.
+      audio_temperature: clampInferenceValue("audioTemp", audioTemp, DEFAULTS.audioTemp, tuningRangeMode),
+      text_temperature: clampInferenceValue("textTemp", textTemp, DEFAULTS.textTemp, tuningRangeMode),
+      text_topk: clampInferenceValue("textTopk", textTopk, DEFAULTS.textTopk, tuningRangeMode),
+      audio_topk: clampInferenceValue("audioTopk", audioTopk, DEFAULTS.audioTopk, tuningRangeMode),
+      repetition_penalty: clampInferenceValue("repPenalty", repPenalty, DEFAULTS.repPenalty, tuningRangeMode),
+      repetition_penalty_context: clampInferenceValue("repContext", repContext, DEFAULTS.repContext, tuningRangeMode),
+      padding_bonus: clampInferenceValue("padBonus", padBonus, DEFAULTS.padBonus, tuningRangeMode),
+      max_turn_text_tokens: clampInferenceValue("maxTurn", maxTurn, DEFAULTS.maxTurn, tuningRangeMode),
       seed: seedRandom ? -1 : Number.parseInt(seed, 10),
       session_timeout_sec: Number(idleTimeout) > 0 ? Number(idleTimeout) * 60 : 0,
       vision_cost_limit_usd: Number(visionCostLimitUsd) || 0,
@@ -1388,6 +1411,7 @@ function App() {
     repContext,
     padBonus,
     maxTurn,
+    tuningRangeMode,
     seedRandom,
     seed,
     idleTimeout,
@@ -3383,6 +3407,35 @@ function App() {
     }, 150);
   }, [isLive, recordTrace]);
 
+  // Commit-time guard for the tuning sliders. A native range input
+  // teleports to a track click or Home/End press, so one interaction in
+  // Expert mode can land on a degenerate extreme; confirm the first commit
+  // that leaves the safe band within a single interaction and revert to
+  // the interaction's start value on decline.
+  const guardedTuningCommit = useCallback(
+    (key, setter, buildFields) => (value, interactionStart) => {
+      const safe = INFERENCE_RANGES.safe[key];
+      if (safe) {
+        const outside = value < safe.min || value > safe.max;
+        const startedInside =
+          interactionStart != null
+          && interactionStart >= safe.min
+          && interactionStart <= safe.max;
+        if (outside && startedInside) {
+          const ok = window.confirm(
+            `Apply ${value}? It is outside the safe range (${safe.min} to ${safe.max}) and can destabilize the conversation.`,
+          );
+          if (!ok) {
+            setter(interactionStart);
+            return;
+          }
+        }
+      }
+      sendLiveConfig(buildFields(value));
+    },
+    [sendLiveConfig],
+  );
+
   const selectTuningRangeMode = useCallback((mode) => {
     if (mode === "expert") {
       setTuningRangeMode("expert");
@@ -5241,24 +5294,24 @@ function App() {
                 </div>
                 <div className="rail">
                   <RailColumn title="TEXT" aggregate={`t ${fmt(textTemp, 2)} · k ${textTopk}`}>
-                    <MiniSlider label="Temperature" info="txtTemp" value={textTemp} onChange={(value) => { setTextTemp(value); setSessionProfileId("custom"); sendLiveConfig({ text_temperature: Number(value) }); }} min={tuningRanges.textTemp.min} max={tuningRanges.textTemp.max} step={tuningRanges.textTemp.step} format={(v) => fmt(v, 2)} />
-                    <MiniSlider label="Top-k" info="txtTopK" value={textTopk} onChange={(value) => { setTextTopk(value); setSessionProfileId("custom"); sendLiveConfig({ text_topk: Number.parseInt(value, 10) }); }} min={tuningRanges.textTopk.min} max={tuningRanges.textTopk.max} step={tuningRanges.textTopk.step} format={(v) => fmt(v, 0)} />
+                    <MiniSlider label="Temperature" info="txtTemp" value={textTemp} onChange={(value) => { setTextTemp(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("textTemp", setTextTemp, (v) => ({ text_temperature: Number(v) }))} min={tuningRanges.textTemp.min} max={tuningRanges.textTemp.max} step={tuningRanges.textTemp.step} format={(v) => fmt(v, 2)} />
+                    <MiniSlider label="Top-k" info="txtTopK" value={textTopk} onChange={(value) => { setTextTopk(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("textTopk", setTextTopk, (v) => ({ text_topk: Number.parseInt(v, 10) }))} min={tuningRanges.textTopk.min} max={tuningRanges.textTopk.max} step={tuningRanges.textTopk.step} format={(v) => fmt(v, 0)} />
                   </RailColumn>
                   <RailColumn title="AUDIO" aggregate={`t ${fmt(audioTemp, 2)} · k ${audioTopk}`}>
-                    <MiniSlider label="Temperature" info="audTemp" value={audioTemp} onChange={(value) => { setAudioTemp(value); setSessionProfileId("custom"); sendLiveConfig({ audio_temperature: Number(value) }); }} min={tuningRanges.audioTemp.min} max={tuningRanges.audioTemp.max} step={tuningRanges.audioTemp.step} format={(v) => fmt(v, 2)} />
-                    <MiniSlider label="Top-k" info="audTopK" value={audioTopk} onChange={(value) => { setAudioTopk(value); setSessionProfileId("custom"); }} onCommit={(value) => sendLiveConfig({ audio_topk: Number.parseInt(value, 10) })} min={tuningRanges.audioTopk.min} max={tuningRanges.audioTopk.max} step={tuningRanges.audioTopk.step} format={(v) => fmt(v, 0)} />
+                    <MiniSlider label="Temperature" info="audTemp" value={audioTemp} onChange={(value) => { setAudioTemp(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("audioTemp", setAudioTemp, (v) => ({ audio_temperature: Number(v) }))} min={tuningRanges.audioTemp.min} max={tuningRanges.audioTemp.max} step={tuningRanges.audioTemp.step} format={(v) => fmt(v, 2)} />
+                    <MiniSlider label="Top-k" info="audTopK" value={audioTopk} onChange={(value) => { setAudioTopk(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("audioTopk", setAudioTopk, (v) => ({ audio_topk: Number.parseInt(v, 10) }))} min={tuningRanges.audioTopk.min} max={tuningRanges.audioTopk.max} step={tuningRanges.audioTopk.step} format={(v) => fmt(v, 0)} />
                   </RailColumn>
                   <RailColumn title="REPETITION" aggregate={`${fmt(repPenalty, 2)} · ${repContext} tok`}>
-                    <MiniSlider label="Penalty" info="repPen" value={repPenalty} onChange={(value) => { setRepPenalty(value); setSessionProfileId("custom"); sendLiveConfig({ repetition_penalty: Number(value) }); }} min={tuningRanges.repPenalty.min} max={tuningRanges.repPenalty.max} step={tuningRanges.repPenalty.step} format={(v) => fmt(v, 2)} />
-                    <MiniSlider label="Context" info="repCtx" value={repContext} onChange={(value) => { setRepContext(value); setSessionProfileId("custom"); sendLiveConfig({ repetition_penalty_context: Number.parseInt(value, 10) }); }} min={tuningRanges.repContext.min} max={tuningRanges.repContext.max} step={tuningRanges.repContext.step} format={(v) => fmt(v, 0)} />
+                    <MiniSlider label="Penalty" info="repPen" value={repPenalty} onChange={(value) => { setRepPenalty(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("repPenalty", setRepPenalty, (v) => ({ repetition_penalty: Number(v) }))} min={tuningRanges.repPenalty.min} max={tuningRanges.repPenalty.max} step={tuningRanges.repPenalty.step} format={(v) => fmt(v, 2)} />
+                    <MiniSlider label="Context" info="repCtx" value={repContext} onChange={(value) => { setRepContext(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("repContext", setRepContext, (v) => ({ repetition_penalty_context: Number.parseInt(v, 10) }))} min={tuningRanges.repContext.min} max={tuningRanges.repContext.max} step={tuningRanges.repContext.step} format={(v) => fmt(v, 0)} />
                   </RailColumn>
                   <RailColumn title="TURN" aggregate={`${maxTurn} tok · pad ${fmt(padBonus, 1)}`}>
-                    <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); sendLiveConfig({ padding_bonus: Number(value) }); }} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
-                    <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
+                    <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("padBonus", setPadBonus, (v) => ({ padding_bonus: Number(v) }))} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
+                    <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("maxTurn", setMaxTurn, (v) => ({ max_turn_text_tokens: Number.parseInt(v, 10) }))} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
                   </RailColumn>
                   <RailColumn title="CONTEXT" aggregate={visionOn || reinforceInSilences ? (injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`) : "inactive"}>
-                    <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_rms: Number(value) }); }} min={INFERENCE_RANGES.expert.injectSilenceRms.min} max={INFERENCE_RANGES.expert.injectSilenceRms.max} step={INFERENCE_RANGES.expert.injectSilenceRms.step} format={(v) => fmt(v, 3)} />
-                    <MiniSlider label="Silence hold" info="injStreak" value={injectSilenceStreak} onChange={(value) => { setInjectSilenceStreak(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_streak: Number.parseInt(value, 10) }); }} min={INFERENCE_RANGES.expert.injectSilenceStreak.min} max={INFERENCE_RANGES.expert.injectSilenceStreak.max} step={INFERENCE_RANGES.expert.injectSilenceStreak.step} format={(v) => fmt(v, 0)} />
+                    <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); }} onCommit={(value) => sendLiveConfig({ inject_silence_rms: Number(value) })} min={INFERENCE_RANGES.expert.injectSilenceRms.min} max={INFERENCE_RANGES.expert.injectSilenceRms.max} step={INFERENCE_RANGES.expert.injectSilenceRms.step} format={(v) => fmt(v, 3)} />
+                    <MiniSlider label="Silence hold" info="injStreak" value={injectSilenceStreak} onChange={(value) => { setInjectSilenceStreak(value); setSessionProfileId("custom"); }} onCommit={(value) => sendLiveConfig({ inject_silence_streak: Number.parseInt(value, 10) })} min={INFERENCE_RANGES.expert.injectSilenceStreak.min} max={INFERENCE_RANGES.expert.injectSilenceStreak.max} step={INFERENCE_RANGES.expert.injectSilenceStreak.step} format={(v) => fmt(v, 0)} />
                   </RailColumn>
                 </div>
               </div>

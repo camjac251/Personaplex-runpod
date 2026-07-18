@@ -188,17 +188,19 @@ export const INFERENCE_RANGES = {
     audioTopk: { min: 100, max: 500, step: 1, integer: true },
     repPenalty: { min: 1, max: 1.3, step: 0.05 },
     repContext: { min: 0, max: 128, step: 8, integer: true },
-    padBonus: { min: 0, max: 2.5, step: 0.1 },
+    padBonus: { min: 0, max: 1, step: 0.1 },
     maxTurn: { min: 40, max: 240, step: 10, integer: true },
   },
+  // Expert bounds mirror the server clamps in moshi/rtc_session.py; a wider
+  // slider would only promise values the server silently clamps away.
   expert: {
     textTemp: { min: 0.1, max: 1.5, step: 0.05 },
     textTopk: { min: 1, max: 500, step: 1, integer: true },
     audioTemp: { min: 0.1, max: 1.5, step: 0.05 },
-    audioTopk: { min: 1, max: 2048, step: 1, integer: true },
-    repPenalty: { min: 1, max: 2, step: 0.05 },
+    audioTopk: { min: 8, max: 2048, step: 1, integer: true },
+    repPenalty: { min: 1, max: 1.5, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
-    padBonus: { min: 0, max: 6, step: 0.1 },
+    padBonus: { min: 0, max: 2, step: 0.1 },
     maxTurn: { min: 40, max: 2000, step: 10, integer: true },
     injectSilenceRms: { min: 0.001, max: 0.02, step: 0.001 },
     injectSilenceStreak: { min: 4, max: 20, step: 1, integer: true },
@@ -417,9 +419,9 @@ export const PARAM_INFO = {
     body: (
       <>
         Hard cap for consecutive non-silence text tokens. Default <b>120</b> is
-        about ten seconds of sustained talk. Hitting it contributes to
-        auto-rewind detection, so the safety floor remains <b>40</b> even in
-        Expert mode.
+        about ten seconds of sustained talk. Caps of <b>120</b> or more double
+        as the auto-rewind collapse signal; lower caps only truncate the turn.
+        The floor is <b>40</b> even in Expert mode.
       </>
     ),
   },

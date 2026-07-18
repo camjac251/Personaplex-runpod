@@ -218,7 +218,22 @@ export function ToggleRow({ name, desc, value, onChange, info }) {
 }
 
 export function MiniSlider({ label, value, onChange, onCommit, min, max, step, format = (v) => v, info }) {
-  const commit = (event) => onCommit?.(Number(event.currentTarget.value));
+  // Value when the current pointer/keyboard interaction began. A native
+  // range input teleports to the click position (and to min/max on
+  // Home/End), so commit handlers get the start value as a second
+  // argument to detect a single interaction jumping past a safety band
+  // and to revert it cleanly.
+  const interactionStartRef = useRef(null);
+  const begin = () => {
+    if (interactionStartRef.current == null) {
+      interactionStartRef.current = Number(value);
+    }
+  };
+  const commit = (event) => {
+    const startValue = interactionStartRef.current;
+    interactionStartRef.current = null;
+    onCommit?.(Number(event.currentTarget.value), startValue);
+  };
   return (
     <div className="mini">
       <div className="mini-row">
@@ -235,6 +250,8 @@ export function MiniSlider({ label, value, onChange, onCommit, min, max, step, f
         step={step}
         value={value}
         aria-label={label}
+        onPointerDown={begin}
+        onKeyDown={begin}
         onChange={(event) => onChange(Number(event.target.value))}
         onPointerUp={commit}
         onKeyUp={commit}
