@@ -7,12 +7,16 @@ No pytest dependency to keep the project deps lean; assertions raise.
 from __future__ import annotations
 
 import asyncio
+import fractions
 import sys
 import time
+from unittest.mock import patch
 
 import numpy as np
 from av.audio.frame import AudioFrame
 from av.audio.resampler import AudioResampler
+import aiortc.codecs as aiortc_codecs
+from aiortc.codecs import opus as aiortc_opus
 
 # Allow running this script from inside the repo without installing.
 sys.path.insert(0, "moshi")
@@ -21,12 +25,18 @@ from moshi.rtc_session import (  # noqa: E402
     MIMI_SAMPLE_RATE,
     OUTBOUND_DRAIN_BACKLOG_SAMPLES,
     OUTBOUND_FRAME_SAMPLES,
-    OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES,
+    OUTBOUND_PREBUFFER_START_SAMPLES,
     WEBRTC_SAMPLE_RATE,
     MimiOutputTrack,
     _f32_to_s16,
     _frame_to_mono_24k_f32,
     _s16_to_f32,
+    _soft_limit_f32,
+)
+import moshi.rtc_opus as rtc_opus  # noqa: E402
+from moshi.rtc_opus import (  # noqa: E402
+    MonoOpusEncoder,
+    install_mono_opus_encoder,
 )
 
 
@@ -56,11 +66,118 @@ def test_int_float_round_trip() -> None:
     assert s16.dtype == np.int16
     assert back.dtype == np.float32
     max_err = float(np.max(np.abs(samples - back)))
-    # f32 -> s16 (* 32767) -> f32 (/ 32768) introduces a small asymmetric
-    # scaling bias on top of the 1/32767 quantisation step. Actual worst
-    # case lands around ~6e-5; treat ~1/16384 as the floor.
-    assert max_err < 1.0 / 16384, f"round-trip max error too high: {max_err}"
+    assert max_err <= 1.0 / 32768, f"round-trip max error too high: {max_err}"
     print(f"  s16 round-trip max error: {max_err:.2e}")
+
+
+def test_mono_opus_encoder_installation_updates_both_factories() -> None:
+    previous_opus_encoder = aiortc_opus.OpusEncoder
+    previous_codecs_encoder = aiortc_codecs.OpusEncoder
+    try:
+        aiortc_opus.OpusEncoder = object
+        aiortc_codecs.OpusEncoder = object
+
+        assert install_mono_opus_encoder()
+        assert aiortc_opus.OpusEncoder is MonoOpusEncoder
+        assert aiortc_codecs.OpusEncoder is MonoOpusEncoder
+    finally:
+        aiortc_opus.OpusEncoder = previous_opus_encoder
+        aiortc_codecs.OpusEncoder = previous_codecs_encoder
+
+
+def test_mono_opus_encoder_emits_payload_for_pcm_frame() -> None:
+    encoder = MonoOpusEncoder()
+    frame = AudioFrame.from_ndarray(
+        np.zeros((1, OUTBOUND_FRAME_SAMPLES), dtype=np.int16),
+        format="s16",
+        layout="mono",
+    )
+    frame.sample_rate = WEBRTC_SAMPLE_RATE
+    frame.pts = 0
+    frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
+
+    payloads, timestamp = encoder.encode(frame)
+
+    assert timestamp == 0
+    assert payloads
+    assert all(isinstance(payload, bytes) and payload for payload in payloads)
+
+
+def test_mono_opus_encoder_timestamps_advance_one_frame() -> None:
+    encoder = MonoOpusEncoder()
+    timestamps: list[int] = []
+    for index in range(20):
+        frame = AudioFrame.from_ndarray(
+            np.zeros((1, OUTBOUND_FRAME_SAMPLES), dtype=np.int16),
+            format="s16",
+            layout="mono",
+        )
+        frame.sample_rate = WEBRTC_SAMPLE_RATE
+        frame.pts = index * OUTBOUND_FRAME_SAMPLES
+        frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
+        payloads, timestamp = encoder.encode(frame)
+        assert len(payloads) == 1
+        assert isinstance(payloads[0], bytes) and payloads[0]
+        assert timestamp is not None
+        timestamps.append(timestamp)
+
+    assert all(
+        later - earlier == OUTBOUND_FRAME_SAMPLES
+        for earlier, later in zip(timestamps, timestamps[1:])
+    )
+
+
+def test_mono_opus_encoder_drops_codec_failures_without_raising() -> None:
+    class _Resampler:
+        @staticmethod
+        def resample(frame):
+            return [frame]
+
+    class _FailingCodec:
+        @staticmethod
+        def encode(_frame):
+            raise RuntimeError("codec failure")
+
+    encoder = MonoOpusEncoder.__new__(MonoOpusEncoder)
+    encoder.resampler = _Resampler()
+    encoder.codec = _FailingCodec()
+    encoder._first_packet_pts = None
+    encoder._encode_failure_count = 0
+    encoder._last_encode_log_at = 0.0
+    frame = AudioFrame.from_ndarray(
+        np.zeros((1, OUTBOUND_FRAME_SAMPLES), dtype=np.int16),
+        format="s16",
+        layout="mono",
+    )
+
+    with (
+        patch.object(rtc_opus.logger, "warning") as warning,
+        patch.object(rtc_opus.logger, "error") as error,
+    ):
+        for _ in range(5):
+            assert encoder.encode(frame) == ([], None)
+
+    assert warning.call_count == 1
+    assert error.call_count == 1
+
+
+def test_soft_limit_preserves_samples_through_knee() -> None:
+    samples = np.array([-0.97, -0.5, 0.0, 0.5, 0.97], dtype=np.float32)
+
+    limited = _soft_limit_f32(samples)
+
+    assert limited.dtype == np.float32
+    np.testing.assert_array_equal(limited, samples)
+
+
+def test_soft_limit_bounds_outliers_symmetrically() -> None:
+    samples = np.array([-1.0, -0.98, 0.98, 1.0], dtype=np.float32)
+
+    limited = _soft_limit_f32(samples)
+
+    assert np.all(np.abs(limited) < 1.0)
+    assert np.all(np.abs(limited) < np.abs(samples))
+    np.testing.assert_allclose(limited[:2], -limited[:1:-1], rtol=0, atol=1e-7)
 
 
 def test_inbound_resample_preserves_sine() -> None:
@@ -232,10 +349,10 @@ def test_output_track_sheds_standing_subthreshold_backlog() -> None:
     backlog floor identifies it and recv() sheds it.
     """
     track = MimiOutputTrack()
-    # 60 ms residue: three outbound frames. Small enough that even the
+    # 70 ms residue: more than three outbound frames. Small enough that even the
     # sawtooth peak (residue + one fresh lump) stays below the 8-frame
     # level gate, so only the backlog-floor path can shed it.
-    residue_24k = _sine_wave_f32(1000.0, 0.06, MIMI_SAMPLE_RATE)
+    residue_24k = _sine_wave_f32(1000.0, 0.07, MIMI_SAMPLE_RATE)
     # One healthy 80 ms producer lump.
     lump_24k = _sine_wave_f32(1000.0, 0.08, MIMI_SAMPLE_RATE)
 
@@ -272,10 +389,13 @@ def test_output_track_sheds_standing_subthreshold_backlog() -> None:
     early_peak = max(backlogs[:25])
     final_floor = min(backlogs[-25:])
     print(
-        f"  standing 60 ms residue: early floor {early_floor}, "
+        f"  standing 70 ms residue: early floor {early_floor}, "
         f"early peak {early_peak}, final floor {final_floor} samples"
     )
-    assert early_floor >= OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES, (
+    standing_threshold = (
+        OUTBOUND_PREBUFFER_START_SAMPLES + OUTBOUND_FRAME_SAMPLES
+    )
+    assert early_floor >= standing_threshold, (
         "test setup failed to create a standing backlog: "
         f"early floor {early_floor}"
     )
@@ -283,8 +403,8 @@ def test_output_track_sheds_standing_subthreshold_backlog() -> None:
         "residue reached the level gate; this test must exercise the "
         f"backlog-floor path: early peak {early_peak}"
     )
-    assert final_floor < OUTBOUND_FRAME_SAMPLES, (
-        "standing sub-threshold backlog was never shed: "
+    assert final_floor <= OUTBOUND_PREBUFFER_START_SAMPLES, (
+        "standing backlog did not return to the adaptive prebuffer floor: "
         f"final floor {final_floor} samples"
     )
 
@@ -292,6 +412,24 @@ def test_output_track_sheds_standing_subthreshold_backlog() -> None:
 if __name__ == "__main__":
     print("test_int_float_round_trip ...")
     test_int_float_round_trip()
+    print("  ok")
+    print("test_mono_opus_encoder_installation_updates_both_factories ...")
+    test_mono_opus_encoder_installation_updates_both_factories()
+    print("  ok")
+    print("test_mono_opus_encoder_emits_payload_for_pcm_frame ...")
+    test_mono_opus_encoder_emits_payload_for_pcm_frame()
+    print("  ok")
+    print("test_mono_opus_encoder_timestamps_advance_one_frame ...")
+    test_mono_opus_encoder_timestamps_advance_one_frame()
+    print("  ok")
+    print("test_mono_opus_encoder_drops_codec_failures_without_raising ...")
+    test_mono_opus_encoder_drops_codec_failures_without_raising()
+    print("  ok")
+    print("test_soft_limit_preserves_samples_through_knee ...")
+    test_soft_limit_preserves_samples_through_knee()
+    print("  ok")
+    print("test_soft_limit_bounds_outliers_symmetrically ...")
+    test_soft_limit_bounds_outliers_symmetrically()
     print("  ok")
     print("test_inbound_resample_preserves_sine ...")
     test_inbound_resample_preserves_sine()

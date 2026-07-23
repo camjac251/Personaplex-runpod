@@ -9,6 +9,7 @@ import asyncio
 import json
 import sys
 import threading
+from unittest.mock import patch
 
 import numpy as np
 
@@ -69,8 +70,10 @@ def _bare_session(process_fn) -> RTCSession:
     session._control_message_lock = asyncio.Lock()
     session._accept_control = True
     session._active_control_task = None
+    session._last_control_overflow_warn_at = 0.0
     session._closed = asyncio.Event()
     session.close_reason = None
+    session.client_ended = False
     return session
 
 
@@ -210,12 +213,17 @@ def test_outbound_underrun_fades_and_reprimes() -> None:
         assert resumed[-1] == np.float32(0.5)
         assert track._primed is True
 
-        # Consuming the last queued frame lands its tail on silence and
-        # reprimes, so a possible underrun next frame cannot click.
+        # A full-frame drain is healthy even when it leaves no queued audio.
         await track._pop_chunk()
-        emptied = await track._pop_chunk()
-        assert emptied[0] == np.float32(0.5)
-        assert emptied[-1] == 0.0
+        exact = await track._pop_chunk()
+        assert np.all(exact == np.float32(0.5))
+        assert track._primed is True
+        assert track._underrun_events == 0
+        assert track._prebuffer_target == OUTBOUND_PREBUFFER_START_SAMPLES
+
+        # The next due frame cannot be filled, so it underruns and reprimes.
+        empty = await track._pop_chunk()
+        assert np.all(empty == 0.0)
         assert track._primed is False
         assert track._underrun_events == 1
         assert track._prebuffer_target == (
@@ -226,7 +234,7 @@ def test_outbound_underrun_fades_and_reprimes() -> None:
         track._buffer = np.full(OUTBOUND_FRAME_SAMPLES, 0.5, dtype=np.float32)
         assert np.all(await track._pop_chunk() == 0.0)
 
-        # A stranded partial frame is emitted faded, never hard-truncated.
+        # A stranded partial frame is emitted faded and counts as an underrun.
         track._primed = True
         track._buffer = np.full(400, 0.5, dtype=np.float32)
         partial = await track._pop_chunk()
@@ -353,6 +361,21 @@ class _Peer:
         return None
 
 
+class _ControlChannel:
+    def __init__(self) -> None:
+        self._handlers = {}
+
+    def on(self, event: str):
+        def register(handler):
+            self._handlers[event] = handler
+            return handler
+
+        return register
+
+    def receive(self, payload: dict) -> None:
+        self._handlers["message"](json.dumps(payload))
+
+
 def _bare_control_session(handler) -> tuple[RTCSession, list[str]]:
     session = RTCSession.__new__(RTCSession)
     logs: list[str] = []
@@ -361,6 +384,7 @@ def _bare_control_session(handler) -> tuple[RTCSession, list[str]]:
     session._control_message_lock = asyncio.Lock()
     session._accept_control = True
     session._active_control_task = None
+    session._last_control_overflow_warn_at = 0.0
     session._closed = asyncio.Event()
     session._on_config = None
     session._on_message = handler
@@ -369,6 +393,7 @@ def _bare_control_session(handler) -> tuple[RTCSession, list[str]]:
     session._process_task = None
     session._pc = _Peer()
     session.close_reason = None
+    session.client_ended = False
     return session, logs
 
 
@@ -437,6 +462,96 @@ async def test_close_drains_active_control_and_cancels_waiters() -> None:
     assert not session._control_tasks
 
 
+async def test_queued_goodbye_survives_teardown_and_suppresses_resume_grant() -> None:
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    order: list[str] = []
+
+    async def handler(payload: dict) -> None:
+        name = payload["name"]
+        order.append(f"start-{name}")
+        if name == "active":
+            active_started.set()
+            await release_active.wait()
+        order.append(f"end-{name}")
+
+    session, _ = _bare_control_session(handler)
+    channel = _ControlChannel()
+    session._wire_control_channel(channel)
+    channel.receive({"type": "command", "name": "active"})
+    await active_started.wait()
+    channel.receive({"type": "goodbye"})
+    await asyncio.sleep(0)
+    assert session.client_ended is True
+
+    close_task = asyncio.create_task(session.close())
+    await asyncio.sleep(0)
+    assert not close_task.done()
+    release_active.set()
+    await close_task
+    assert order == ["start-active", "end-active"], order
+    assert not session._control_tasks
+
+    state = ServerState.__new__(ServerState)
+    state._resume_grant = None
+    state._resume_grant_expiry_handle = None
+    recorded = state._maybe_record_resume_grant(
+        session=session,
+        session_id="session",
+        cfg=object(),
+        went_live=True,
+        state_frozen=True,
+        server_ended=False,
+        effective_timeout_sec=0,
+        session_started_at=None,
+    )
+    assert recorded is False
+    assert state._resume_grant is None
+
+
+async def test_goodbye_sniff_treats_recursion_error_as_malformed() -> None:
+    session, _ = _bare_control_session(lambda _payload: None)
+    channel = _ControlChannel()
+    session._wire_control_channel(channel)
+
+    with patch("moshi.rtc_session.json.loads", side_effect=RecursionError):
+        channel._handlers["message"]("pathological")
+
+    await asyncio.gather(*tuple(session._control_tasks))
+    assert session.client_ended is False
+    assert session.close_reason is None
+    assert not session._closed.is_set()
+
+
+async def test_transport_death_without_goodbye_records_resume_grant() -> None:
+    session, _ = _bare_control_session(lambda _payload: None)
+    state = ServerState.__new__(ServerState)
+    state._resume_grant = None
+    state._resume_grant_expiry_handle = None
+    state._session_snapshots = {"session": ["snapshot"]}
+    state._session_bookmarks = {"session": ["bookmark"]}
+    state._schedule_resume_grant_expiry = lambda _grant: None
+    cfg = object()
+
+    recorded = state._maybe_record_resume_grant(
+        session=session,
+        session_id="session",
+        cfg=cfg,
+        went_live=True,
+        state_frozen=True,
+        server_ended=False,
+        effective_timeout_sec=0,
+        session_started_at=None,
+    )
+
+    assert recorded is True
+    assert state._resume_grant is not None
+    assert state._resume_grant["session_id"] == "session"
+    assert state._resume_grant["cfg"] is cfg
+    assert state._resume_grant["snapshots"] == ["snapshot"]
+    assert state._resume_grant["bookmarks"] == ["bookmark"]
+
+
 async def test_control_failure_is_retrieved_and_closes_session() -> None:
     async def handler(_payload: dict) -> None:
         raise RuntimeError("boom")
@@ -479,6 +594,9 @@ if __name__ == "__main__":
         test_stat_envelope_only_forwards_numeric_diagnostics,
         test_control_commands_preserve_wire_order,
         test_close_drains_active_control_and_cancels_waiters,
+        test_queued_goodbye_survives_teardown_and_suppresses_resume_grant,
+        test_goodbye_sniff_treats_recursion_error_as_malformed,
+        test_transport_death_without_goodbye_records_resume_grant,
         test_control_failure_is_retrieved_and_closes_session,
         test_cancelled_session_lock_waiter_cannot_orphan_lock,
     ]

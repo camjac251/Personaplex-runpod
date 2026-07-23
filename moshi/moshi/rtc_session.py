@@ -37,9 +37,15 @@ from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from av.audio.frame import AudioFrame
 from av.audio.resampler import AudioResampler
 
+from .rtc_opus import install_mono_opus_encoder
+
+
+install_mono_opus_encoder()
 
 MIMI_SAMPLE_RATE = 24_000
 WEBRTC_SAMPLE_RATE = 48_000
+S16_SCALE = 32768.0
+OUTBOUND_SOFT_LIMIT_KNEE = 0.97
 OUTBOUND_FRAME_MS = 20
 OUTBOUND_FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * OUTBOUND_FRAME_MS // 1000  # 960
 OUTBOUND_BUFFER_CAP_SAMPLES = WEBRTC_SAMPLE_RATE * 2  # 2 seconds; sanity cap.
@@ -56,13 +62,12 @@ OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 # a frame or more means a stall left residue behind. 25 calls ~= 500 ms
 # spans several 80 ms production lumps plus jitter.
 OUTBOUND_STANDING_BACKLOG_WINDOW = 25
-# Adaptive outbound floor: after an underrun (or at session start), hold
-# this much audio before emission resumes so the healthy sawtooth rides
-# above empty and micro-jitter cannot force mid-word silence insertions.
-# The floor grows one frame per underrun and decays one frame after a
-# sustained clean stretch, so the paid latency tracks the jitter this
-# session actually exhibits instead of a blind worst case; the
-# silence-preferring shed reclaims freed floor inaudibly.
+# Adaptive outbound floor: after a missed playout (or at session start),
+# hold this much audio before emission resumes. A full frame that lands
+# exactly on a healthy producer-lump boundary remains primed; only a due
+# frame the buffer cannot fill grows the floor. The floor decays one frame
+# after a sustained clean stretch, and silence-preferring shedding reclaims
+# freed floor inaudibly.
 OUTBOUND_PREBUFFER_START_SAMPLES = OUTBOUND_FRAME_SAMPLES * 2
 OUTBOUND_PREBUFFER_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES
 OUTBOUND_PREBUFFER_MAX_SAMPLES = OUTBOUND_FRAME_SAMPLES * 6
@@ -109,12 +114,27 @@ def ice_servers_to_aiortc(servers: list[dict]) -> list[RTCIceServer]:
 
 
 def _f32_to_s16(samples: np.ndarray) -> np.ndarray:
-    clipped = np.clip(samples, -1.0, 1.0)
-    return (clipped * 32767.0).astype(np.int16)
+    scaled = samples * S16_SCALE
+    return np.clip(scaled, -32768, 32767).astype(np.int16)
 
 
 def _s16_to_f32(samples: np.ndarray) -> np.ndarray:
-    return samples.astype(np.float32) / 32768.0
+    return samples.astype(np.float32) / S16_SCALE
+
+
+def _soft_limit_f32(samples: np.ndarray) -> np.ndarray:
+    magnitude = np.abs(samples)
+    limited = OUTBOUND_SOFT_LIMIT_KNEE + (
+        1.0 - OUTBOUND_SOFT_LIMIT_KNEE
+    ) * np.tanh(
+        (magnitude - OUTBOUND_SOFT_LIMIT_KNEE)
+        / (1.0 - OUTBOUND_SOFT_LIMIT_KNEE)
+    )
+    return np.where(
+        magnitude <= OUTBOUND_SOFT_LIMIT_KNEE,
+        samples,
+        np.copysign(limited, samples),
+    ).astype(np.float32, copy=False)
 
 
 def _frame_to_mono_24k_f32(frame: AudioFrame, resampler: AudioResampler) -> np.ndarray:
@@ -137,7 +157,7 @@ def _frame_to_mono_24k_f32(frame: AudioFrame, resampler: AudioResampler) -> np.n
 
 
 class MimiOutputTrack(MediaStreamTrack):
-    """Outbound audio track. Pulls 48 kHz s16 mono frames from a buffer.
+    """Outbound audio track. Pulls 48 kHz float mono PCM from a buffer.
 
     The buffer is fed by `push_24k_f32`. `recv()` paces at real time so
     aiortc emits Opus packets at the steady ~20 ms cadence its sender
@@ -177,18 +197,17 @@ class MimiOutputTrack(MediaStreamTrack):
         # Persistent resampler so its internal anti-alias filter state
         # carries between chunks. Recreating per-call breaks continuity.
         self._resampler = AudioResampler(
-            format="s16", layout="mono", rate=WEBRTC_SAMPLE_RATE
+            format="flt", layout="mono", rate=WEBRTC_SAMPLE_RATE
         )
 
     async def push_24k_f32(self, samples: np.ndarray) -> None:
         """Append Mimi-decoded mono 24 kHz float32 samples to the buffer."""
         if samples.size == 0:
             return
-        # Resample 24k -> 48k via PyAV. The resampler wants an AudioFrame.
-        s16 = _f32_to_s16(samples)
-        # AudioFrame.from_ndarray expects shape (channels, N) for planar.
         in_frame = AudioFrame.from_ndarray(
-            s16.reshape(1, -1), format="s16", layout="mono"
+            samples.astype(np.float32, copy=False).reshape(1, -1),
+            format="flt",
+            layout="mono",
         )
         in_frame.sample_rate = MIMI_SAMPLE_RATE
         out_frames = self._resampler.resample(in_frame)
@@ -197,7 +216,7 @@ class MimiOutputTrack(MediaStreamTrack):
             arr = out.to_ndarray()
             if arr.ndim == 2:
                 arr = arr[0]
-            chunks.append(_s16_to_f32(arr))
+            chunks.append(arr.astype(np.float32, copy=False))
         if not chunks:
             return
         upsampled = np.concatenate(chunks)
@@ -226,7 +245,7 @@ class MimiOutputTrack(MediaStreamTrack):
             # for another window; the flush already shed that latency.
             self._backlog_window.clear()
             self._resampler = AudioResampler(
-                format="s16", layout="mono", rate=WEBRTC_SAMPLE_RATE
+                format="flt", layout="mono", rate=WEBRTC_SAMPLE_RATE
             )
 
     def _shed_buffer_locked(self, drop: int) -> None:
@@ -277,7 +296,7 @@ class MimiOutputTrack(MediaStreamTrack):
         self._dropped_samples += removed
 
     def _note_underrun_locked(self) -> None:
-        """Grow the floor and reprime after the buffer ran dry."""
+        """Grow the floor and reprime after a due frame cannot be filled."""
         self._underrun_events += 1
         self._clean_recvs = 0
         self._prebuffer_target = min(
@@ -314,18 +333,8 @@ class MimiOutputTrack(MediaStreamTrack):
                         0.0, 1.0, fade, dtype=np.float32
                     )
                     self._resume_fade_pending = False
-                if self._buffer.size == 0:
-                    # The floor is gone, so the next recv() may find
-                    # nothing. Land this chunk on silence and reprime so
-                    # emission resumes from a refilled floor.
-                    fade = OUTBOUND_SHED_CROSSFADE_SAMPLES
-                    chunk[-fade:] *= np.linspace(
-                        1.0, 0.0, fade, dtype=np.float32
-                    )
-                    self._note_underrun_locked()
                 return chunk
-            # Partial frame left: emit it faded to silence, zero-padded,
-            # and reprime before emission resumes.
+
             out = np.zeros(OUTBOUND_FRAME_SAMPLES, dtype=np.float32)
             partial = self._buffer
             self._buffer = np.empty(0, dtype=np.float32)
@@ -335,10 +344,7 @@ class MimiOutputTrack(MediaStreamTrack):
                 out[partial.size - fade: partial.size] *= np.linspace(
                     1.0, 0.0, fade, dtype=np.float32
                 )
-                self._note_underrun_locked()
-            else:
-                self._primed = False
-                self._resume_fade_pending = True
+            self._note_underrun_locked()
             return out
 
     async def recv(self) -> AudioFrame:
@@ -397,7 +403,7 @@ class MimiOutputTrack(MediaStreamTrack):
             await asyncio.sleep(delay)
 
         chunk = await self._pop_chunk()
-        s16 = _f32_to_s16(chunk).reshape(1, -1)
+        s16 = _f32_to_s16(_soft_limit_f32(chunk)).reshape(1, -1)
         frame = AudioFrame.from_ndarray(s16, format="s16", layout="mono")
         frame.sample_rate = WEBRTC_SAMPLE_RATE
         frame.pts = self._timestamp
@@ -1048,6 +1054,9 @@ class RTCSession:
         # distinguish a broken transport (model state still trustworthy)
         # from broken state.
         self.close_reason: Optional[str] = None
+        # Receipt is authoritative even when teardown cancels the serialized
+        # goodbye handler before it reaches the server callback.
+        self.client_ended = False
 
         @self._pc.on("track")
         def _on_track(track: MediaStreamTrack) -> None:
@@ -1615,6 +1624,21 @@ class RTCSession:
         def _on_message(message: object) -> None:
             if not self._accept_control or self._closed.is_set():
                 return
+            if isinstance(message, str):
+                try:
+                    received = json.loads(message)
+                except Exception:
+                    # Malformed input is simply not a goodbye. json.loads can
+                    # raise beyond JSONDecodeError (RecursionError on deeply
+                    # nested payloads), and any escape here would kill the
+                    # DataChannel's message dispatch for the session.
+                    pass
+                else:
+                    if (
+                        isinstance(received, dict)
+                        and received.get("type") == "goodbye"
+                    ):
+                        self.client_ended = True
             if len(self._control_tasks) >= CONTROL_TASK_MAX:
                 now = asyncio.get_event_loop().time()
                 if now - self._last_control_overflow_warn_at >= 1.0:
@@ -1824,44 +1848,50 @@ class RTCSession:
                     self._pending_pcm = self._pending_pcm[self._frame_size :]
                     generation = self._pipeline_generation
                     self._process_idle.clear()
-                    in_flight = asyncio.ensure_future(
-                        loop.run_in_executor(
-                            self._process_executor, self._process_fn, chunk
-                        )
-                    )
                     try:
-                        results = await asyncio.shield(in_flight)
-                    except asyncio.CancelledError:
+                        in_flight = asyncio.ensure_future(
+                            loop.run_in_executor(
+                                self._process_executor, self._process_fn, chunk
+                            )
+                        )
                         try:
-                            await in_flight
-                        except BaseException:
-                            pass
-                        raise
+                            results = await asyncio.shield(in_flight)
+                        except asyncio.CancelledError:
+                            try:
+                                await in_flight
+                            except BaseException:
+                                pass
+                            raise
+                        trimmed_ms = self._trim_standing_inbound_backlog()
+                        if trimmed_ms > 0:
+                            now = loop.time()
+                            if now - self._last_drop_warn_at >= 1.0:
+                                self._log(
+                                    "warning",
+                                    "trimmed standing inbound audio backlog "
+                                    f"dropped_ms={trimmed_ms:.1f} "
+                                    f"q={self._pcm_queue.qsize()}/{self._pcm_queue.maxsize}",
+                                )
+                                self._last_drop_warn_at = now
+                        if (
+                            self._processing_paused
+                            or generation != self._pipeline_generation
+                        ):
+                            continue
+                        for pcm_data, text in results:
+                            frame_f32 = pcm_data.astype(np.float32)
+                            await self._output_track.push_24k_f32(frame_f32)
+                            if (
+                                self._processing_paused
+                                or generation != self._pipeline_generation
+                            ):
+                                break
+                            if self._on_pcm is not None:
+                                self._on_pcm(frame_f32)
+                            if text is not None:
+                                self.send_text(text)
                     finally:
                         self._process_idle.set()
-                    trimmed_ms = self._trim_standing_inbound_backlog()
-                    if trimmed_ms > 0:
-                        now = loop.time()
-                        if now - self._last_drop_warn_at >= 1.0:
-                            self._log(
-                                "warning",
-                                "trimmed standing inbound audio backlog "
-                                f"dropped_ms={trimmed_ms:.1f} "
-                                f"q={self._pcm_queue.qsize()}/{self._pcm_queue.maxsize}",
-                            )
-                            self._last_drop_warn_at = now
-                    if (
-                        self._processing_paused
-                        or generation != self._pipeline_generation
-                    ):
-                        continue
-                    for pcm_data, text in results:
-                        frame_f32 = pcm_data.astype(np.float32)
-                        await self._output_track.push_24k_f32(frame_f32)
-                        if self._on_pcm is not None:
-                            self._on_pcm(frame_f32)
-                        if text is not None:
-                            self.send_text(text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
