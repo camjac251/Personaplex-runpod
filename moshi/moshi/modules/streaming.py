@@ -69,92 +69,173 @@ def is_dataclass_instance(obj):
     return is_dataclass(obj) and not isinstance(obj, type)
 
 
-def _restore_streaming_state_pt(value: torch.Tensor,
-                                name: str,
-                                state_dict: dict[str, torch.Tensor],
-                                ):
-    """Restore the streaming state from the given pt_state dict
-    
-    Parameters
-    ----------
-    value : torch.Tensor
-        Specific streaming state tensor that needs to be set.
-    name : str
-        Name of the tensor in the state dict.
-    state_dict: StreamingStateDict
-        Flattened state dict containing the values to set.
-    """
-    if name in state_dict:
-        value.copy_(state_dict[name].to(value.device))
-        state_dict.pop(name)
-    else:
+def _validate_tensor_restore(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    name: str,
+) -> None:
+    batch_broadcast = (
+        source.ndim == destination.ndim
+        and source.ndim > 0
+        and source.shape[0] == 1
+        and destination.shape[0] > 1
+        and source.shape[1:] == destination.shape[1:]
+    )
+    if source.dtype != destination.dtype or (
+        source.shape != destination.shape and not batch_broadcast
+    ):
+        raise RuntimeError(
+            f"Cannot restore {name}: expected shape {tuple(destination.shape)} "
+            f"and dtype {destination.dtype}, got shape {tuple(source.shape)} "
+            f"and dtype {source.dtype}."
+        )
+
+
+def _restore_streaming_state_pt(
+    value: torch.Tensor,
+    name: str,
+    state_dict: StreamingStateDict,
+    *,
+    apply: bool,
+):
+    """Restore a tensor streaming state from the given state dict."""
+    if name not in state_dict:
         raise KeyError(f"Expected to find a streaming state for {name}.")
 
-    
-def _set_streaming_state_inplace(streaming_state: State,
-                                 state_dict: StreamingStateDict,
-                                 prefix: str,
-                                 device: torch.device,
-                                 ):
-    """Set the streaming state in-place from the given `state_dict` dict.
+    restored_value = state_dict.pop(name)
+    if not isinstance(restored_value, torch.Tensor):
+        raise TypeError(
+            f"Expected a tensor for {name}, got {type(restored_value)}."
+        )
+    _validate_tensor_restore(value, restored_value, name)
+    if apply:
+        value.copy_(restored_value.to(value.device))
 
-    Parameters
-    ----------
-    streaming_state : State
-        Specific streaming state object that needs to be set.
-    state_dict: StreamingStateDict
-        Flattened state dict containing the values to set.
-    prefix : str
-        Prefix to add to each key when looking up in `state_dict`.
-    device : torch.device
-        Device to move tensors to if needed.
-    """
+
+def _set_streaming_state_inplace(
+    streaming_state: State,
+    state_dict: StreamingStateDict,
+    prefix: str,
+    device: torch.device,
+    *,
+    apply: bool,
+):
+    """Validate or set streaming state in-place from a flattened state dict."""
     if isinstance(streaming_state, torch.Tensor):
-        _restore_streaming_state_pt(streaming_state, prefix, state_dict)
+        _restore_streaming_state_pt(
+            streaming_state, prefix, state_dict, apply=apply
+        )
     elif is_dataclass_instance(streaming_state):
-        _restore_streaming_state_from_keys(streaming_state, state_dict, prefix, [field.name for field in fields(streaming_state)], device)
+        _restore_streaming_state_from_keys(
+            streaming_state,
+            state_dict,
+            prefix,
+            [field.name for field in fields(streaming_state)],
+            device,
+            apply=apply,
+        )
     elif hasattr(streaming_state, "asdict"):
-        _restore_streaming_state_from_keys(streaming_state, state_dict, prefix, list(streaming_state.asdict().keys()), device)
+        _restore_streaming_state_from_keys(
+            streaming_state,
+            state_dict,
+            prefix,
+            list(streaming_state.asdict().keys()),
+            device,
+            apply=apply,
+        )
     else:
-        raise TypeError(f"Unsupported type {type(streaming_state)} for streaming state with prefix {prefix}.")
+        raise TypeError(
+            f"Unsupported type {type(streaming_state)} for streaming state "
+            f"with prefix {prefix}."
+        )
 
 
-def _restore_streaming_state_from_keys(streaming_state: State,
-                                       state_dict: StreamingStateDict,
-                                       prefix: str,
-                                       keys: List[str],
-                                       device: torch.device,
-                                       ):
-    """Restores the streaming state from the given `state_dict` dict
-    looking up fields by adding `prefix` to each key in `keys` to look
-    up values.
-    `torch.Tensor` are copied to `device` if no `torch.Tensor` is already present
-    otherwise, the data is copied to the device of the existing `torch.Tensor`.
-    
-    Parameters
-    ----------
-    streaming_state : State
-        Specific streaming state object that needs to be set.
-    state_dict: StreamingStateDict
-        Flattened state dict containing the values to set.
-    prefix : str
-        Prefix to add to each key when looking up in `state_dict`.
-    keys : List[str]
-        List of keys to look up in `state_dict`.
-    device : torch.device
-        Device to move tensors to if needed.
+def _none_over_tensor_allowed(streaming_state: State, key: str) -> bool:
+    """Whether ``None`` is a legal live value for a tensor-holding field.
+
+    Only fields declared optional (a ``None`` default or a union with
+    ``None``) may be nulled: writing ``None`` into a required tensor field
+    detaches storage that CUDA graphs and later restores rely on.
     """
+    if not is_dataclass_instance(streaming_state):
+        return False
+    for field in fields(streaming_state):
+        if field.name != key:
+            continue
+        if field.default is None:
+            return True
+        annotation = field.type
+        if isinstance(annotation, str):
+            return "None" in annotation or "Optional" in annotation
+        return type(None) in getattr(annotation, "__args__", ())
+    return False
+
+
+def _validate_scalar_for_tensor(
+    destination: torch.Tensor,
+    value: Union[int, float, bool],
+    name: str,
+) -> None:
+    """Preflight a numeric scalar destined for ``Tensor.fill_``.
+
+    ``fill_`` silently truncates fractional floats into integer tensors and
+    raises mid-apply on out-of-range values, so both are rejected up front.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(
+            f"Cannot restore {name}: non-finite scalar {value!r}."
+        )
+    dtype = destination.dtype
+    if dtype.is_floating_point or dtype.is_complex or dtype == torch.bool:
+        return
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"Cannot restore {name}: fractional scalar {value!r} for "
+            f"integer dtype {dtype}."
+        )
+    info = torch.iinfo(dtype)
+    if not (info.min <= int(value) <= info.max):
+        raise ValueError(
+            f"Cannot restore {name}: scalar {value!r} out of range for "
+            f"dtype {dtype}."
+        )
+
+
+def _restore_streaming_state_from_keys(
+    streaming_state: State,
+    state_dict: StreamingStateDict,
+    prefix: str,
+    keys: List[str],
+    device: torch.device,
+    *,
+    apply: bool,
+):
+    """Validate or restore keyed fields from a flattened state dict."""
     for key in keys:
         full_key = f"{prefix}.{key}"
         existing_value = getattr(streaming_state, key)
         if full_key in state_dict:
             restored_value = state_dict.pop(full_key)
             if restored_value is None:
-                setattr(streaming_state, key, None)
+                if isinstance(
+                    existing_value, torch.Tensor
+                ) and not _none_over_tensor_allowed(streaming_state, key):
+                    raise TypeError(
+                        f"Cannot restore {full_key}: None is not a legal "
+                        "value for a required tensor field."
+                    )
+                if apply:
+                    setattr(streaming_state, key, None)
             elif isinstance(restored_value, torch.Tensor):
                 if isinstance(existing_value, torch.Tensor):
-                    existing_value.copy_(restored_value.to(existing_value.device))
-                else:
+                    _validate_tensor_restore(
+                        existing_value, restored_value, full_key
+                    )
+                    if apply:
+                        existing_value.copy_(
+                            restored_value.to(existing_value.device)
+                        )
+                elif apply:
                     # .to(device) may return the snapshot tensor itself. Clone
                     # so subsequent live mutations cannot corrupt a reusable
                     # stored snapshot.
@@ -164,26 +245,44 @@ def _restore_streaming_state_from_keys(streaming_state: State,
                         restored_value.detach().clone().to(device),
                     )
             elif isinstance(restored_value, (int, float, str, bool)):
-                if isinstance(existing_value, torch.Tensor) and isinstance(
-                    restored_value, (int, float, bool)
-                ):
+                if isinstance(existing_value, torch.Tensor):
+                    if not isinstance(restored_value, (int, float, bool)):
+                        raise TypeError(
+                            f"Cannot restore {full_key}: expected a tensor "
+                            f"or numeric scalar, got "
+                            f"{type(restored_value).__name__}."
+                        )
                     # A numeric scalar for a tensor field is an older state
                     # layout (e.g. pre-tensor recent_text_offset sidecars).
                     # Writing into the live tensor preserves the storage that
                     # CUDA graphs and later restores rely on; setattr would
                     # replace it with a Python scalar and poison every
                     # subsequent session.
-                    existing_value.fill_(restored_value)
-                else:
+                    _validate_scalar_for_tensor(
+                        existing_value, restored_value, full_key
+                    )
+                    if apply:
+                        existing_value.fill_(restored_value)
+                elif apply:
                     setattr(streaming_state, key, restored_value)
             else:
                 raise TypeError(
-                    f"Unsupported restored value {type(restored_value)} for {full_key}."
+                    f"Unsupported restored value {type(restored_value)} for "
+                    f"{full_key}."
                 )
-        elif isinstance(existing_value, (int, float, str, bool, type(None), torch.Tensor)):
+        elif isinstance(
+            existing_value,
+            (int, float, str, bool, type(None), torch.Tensor),
+        ):
             raise RuntimeError(f"Key {full_key} not found in state_dict.")
         else:
-            _set_streaming_state_inplace(existing_value, state_dict, full_key, device)
+            _set_streaming_state_inplace(
+                existing_value,
+                state_dict,
+                full_key,
+                device,
+                apply=apply,
+            )
 
 
 def safe_asdict(dataclass_obj):
@@ -422,11 +521,27 @@ class StreamingModule(abc.ABC, torch.nn.Module, Generic[State]):
         sub-modules using a flattened-state dict.
         """
         device = next(self.parameters()).device
-        def _set(name: str, module: StreamingModule):
-            _set_streaming_state_inplace(module._streaming_state, state, prefix=name, device=device)
-        self._apply_named_streaming(_set)
-        if state:
-            raise RuntimeError(f"Some states were not consumed: {list(state.keys())}")
+
+        def _restore(
+            state_dict: StreamingStateDict, *, apply: bool
+        ) -> None:
+            def _set(name: str, module: StreamingModule):
+                _set_streaming_state_inplace(
+                    module._streaming_state,
+                    state_dict,
+                    prefix=name,
+                    device=device,
+                    apply=apply,
+                )
+
+            self._apply_named_streaming(_set)
+            if state_dict:
+                raise RuntimeError(
+                    f"Some states were not consumed: {list(state_dict.keys())}"
+                )
+
+        _restore(dict(state), apply=False)
+        _restore(state, apply=True)
 
     def set_streaming_state(self, state: dict[str, Any]):
         """Set the streaming state, including that of sub-modules."""
