@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "id": "long_session_soak",
+  "description": "Ten-minute soak: twelve widely spaced spoken turns to expose slow drift in response latency, queue pressure, and transcript stability.",
+  "audio": null,
+  "input_requirements": "Mono PCM16 48 kHz. Twelve natural spoken requests, each ending exactly on a 50 s boundary (50000 through 600000 ms), with silence between them; scripts/make_duplex_wavs.sh synthesizes a matching WAV.",
+  "config": {
+    "seed": 42
+  },
+  "actions": [],
+  "expectations": [
+    {
+      "kind": "turn",
+      "label": "turn one",
+      "at_ms": 50000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn two",
+      "at_ms": 100000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn three",
+      "at_ms": 150000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn four",
+      "at_ms": 200000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn five",
+      "at_ms": 250000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn six",
+      "at_ms": 300000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn seven",
+      "at_ms": 350000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn eight",
+      "at_ms": 400000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn nine",
+      "at_ms": 450000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn ten",
+      "at_ms": 500000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn eleven",
+      "at_ms": 550000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    },
+    {
+      "kind": "turn",
+      "label": "turn twelve",
+      "at_ms": 600000,
+      "deadline_ms": 8000,
+      "max_latency_ms": 6000
+    }
+  ],
+  "limits": {
+    "max_clipped_samples": 0,
+    "max_continuous_speech_ms": 20000,
+    "max_identical_word_run": 5,
+    "max_words_per_second": 19
+  },
+  "tail_ms": 15000
+}

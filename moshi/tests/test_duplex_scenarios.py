@@ -68,9 +68,11 @@ def _tone(start_ms: int, end_ms: int, duration_ms: int, amplitude: float = 0.2):
 
 def test_checked_in_manifests_validate_without_bundled_audio() -> None:
     paths = sorted(FIXTURES.glob("*.json"))
-    assert len(paths) >= 5
+    assert len(paths) >= 6
+    scenario_ids = set()
     for path in paths:
         manifest = load_manifest(path)
+        scenario_ids.add(manifest["id"])
         assert manifest["audio"] is None
         assert manifest["input_requirements"]
         try:
@@ -79,6 +81,23 @@ def test_checked_in_manifests_validate_without_bundled_audio() -> None:
             assert "pass --input-wav" in str(exc)
         else:
             raise AssertionError(f"{path} unexpectedly resolved missing audio")
+    assert "long_session_soak" in scenario_ids
+
+
+def test_long_session_soak_turns_fit_generated_wav_timeline() -> None:
+    manifest = load_manifest(FIXTURES / "long_session_soak.json")
+    turns = [
+        expectation
+        for expectation in manifest["expectations"]
+        if expectation["kind"] == "turn"
+    ]
+    assert len(turns) == 12
+    assert [turn["at_ms"] for turn in turns] == [
+        50_000.0 * index for index in range(1, 13)
+    ]
+    # scripts/make_duplex_wavs.sh writes a 600 s soak WAV, so every scoring
+    # window must fit inside that capture plus the manifest tail.
+    _validate_scenario_timeline(manifest, 600_000 + manifest["tail_ms"])
 
 
 def test_manifest_rejects_ambiguous_action_schedule() -> None:
@@ -516,6 +535,7 @@ def test_artifact_bundle_is_replayable() -> None:
 if __name__ == "__main__":
     tests = [
         test_checked_in_manifests_validate_without_bundled_audio,
+        test_long_session_soak_turns_fit_generated_wav_timeline,
         test_manifest_rejects_ambiguous_action_schedule,
         test_runner_rejects_expectation_windows_past_capture_end,
         test_wav_validation_and_twenty_ms_framing,
