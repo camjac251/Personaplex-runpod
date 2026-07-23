@@ -248,8 +248,20 @@ class RingKVCache:
         capacity: int,
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.bfloat16,
+        sink: int = 0,
     ):
         self.capacity = capacity
+        # Number of leading cache slots reserved as attention sinks: they are
+        # written once by the first `sink` frames and then never evicted, so
+        # the t=0 conditioning stays reachable after the ring wraps. The
+        # remaining `capacity - sink` slots hold the rolling recent window.
+        # 0 (default) reproduces the plain ring exactly. Fixed at construction
+        # so it is a constant inside the captured CUDA graph.
+        if not 0 <= sink < capacity:
+            raise ValueError(
+                f"sink ({sink}) must satisfy 0 <= sink < capacity ({capacity})"
+            )
+        self.sink = sink
         self.cache = torch.zeros(
             (2, batch_size, num_heads, capacity, dim_per_head),
             device=device,
@@ -263,8 +275,23 @@ class RingKVCache:
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
-        indexes = indexes % self.capacity
+        positions_written = (
+            torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype)
+            + self.end_offset
+        )
+        if self.sink:
+            # Absolute positions below `sink` land in their own slot and are
+            # written exactly once (positions only increase); everything else
+            # rotates over the sub-ring [sink, capacity). Because writes happen
+            # at monotonically increasing positions, no later frame ever targets
+            # a sink slot again, so the sink freezes without a branch.
+            ring = self.capacity - self.sink
+            rolling = self.sink + (positions_written - self.sink) % ring
+            indexes = torch.where(
+                positions_written < self.sink, positions_written, rolling
+            )
+        else:
+            indexes = positions_written % self.capacity
         self.cache[0].index_copy_(2, indexes, k)
         self.cache[1].index_copy_(2, indexes, v)
         self.end_offset.add_(T)
@@ -277,23 +304,36 @@ class RingKVCache:
         )
         invalid = indexes >= self.end_offset
 
-        end_index = self.end_offset % self.capacity
-        delta = indexes - end_index
+        if self.sink:
+            ring = self.capacity - self.sink
+            # Rolling slots reuse the wrap trick over the sub-ring [sink,
+            # capacity); sink slots carry their literal absolute position.
+            end_rolling = self.sink + (self.end_offset - self.sink) % ring
+            delta = indexes - end_rolling
+            rolling_positions = torch.where(
+                delta <= 0,
+                self.end_offset + delta,
+                self.end_offset + delta - ring,
+            )
+            positions = torch.where(indexes < self.sink, indexes, rolling_positions)
+        else:
+            end_index = self.end_offset % self.capacity
+            delta = indexes - end_index
 
-        # If last key is for step S, and capacity is C, last key was written at index S % C.
-        # then end_offset = S + 1, and end_index = (S + 1) % C.
-        # Then for index = (S % C), delta = -1, and the next code gives us:
-        # position(index) = (S + 1) - 1 = S, all good.
-        # Now the time step at end_offset is actually the oldest in the KVCache, e.g., its
-        # position should be (S - self.capacity + 1).
-        # The following code gives us:
-        # position(index + 1) = S + 1 + 0 - self.capacity.
+            # If last key is for step S, and capacity is C, last key was written at index S % C.
+            # then end_offset = S + 1, and end_index = (S + 1) % C.
+            # Then for index = (S % C), delta = -1, and the next code gives us:
+            # position(index) = (S + 1) - 1 = S, all good.
+            # Now the time step at end_offset is actually the oldest in the KVCache, e.g., its
+            # position should be (S - self.capacity + 1).
+            # The following code gives us:
+            # position(index + 1) = S + 1 + 0 - self.capacity.
 
-        positions = torch.where(
-            delta <= 0,
-            self.end_offset + delta,
-            self.end_offset + delta - self.capacity,
-        )
+            positions = torch.where(
+                delta <= 0,
+                self.end_offset + delta,
+                self.end_offset + delta - self.capacity,
+            )
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
 
         return KVCacheResult(keys, values, positions)
@@ -341,6 +381,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         context: tp.Optional[int] = None,
         rope: tp.Optional[RotaryEmbedding] = None,
         weights_per_step: int = 0,
+        kv_sink: int = 0,
         device=None,
         dtype=None,
     ):
@@ -352,6 +393,10 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         self.context = context
         self.rope = rope
         self.num_heads = num_heads
+        # Attention-sink frames pinned at the front of the ring cache; also
+        # exempt from the sliding-window mask so they stay attendable past
+        # `context`. 0 disables the feature entirely.
+        self.kv_sink = kv_sink
 
         out_dim = embed_dim
         out_dim = 3 * embed_dim
@@ -381,8 +426,17 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
+        # Pass kv_sink straight through so the cache pins exactly the positions
+        # the attention mask exempts; RingKVCache raises if it exceeds capacity,
+        # surfacing a misconfiguration at startup instead of silently diverging.
         kv_cache = RingKVCache(
-            batch_size, self.num_heads, dim_per_head, capacity, device, dtype
+            batch_size,
+            self.num_heads,
+            dim_per_head,
+            capacity,
+            device,
+            dtype,
+            sink=self.kv_sink,
         )
         return _MHAState(
             kv_cache,
@@ -431,7 +485,13 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             delta = pos_q - pos_k
             attn_bias = (pos_k >= 0) & (delta >= 0)
             if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
+                within_window = delta < self.context
+                if self.kv_sink:
+                    # Pinned sink positions [0, kv_sink) stay attendable even
+                    # once they age past the sliding window, so the anchored
+                    # KV slots are not just retained but actually attended.
+                    within_window = within_window | ((pos_k >= 0) & (pos_k < self.kv_sink))
+                attn_bias = attn_bias & within_window
         else:
             attn_bias = None
         x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
@@ -490,6 +550,7 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
         layer_scale: tp.Optional[float] = None,
         gating: str = "none",
         weights_per_step: int = 0,
+        kv_sink: int = 0,
         activation=F.gelu,
         skip_self_attn: bool = False,
         device=None,
@@ -508,6 +569,7 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 context=context,
                 rope=rope,
                 weights_per_step=weights_per_step,
+                kv_sink=kv_sink,
                 **attn_kwargs,  # type: ignore
                 **factory_kwargs,  # type: ignore
             )  # type: ignore

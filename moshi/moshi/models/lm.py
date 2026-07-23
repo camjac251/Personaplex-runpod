@@ -363,6 +363,7 @@ class LMModel(StreamingContainer):
         depformer_pos_emb: str = "sin",
         existing_text_padding_id: Optional[int] = None,
         context: Optional[int] = None,
+        kv_sink: int = 0,
         device=None,
         dtype=None,
         **kwargs,
@@ -401,11 +402,15 @@ class LMModel(StreamingContainer):
         main_kwargs = {
             k: v for k, v in kwargs.items() if not k.startswith(depformer_prefix)
         }
+        # Attention sinks apply only to the main temporal transformer, which is
+        # the one with a finite `context` ring cache; the depformer runs with
+        # context=None below and must never reserve sink slots.
         self.transformer = StreamingTransformer(
             d_model=dim,
             num_heads=num_heads,
             dim_feedforward=int(hidden_scale * dim),
             norm=norm,
+            kv_sink=kv_sink,
             device=device,
             dtype=dtype,
             **main_kwargs,

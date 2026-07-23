@@ -6763,6 +6763,17 @@ def _environment_float(name: str, default: float) -> float:
         return default
 
 
+def _environment_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -6781,6 +6792,20 @@ def main():
             "text timeline. Roughly doubles per-frame transformer compute "
             "and the streaming KV memory. Fixed at server start because "
             "the CUDA graphs capture the batch size."
+        ),
+    )
+    parser.add_argument(
+        "--kv-sink-frames",
+        type=int,
+        default=_environment_int("PERSONAPLEX_KV_SINK_FRAMES", 0),
+        help=(
+            "Pin this many front-of-cache frames as attention sinks in the "
+            "main transformer's ring KV cache: they are written once by the "
+            "opening frames and never evicted, and stay attendable past the "
+            "context window, so the t=0 conditioning does not rotate out on "
+            "long sessions. 0 (default) leaves the cache byte-identical to "
+            "stock. Fixed at server start because the CUDA graphs capture it; "
+            "must be less than the 3000-frame context."
         ),
     )
     parser.add_argument(
@@ -7048,7 +7073,17 @@ def main():
             revision=args.hf_revision,
         )
     t = time.monotonic()
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    lm = loaders.get_moshi_lm(
+        args.moshi_weight,
+        device=args.device,
+        cpu_offload=args.cpu_offload,
+        kv_sink=args.kv_sink_frames,
+    )
+    if args.kv_sink_frames:
+        logger.info(
+            "attention sink enabled: %d pinned front-of-cache frames",
+            args.kv_sink_frames,
+        )
     lm.eval()
     logger.info("moshi loaded in %.1f s", time.monotonic() - t)
     # Surface the inner-monologue yield token so a mismatch with the

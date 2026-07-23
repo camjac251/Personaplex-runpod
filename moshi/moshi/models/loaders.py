@@ -206,6 +206,7 @@ def get_moshi_lm(
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
     cpu_offload: bool = False,
+    kv_sink: int = 0,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -217,10 +218,13 @@ def get_moshi_lm(
         delays: Optional custom delays configuration.
         cpu_offload: If True, offload model layers to CPU when GPU memory is
                      insufficient. Uses accelerate's device_map="auto".
+        kv_sink: Number of front-of-cache frames pinned as attention sinks in
+                 the main temporal transformer (0 disables the feature).
     """
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
     lm_kwargs["dep_q"] = 16
+    lm_kwargs["kv_sink"] = int(kv_sink)
     if delays is not None:
         lm_kwargs["delays"] = delays
 
