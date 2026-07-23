@@ -51,6 +51,7 @@ from ..modules.transformer import (
     StreamingTransformer,
     create_norm_fn,
 )
+from ..voice_select import select_voice_window
 
 logger = logging.getLogger(__name__)
 
@@ -889,6 +890,12 @@ class LMGen(StreamingModule[_LMGenState]):
         # upload path reads this; the embeddings-replay and blend paths ignore
         # it. Set at connect time before priming, never live.
         self.voice_prompt_strength: float = 1.0
+        # Optional (mono_window, sample_rate) -> embedding callable for
+        # best-of-N voice window selection (voice_select.select_voice_window).
+        # None keeps the plain tail slice. Set once at server startup when
+        # PERSONAPLEX_VOICE_PICKER is enabled and the embedder is available;
+        # never mutated live.
+        self.voice_window_embedder: Optional[Callable[[np.ndarray, int], np.ndarray]] = None
         # Missing: Mimi encoder streaming state is not captured alongside the LM
         # state. When a saved voice prompt is loaded mid-session the LM cache
         # resumes mid-stream but the Mimi encoder restarts at t=0, so the
@@ -1598,14 +1605,17 @@ class LMGen(StreamingModule[_LMGenState]):
         return top_k_changed
 
     def _strength_sliced_voice_prompt_audio(self):
-        """Tail slice of the uploaded clip selected by voice_prompt_strength.
+        """Window of the uploaded clip selected by voice_prompt_strength.
 
         The clip primes the cache frame by frame; replaying fewer frames
-        conditions less strongly. Keeping the tail makes the most recent
-        audio the last thing the cache sees, so the kept slice dominates.
-        Strength 1.0 keeps the whole clip (current behavior), 0.0 keeps
-        nothing (the model's own voice). Returns the slice as a (C, T')
-        array on the same axis layout the encoder iterator expects.
+        conditions less strongly. Strength 1.0 keeps the whole clip, 0.0
+        keeps nothing (the model's own voice). The kept window is the clip
+        tail (the most recent audio is the last thing the cache sees, so
+        the kept slice dominates) unless voice_window_embedder is set, in
+        which case select_voice_window picks the window most similar to the
+        whole clip and falls back to the tail on ties or scoring failure.
+        Returns the slice as a (C, T') array on the same axis layout the
+        encoder iterator expects.
         """
         audio = self.voice_prompt_audio
         strength = max(0.0, min(1.0, self.voice_prompt_strength))
@@ -1617,7 +1627,15 @@ class LMGen(StreamingModule[_LMGenState]):
         if keep_frames <= 0:
             return audio[:, :0]
         keep_samples = min(total_samples, keep_frames * self._frame_size)
-        return audio[:, -keep_samples:]
+        if self.voice_window_embedder is None or keep_samples >= total_samples:
+            return audio[:, -keep_samples:]
+        start = select_voice_window(
+            audio[0],
+            self._sample_rate,
+            keep_samples,
+            self.voice_window_embedder,
+        )
+        return audio[:, start : start + keep_samples]
 
     def _encode_voice_prompt_frames(self, mimi):
         return encode_from_sphn(

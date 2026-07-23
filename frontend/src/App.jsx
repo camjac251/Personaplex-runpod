@@ -3471,6 +3471,16 @@ function App() {
     }
   };
 
+  const voiceReset = () => {
+    const now = performance.now();
+    if (now - lastRewindClickRef.current < 1000) return;
+    lastRewindClickRef.current = now;
+    if (controlRef.current?.readyState === "open") {
+      controlRef.current.send(JSON.stringify({ type: "voice_reset" }));
+      addNotice("info", "Voice reset requested", "rewind");
+    }
+  };
+
   const addBookmark = () => {
     if (phase !== "live") return;
     const now = performance.now();
@@ -5532,6 +5542,7 @@ function App() {
                     </>
                   )}
                   <button className="btn ghost" type="button" onClick={rewind}>{Icon.rewind} Rewind</button>
+                  <button className="btn ghost" type="button" onClick={voiceReset} title="Restore the session-start voice anchor to cure voice drift">{Icon.skipStart} Voice reset</button>
                   <button className="btn ghost" type="button" onClick={addBookmark} title="Bookmark the current snapshot to jump back to it">{Icon.bookmark} Bookmark</button>
                   <button className="btn danger" type="button" onClick={() => interruptResponse("manual")}>{Icon.stop} Stop response</button>
                 </>

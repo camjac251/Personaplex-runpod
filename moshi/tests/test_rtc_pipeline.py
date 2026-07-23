@@ -554,6 +554,82 @@ async def test_transport_death_without_goodbye_records_resume_grant() -> None:
     assert state._resume_grant["bookmarks"] == ["bookmark"]
 
 
+class _EventSession:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, str]] = []
+        self.notices: list[str] = []
+
+    def send_event(self, kind, text, level="info", data=None) -> None:
+        self.events.append((kind, level, text))
+
+    def send_notice(self, text) -> None:
+        self.notices.append(text)
+
+
+class _RecordingClog:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def log(self, level, text) -> None:
+        self.lines.append(f"{level}:{text}")
+
+
+async def test_voice_reset_targets_baseline_not_latest_snapshot() -> None:
+    state = ServerState.__new__(ServerState)
+    baseline = {"version": 2, "marker": "baseline"}
+    periodic = {"version": 2, "marker": "periodic"}
+    state._session_baselines = {"session": (100.0, baseline)}
+    # The auto-rewind ring holds only a newer periodic snapshot: the state
+    # after the periodic task has replaced the ring wholesale.
+    state._session_snapshots = {"session": [(200.0, periodic)]}
+    state._session_bookmarks = {"session": [{"id": "bm", "state": periodic}]}
+    restore_calls: list[tuple[str, dict, bool]] = []
+
+    async def fake_restore(
+        session, session_id, snapshot, *, auto_recovery=False
+    ):
+        restore_calls.append((session_id, snapshot, auto_recovery))
+        return True
+
+    state._restore_session_snapshot = fake_restore
+    session = _EventSession()
+
+    await state._handle_voice_reset(session, "session", _RecordingClog())
+
+    assert len(restore_calls) == 1
+    restored_session_id, restored_snapshot, auto_recovery = restore_calls[0]
+    assert restored_session_id == "session"
+    assert restored_snapshot is baseline
+    # Manual rewind semantics: live tuning must be preserved, so the
+    # auto-recovery tuning reset must not be requested.
+    assert auto_recovery is False
+    assert [(kind, level) for kind, level, _ in session.events] == [
+        ("voice_reset", "ok")
+    ]
+    assert session.notices
+
+
+async def test_voice_reset_without_baseline_warns_and_skips_restore() -> None:
+    state = ServerState.__new__(ServerState)
+    state._session_baselines = {}
+    state._session_snapshots = {"session": [(200.0, {"version": 2})]}
+    restore_calls: list[object] = []
+
+    async def fake_restore(*args, **kwargs):
+        restore_calls.append((args, kwargs))
+        return True
+
+    state._restore_session_snapshot = fake_restore
+    session = _EventSession()
+
+    await state._handle_voice_reset(session, "session", _RecordingClog())
+
+    assert restore_calls == []
+    assert [(kind, level) for kind, level, _ in session.events] == [
+        ("voice_reset", "warn")
+    ]
+
+
 async def test_control_failure_is_retrieved_and_closes_session() -> None:
     async def handler(_payload: dict) -> None:
         raise RuntimeError("boom")
@@ -599,6 +675,8 @@ if __name__ == "__main__":
         test_queued_goodbye_survives_teardown_and_suppresses_resume_grant,
         test_goodbye_sniff_treats_recursion_error_as_malformed,
         test_transport_death_without_goodbye_records_resume_grant,
+        test_voice_reset_targets_baseline_not_latest_snapshot,
+        test_voice_reset_without_baseline_warns_and_skips_restore,
         test_control_failure_is_retrieved_and_closes_session,
         test_cancelled_session_lock_waiter_cannot_orphan_lock,
     ]

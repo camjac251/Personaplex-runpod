@@ -79,6 +79,7 @@ from .rtc_session import (
 from .utils.assets import safe_extract_tar
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .voice_select import wavlm_embedder
 
 
 logger = setup_logger(__name__)
@@ -1528,6 +1529,13 @@ class ServerState:
         # for jump-back and are capped independently. Mutated only from the
         # on_message coroutine.
         self._session_bookmarks: dict[str, list[dict]] = {}
+        # Session-start voice anchor: session_id -> (monotonic_ts,
+        # versioned_snapshot), captured once right after priming. Held under
+        # its own key because the periodic snapshot task replaces the
+        # auto-rewind ring wholesale; voice_reset restores this anchor to
+        # cure voice drift without ending the session. Not carried across a
+        # transport resume.
+        self._session_baselines: dict[str, tuple[float, dict]] = {}
         # Accelerator/build identity. Stable for the process lifetime, so
         # captured once and folded into the per-session ready handshake.
         # vram_total is bytes (0 on CPU); the client formats to gigabytes.
@@ -3334,6 +3342,64 @@ class ServerState:
             return restored["ok"]
         finally:
             session.resume_audio(generation)
+
+    async def _handle_voice_reset(
+        self,
+        session: "RTCSession",
+        session_id: str,
+        clog: ColorizedLog,
+    ) -> None:
+        """Restore the session-start baseline to cure voice drift.
+
+        Targets the dedicated baseline store, so newer periodic snapshots
+        and bookmarks never shadow the post-prime voice anchor. Manual
+        rewind semantics: live tuning is preserved.
+        """
+        entry = self._session_baselines.get(session_id)
+        if entry is None:
+            clog.log(
+                "warning", "voice reset requested but no baseline snapshot"
+            )
+            try:
+                session.send_event(
+                    "voice_reset",
+                    "Voice reset unavailable; no baseline snapshot",
+                    "warn",
+                )
+                session.send_notice("Voice reset unavailable for this session")
+            except Exception as exc:
+                logger.warning(
+                    "voice-reset no-baseline notify failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            return
+        baseline_ts, state_dict = entry
+        age_sec = max(0.0, time.monotonic() - baseline_ts)
+        clog.log(
+            "info", f"voice reset: restoring baseline from {age_sec:.0f} s ago"
+        )
+        restored = await self._restore_session_snapshot(
+            session,
+            session_id,
+            state_dict,
+        )
+        if not restored:
+            return
+        try:
+            session.send_event(
+                "voice_reset",
+                "Voice reset restored the session-start baseline",
+                "ok",
+                {"age_sec": round(age_sec, 1)},
+            )
+            session.send_notice("Voice reset restored the session-start voice")
+        except Exception as exc:
+            logger.warning(
+                "voice-reset notify failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _schedule_auto_rewind(
         self, snapshot: dict, trigger_count: int
@@ -5162,6 +5228,22 @@ class ServerState:
                             type(exc).__name__,
                             exc,
                         )
+                elif mtype == "voice_reset":
+                    if not warmup_done.is_set():
+                        try:
+                            session.send_event(
+                                "voice_reset",
+                                "Voice reset unavailable during warmup",
+                                "warn",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "voice-reset warmup notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
+                    await self._handle_voice_reset(session, session_id, clog)
                 elif mtype == "bookmark":
                     if not warmup_done.is_set():
                         try:
@@ -6149,8 +6231,16 @@ class ServerState:
                         except BaseException:
                             pass
                         raise
+                    baseline_ts = time.monotonic()
                     self._session_snapshots.setdefault(session_id, []).append(
-                        (time.monotonic(), baseline)
+                        (baseline_ts, baseline)
+                    )
+                    # Same clone under a second key: the periodic snapshot
+                    # task replaces the ring wholesale, and voice_reset must
+                    # still find the session-start anchor afterwards.
+                    self._session_baselines[session_id] = (
+                        baseline_ts,
+                        baseline,
                     )
                     clog.log("info", "baseline snapshot captured")
                 except Exception as exc:
@@ -6441,6 +6531,7 @@ class ServerState:
                 # Release the labelled snapshots' tensor clones on session end,
                 # exactly like the auto-rewind ring above.
                 self._session_bookmarks.pop(session_id, None)
+                self._session_baselines.pop(session_id, None)
                 # Drain in-flight Gemini calls before the next session can
                 # acquire the lock. A stale handle_vision_frame still
                 # awaiting a response would otherwise overwrite the next
@@ -7000,6 +7091,19 @@ def main():
     logger.info(
         "asr: %s",
         "enabled" if asr_engine is not None else "disabled",
+    )
+
+    # Optional best-of-N voice reference window selection. Constructed only
+    # when PERSONAPLEX_VOICE_PICKER is enabled; wavlm_embedder itself returns
+    # None (and logs) when transformers is unavailable, so the default
+    # deployment loads nothing and priming slices the clip tail exactly as
+    # with the flag off. The embedder loads its model lazily on the first
+    # sliced priming, on the inference executor.
+    if _environment_flag("PERSONAPLEX_VOICE_PICKER", False):
+        lm_gen.voice_window_embedder = wavlm_embedder(args.device)
+    logger.info(
+        "voice_picker: %s",
+        "enabled" if lm_gen.voice_window_embedder is not None else "disabled",
     )
 
     state = ServerState(
